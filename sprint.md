@@ -64,14 +64,14 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 **Objectif :** rendre une page à l'écran fidèlement.
 
-- [ ] Polices : TrueType, CFF/Type1C, Type0/CID ; polices intégrées (`/FontFile*`).
-- [ ] Substitution système (Core Text) + 14 polices standard.
-- [ ] Encodages & CMaps (`/Encoding`, `/ToUnicode`).
-- [ ] Rasteriseur CPU via `tiny-skia`.
-- [ ] Images : `DCTDecode` (JPEG), `LZWDecode`, `CCITTFaxDecode`.
-- [ ] Fenêtre de visualisation prototype (egui).
+- [ ] Polices : TrueType, CFF/Type1C, Type0/CID ; polices intégrées (`/FontFile*`) — **pas encore fait** : aucun parsing de police embarquée, donc aucun contour de glyphe disponible pour le rendu (`pdf-render` ne dessine que les chemins vectoriels, pas le texte).
+- [ ] Substitution système (Core Text) + 14 polices standard — non fait ; seule une table de largeurs Helvetica (AFM) sert de repli pour les métriques, pas pour le rendu visuel des glyphes.
+- [x] Encodages & CMaps (`/Encoding`, `/ToUnicode` partiel) — `encoding.rs` : tables `WinAnsiEncoding`/`StandardEncoding` complètes (256 codes) + résolution `/Differences` via un sous-ensemble de l'Adobe Glyph List. `font.rs` combine `/Widths`+`/FirstChar`+`/Encoding` pour produire de vraies largeurs et du texte Unicode réel (validé sur fixture : `"Page 1 - Hello, PDF Manager!"` recomposé exactement). **Non fait :** lecture de `/ToUnicode` (CMap dédié, prioritaire quand présent), polices composites `/Type0`/CID (repli sur l'ancien comportement placeholder), `MacRomanEncoding` dédiée (actuellement approximée par WinAnsi).
+- [x] Rasteriseur CPU via `tiny-skia` (`pdf-render`) — dessine les chemins (`fill`/`stroke`/`fill+stroke`, règles nonzero/even-odd, courbes de Bézier), avec conversion Gray/RGB/CMYK→RGB et export PNG. Validé visuellement sur le fixture réel : le rectangle de test apparaît au bon endroit après inversion d'axe Y. **Non fait :** rendu des glyphes (aucun contour de police disponible, voir ci-dessus), rendu des images, application du clip.
+- [ ] Images : `DCTDecode` (JPEG), `LZWDecode` (fait, voir Phase 1), `CCITTFaxDecode` — décodage JPEG/CCITT non fait ; les images sont repérées dans la `DisplayList` (position) mais jamais décodées ni dessinées.
+- [ ] Fenêtre de visualisation prototype (egui) — non fait, reporté (voir section 8 de architecture.md).
 
-**Critère de sortie (fin Phase 2) :** rendu pixel-comparé conforme sur le corpus, écart sous le seuil défini par le harnais.
+**Critère de sortie (fin Phase 2) :** rendu pixel-comparé conforme sur le corpus, écart sous le seuil défini par le harnais. **Statut réel : partiellement atteint.** Le rendu vectoriel (chemins) est fonctionnel et validé visuellement sur le corpus existant (4 fixtures) ; il manque le rendu du texte (polices), des images, un harnais de comparaison pixel automatisé, et un corpus de test large pour véritablement clore cette phase.
 
 ---
 

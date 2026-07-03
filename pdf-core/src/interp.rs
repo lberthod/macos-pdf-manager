@@ -3,12 +3,11 @@
 //! un état graphique (pile `q`/`Q`, CTM, état texte) pour produire une
 //! `DisplayList`.
 //!
-//! Limitations connues à ce stade (Sprint 5-6) — voir sprint.md :
-//! - Les largeurs de glyphes réelles (`/Widths` de police) ne sont pas
-//!   encore disponibles (Sprint 7-8) : l'avance de texte utilise une
-//!   heuristique constante, signalée via `DisplayItem::Glyph::advance_is_estimated`.
-//! - Les codes de caractères ne sont pas résolus en Unicode (CMap/Encoding
-//!   manquants, Sprint 7-8).
+//! Limitations connues à ce stade — voir sprint.md :
+//! - Polices composites (`/Type0`, CID, codes 2 octets) : non gérées par
+//!   `font::Font` ; repli sur l'avance placeholder et `unicode: None`
+//!   (`DisplayItem::Glyph::advance_is_estimated` le signale).
+//! - `/ToUnicode` n'est pas lu (seul `/Encoding`+`/Differences` l'est).
 //! - Le clip (`W`/`W*`) est signalé (`sets_clip`) mais pas appliqué.
 //! - Les patterns, shadings et le contenu marqué sont ignorés.
 //! - Les images XObject ne sont pas décodées (position seulement).
@@ -17,6 +16,7 @@ use crate::content::{parse_content_stream, ContentInstruction};
 use crate::display::{Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
 use crate::document::Document;
 use crate::error::Result;
+use crate::font::Font;
 use crate::object::{Dictionary, Object};
 
 const MAX_XOBJECT_DEPTH: usize = 12;
@@ -54,9 +54,10 @@ impl Default for GraphicsState {
     }
 }
 
-/// Avance de glyphe placeholder, en millièmes d'em (à peu près la largeur
-/// moyenne des glyphes latins) — tant que les métriques réelles de police
-/// (Sprint 7-8) ne sont pas disponibles.
+/// Avance de repli quand aucune police n'est résolvable dans les ressources
+/// (référence manquante, police composite `/Type0` non supportée...) — dans
+/// le cas courant d'une police simple résolue, `font::Font::decode_simple`
+/// fournit une largeur réelle (`/Widths` ou table Helvetica AFM).
 const PLACEHOLDER_GLYPH_WIDTH_PER_MILLE: f64 = 500.0;
 
 pub struct Interpreter<'a> {
@@ -353,7 +354,19 @@ impl<'a> Interpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
-        let font = self.gs.font.clone().unwrap_or_default();
+        let font_name = self.gs.font.clone().unwrap_or_default();
+        // Rechargé à chaque appel plutôt que mis en cache : simple et correct
+        // (pas de risque d'incohérence entre resources_stack imbriquées),
+        // au prix d'un re-parsing du dict de police par Tj/TJ — acceptable
+        // tant que les documents restent de taille modeste (voir sprint.md).
+        let font = self
+            .lookup_resource("Font", &font_name)
+            .ok()
+            .flatten()
+            .and_then(|obj| obj.as_dict().cloned())
+            .and_then(|dict| Font::load(self.doc, &dict).ok())
+            .filter(|f| !f.is_composite()); // polices composites (Type0) : repli placeholder.
+
         for &code in bytes {
             let scale = Matrix::new(
                 self.gs.font_size * self.gs.h_scale,
@@ -364,12 +377,22 @@ impl<'a> Interpreter<'a> {
                 self.gs.text_rise,
             );
             let transform = scale.then(&self.text_matrix).then(&self.gs.ctm);
+
+            let (unicode, width_per_mille, advance_is_estimated) = match &font {
+                Some(f) => {
+                    let (u, w) = f.decode_simple(code);
+                    (u, w, false)
+                }
+                None => (None, PLACEHOLDER_GLYPH_WIDTH_PER_MILLE, true),
+            };
+
             self.display.items.push(DisplayItem::Glyph {
-                font: font.clone(),
+                font: font_name.clone(),
                 code: code as u32,
+                unicode,
                 transform,
                 color: self.gs.fill_color,
-                advance_is_estimated: true,
+                advance_is_estimated,
             });
 
             let word_spacing = if code == b' ' {
@@ -377,7 +400,7 @@ impl<'a> Interpreter<'a> {
             } else {
                 0.0
             };
-            let advance = (PLACEHOLDER_GLYPH_WIDTH_PER_MILLE / 1000.0 * self.gs.font_size
+            let advance = (width_per_mille / 1000.0 * self.gs.font_size
                 + self.gs.char_spacing
                 + word_spacing)
                 * self.gs.h_scale;
@@ -631,5 +654,32 @@ mod tests {
             }
             other => panic!("expected Path, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn real_fixture_recovers_unicode_text_and_real_widths() {
+        let bytes = include_bytes!("../tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        let text: String = display
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Glyph { unicode, .. } => *unicode,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Page 1 - Hello, PDF Manager!");
+
+        assert!(display.items.iter().all(|item| !matches!(
+            item,
+            DisplayItem::Glyph {
+                advance_is_estimated: true,
+                ..
+            }
+        )));
     }
 }

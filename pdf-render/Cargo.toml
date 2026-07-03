@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 pdf-core = { workspace = true }
+tiny-skia = "0.11"

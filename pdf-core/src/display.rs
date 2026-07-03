@@ -109,14 +109,16 @@ pub enum DisplayItem {
         sets_clip: bool,
     },
     /// Un glyphe positionné. `code` est le code de caractère brut tel
-    /// qu'il apparaît dans la chaîne du flux de contenu (pas encore
-    /// résolu en Unicode : nécessite le CMap/Encoding de la police,
-    /// prévu Sprint 7-8). `advance_is_estimated` signale que l'avance
-    /// utilisée pour positionner le glyphe *suivant* est une heuristique
-    /// (largeurs réelles de police non encore disponibles).
+    /// qu'il apparaît dans la chaîne du flux de contenu. `unicode` est
+    /// résolu via `/Encoding` + `/Differences` (Sprint 7-8) quand la police
+    /// est une police simple 1 octet reconnue ; `None` sinon (police
+    /// composite `/Type0` ou absente des ressources). `advance_is_estimated`
+    /// signale que l'avance utilisée pour positionner le glyphe *suivant*
+    /// est une heuristique constante plutôt qu'une largeur de police réelle.
     Glyph {
         font: String,
         code: u32,
+        unicode: Option<char>,
         transform: Matrix,
         color: Color,
         advance_is_estimated: bool,

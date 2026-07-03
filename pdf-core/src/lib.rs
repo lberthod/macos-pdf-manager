@@ -10,8 +10,10 @@
 pub mod content;
 pub mod display;
 pub mod document;
+pub mod encoding;
 pub mod error;
 pub mod filters;
+pub mod font;
 pub mod interp;
 pub mod lexer;
 pub mod object;

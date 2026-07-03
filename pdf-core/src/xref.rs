@@ -1,18 +1,25 @@
-//! Table de références croisées classique + reconstruction de secours —
-//! architecture.md §4.2. Les cross-reference streams / object streams
-//! (PDF 1.5+) sont prévus pour une itération ultérieure (sprint.md, Sprint 3-4
-//! partie avancée).
+//! Table de références croisées : format classique et cross-reference
+//! streams (PDF 1.5+), plus reconstruction de secours — architecture.md §4.2.
 
 use crate::error::{PdfError, Result};
+use crate::filters::decode_stream;
 use crate::lexer::{Lexer, Token};
-use crate::object::Dictionary;
+use crate::object::{Dictionary, Object};
 use crate::parser::Parser;
 use std::collections::BTreeMap;
 
-/// Table num d'objet -> offset dans le fichier.
+/// Emplacement d'un objet indirect : soit un offset direct dans le fichier,
+/// soit un objet compressé dans un object stream (`/Type /ObjStm`, PDF 1.5+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrefEntry {
+    Offset(usize),
+    Compressed { stream_num: u32, index: u32 },
+}
+
+/// Table num d'objet -> emplacement.
 #[derive(Debug, Clone, Default)]
 pub struct XrefTable {
-    pub offsets: BTreeMap<u32, usize>,
+    pub entries: BTreeMap<u32, XrefEntry>,
 }
 
 /// Cherche `startxref` en partant de la fin du fichier et lit l'offset qui suit.
@@ -34,8 +41,9 @@ fn find_startxref_offset(data: &[u8]) -> Result<usize> {
     }
 }
 
-/// Parse la table xref classique (+ trailer) à l'offset donné, en suivant
-/// les chaînes `/Prev` pour les mises à jour incrémentales.
+/// Parse la table xref (classique ou stream) à l'offset donné, en suivant
+/// les chaînes `/Prev` (et `/XRefStm` pour les mises à jour hybrides) pour
+/// les mises à jour incrémentales.
 pub fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
     let Ok(start_offset) = find_startxref_offset(data) else {
         return reconstruct_by_scan(data);
@@ -54,8 +62,8 @@ pub fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
         match parse_xref_section(data, offset) {
             Ok((section_table, section_trailer)) => {
                 // Les entrées les plus récentes (première section lue) priment.
-                for (num, off) in section_table.offsets {
-                    table.offsets.entry(num).or_insert(off);
+                for (num, entry) in section_table.entries {
+                    table.entries.entry(num).or_insert(entry);
                 }
                 for (key, value) in section_trailer.iter() {
                     trailer
@@ -72,14 +80,24 @@ pub fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
         }
     }
 
-    if table.offsets.is_empty() {
+    if table.entries.is_empty() {
         return reconstruct_by_scan(data);
     }
 
     Ok((table, trailer))
 }
 
+/// Distingue une section xref classique (`xref` ... `trailer`) d'un
+/// cross-reference stream (objet indirect dont le dict a `/Type /XRef`).
 fn parse_xref_section(data: &[u8], offset: usize) -> Result<(XrefTable, Dictionary)> {
+    let mut probe = Lexer::with_pos(data, offset);
+    match probe.next_token()? {
+        Some(Token::Keyword(kw)) if kw == "xref" => parse_classic_xref_section(data, offset),
+        _ => parse_xref_stream_section(data, offset),
+    }
+}
+
+fn parse_classic_xref_section(data: &[u8], offset: usize) -> Result<(XrefTable, Dictionary)> {
     let mut lexer = Lexer::with_pos(data, offset);
     match lexer.next_token()? {
         Some(Token::Keyword(kw)) if kw == "xref" => {}
@@ -111,7 +129,9 @@ fn parse_xref_section(data: &[u8], offset: usize) -> Result<(XrefTable, Dictiona
                         return Err(PdfError::InvalidXref("malformed xref entry".into()));
                     };
                     if kind == "n" {
-                        table.offsets.insert((start + i) as u32, off as usize);
+                        table
+                            .entries
+                            .insert((start + i) as u32, XrefEntry::Offset(off as usize));
                     }
                 }
             }
@@ -141,41 +161,131 @@ fn parse_xref_section(data: &[u8], offset: usize) -> Result<(XrefTable, Dictiona
     Ok((table, trailer))
 }
 
-/// Reconstruction de secours : scanne tout le fichier à la recherche des
-/// motifs `N G obj` pour reconstituer une table d'offsets, puis localise le
-/// trailer le plus plausible (dernier `trailer` du fichier, ou dictionnaire
-/// `/Type /Catalog` en dernier recours).
-fn reconstruct_by_scan(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
-    let mut table = XrefTable::default();
-    let mut lexer = Lexer::new(data);
-    let mut pending: Vec<(usize, Token)> = Vec::new();
+/// Parse un cross-reference stream (PDF 1.5+, ISO 32000-1 §7.5.8) : un objet
+/// indirect `/Type /XRef` dont le flux (souvent `FlateDecode` + prédicteur
+/// PNG) contient des enregistrements de largeur fixe décrits par `/W`.
+fn parse_xref_stream_section(data: &[u8], offset: usize) -> Result<(XrefTable, Dictionary)> {
+    let mut parser = Parser::with_pos(data, offset);
+    let (_num, _gen, object) = parser.parse_indirect_object()?;
+    let Object::Stream(stream) = object else {
+        return Err(PdfError::InvalidXref(
+            "expected a stream object for cross-reference stream".into(),
+        ));
+    };
 
-    loop {
-        let pos = lexer.pos();
-        let Some(token) = lexer.next_token()? else {
-            break;
-        };
-        pending.push((pos, token.clone()));
-        if pending.len() > 3 {
-            pending.remove(0);
+    let dict = stream.dict.clone();
+    match dict.get("Type").and_then(|o| o.as_name()) {
+        Some("XRef") => {}
+        other => {
+            return Err(PdfError::InvalidXref(format!(
+                "expected /Type /XRef, found {other:?}"
+            )))
         }
-        if let Token::Keyword(kw) = &token {
-            if kw == "obj" && pending.len() == 3 {
-                if let (
-                    (start_pos, Token::Integer(num)),
-                    (_, Token::Integer(_gen)),
-                    (_, Token::Keyword(_)),
-                ) = (&pending[0], &pending[1], &pending[2])
-                {
-                    if *num >= 0 {
-                        table.offsets.insert(*num as u32, *start_pos);
-                    }
+    }
+
+    let widths: Vec<usize> = dict
+        .get("W")
+        .and_then(|o| o.as_array())
+        .ok_or_else(|| PdfError::MissingKey("W".into()))?
+        .iter()
+        .map(|o| o.as_int().unwrap_or(0) as usize)
+        .collect();
+    if widths.len() != 3 {
+        return Err(PdfError::InvalidXref(
+            "/W must have exactly 3 entries".into(),
+        ));
+    }
+    let (w0, w1, w2) = (widths[0], widths[1], widths[2]);
+    let record_len = w0 + w1 + w2;
+
+    let size = dict.get_int("Size").unwrap_or(0);
+    let index: Vec<i64> = match dict.get("Index").and_then(|o| o.as_array()) {
+        Some(items) => items.iter().filter_map(|o| o.as_int()).collect(),
+        None => vec![0, size],
+    };
+
+    let decoded = decode_stream(&stream)?;
+    if record_len == 0 {
+        return Err(PdfError::InvalidXref("/W entries sum to zero".into()));
+    }
+
+    let mut table = XrefTable::default();
+    let mut cursor = 0usize;
+    for pair in index.chunks(2) {
+        let [start, count] = [pair[0], *pair.get(1).unwrap_or(&0)];
+        for i in 0..count {
+            if cursor + record_len > decoded.len() {
+                break;
+            }
+            let record = &decoded[cursor..cursor + record_len];
+            cursor += record_len;
+
+            let field_type = if w0 == 0 {
+                1 // Par défaut (absence de /W[0]) : entrée "en usage" classique.
+            } else {
+                be_bytes_to_u64(&record[0..w0])
+            };
+            let field2 = be_bytes_to_u64(&record[w0..w0 + w1]);
+            let field3 = be_bytes_to_u64(&record[w0 + w1..w0 + w1 + w2]);
+
+            let obj_num = (start + i) as u32;
+            match field_type {
+                0 => {} // objet libre : ignoré.
+                1 => {
+                    table
+                        .entries
+                        .insert(obj_num, XrefEntry::Offset(field2 as usize));
                 }
+                2 => {
+                    table.entries.insert(
+                        obj_num,
+                        XrefEntry::Compressed {
+                            stream_num: field2 as u32,
+                            index: field3 as u32,
+                        },
+                    );
+                }
+                _ => {} // types réservés futurs : ignorés.
             }
         }
     }
 
-    if table.offsets.is_empty() {
+    Ok((table, dict))
+}
+
+fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
+}
+
+/// Reconstruction de secours : scanne le fichier **au niveau des octets**
+/// (pas via le lexer) à la recherche du motif littéral `obj` précédé de
+/// `N G `, pour reconstituer une table d'offsets. Un scan basé sur le lexer
+/// échouerait dès qu'un flux compressé contient un octet ressemblant à un
+/// délimiteur PDF ; les données brutes de `stream`/`endstream` sont
+/// arbitraires et ne suivent pas la syntaxe des objets.
+fn reconstruct_by_scan(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
+    let mut table = XrefTable::default();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = find_subslice(&data[search_from..], b"obj") {
+        let obj_pos = search_from + rel;
+        search_from = obj_pos + 3;
+
+        // Exclut `endobj` (qui contient `obj` comme sous-chaîne) et exige
+        // que `obj` soit suivi d'un caractère non-régulier (espace/délimiteur).
+        if obj_pos >= 3 && &data[obj_pos - 3..obj_pos] == b"end" {
+            continue;
+        }
+        if data.get(obj_pos + 3).is_some_and(|&b| is_regular_byte(b)) {
+            continue;
+        }
+
+        if let Some((num, start_pos)) = parse_header_backwards(data, obj_pos) {
+            table.entries.insert(num, XrefEntry::Offset(start_pos));
+        }
+    }
+
+    if table.entries.is_empty() {
         return Err(PdfError::InvalidXref(
             "no indirect objects found while reconstructing xref".into(),
         ));
@@ -186,16 +296,113 @@ fn reconstruct_by_scan(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
         let mut parser = Parser::with_pos(data, trailer_pos);
         if let Ok(obj) = parser.parse_object() {
             if let Some(dict) = obj.as_dict() {
-                return Ok((table, dict.clone()));
+                if dict.get("Root").is_some() {
+                    return Ok((table, dict.clone()));
+                }
             }
         }
     }
 
+    // Dernier recours (pas de trailer exploitable) : cherche un objet
+    // `/Type /Catalog` parmi les objets retrouvés et synthétise un trailer.
+    if let Some(root_num) = find_catalog_object(data, &table) {
+        let mut trailer = Dictionary::new();
+        trailer.insert(
+            "Root",
+            Object::Reference(crate::object::ObjRef::new(root_num, 0)),
+        );
+        return Ok((table, trailer));
+    }
+
     Ok((table, Dictionary::new()))
+}
+
+fn find_catalog_object(data: &[u8], table: &XrefTable) -> Option<u32> {
+    for (&num, entry) in &table.entries {
+        let XrefEntry::Offset(offset) = entry else {
+            continue;
+        };
+        let mut parser = Parser::with_pos(data, *offset);
+        let Ok((_, _, object)) = parser.parse_indirect_object() else {
+            continue;
+        };
+        if let Some(dict) = object.as_dict() {
+            if dict.get("Type").and_then(|o| o.as_name()) == Some("Catalog") {
+                return Some(num);
+            }
+        }
+    }
+    None
 }
 
 fn find_last_trailer(data: &[u8]) -> Option<usize> {
     const NEEDLE: &[u8] = b"trailer";
     let rel = data.windows(NEEDLE.len()).rposition(|w| w == NEEDLE)?;
     Some(rel + NEEDLE.len())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn is_regular_byte(b: u8) -> bool {
+    !matches!(
+        b,
+        b'\0'
+            | b'\t'
+            | b'\n'
+            | 0x0C
+            | b'\r'
+            | b' '
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'/'
+            | b'%'
+    )
+}
+
+/// Depuis la position du mot-clé `obj`, remonte dans le fichier pour lire
+/// `N G ` (numéro d'objet, génération) au format brut, sans passer par le
+/// lexer. Retourne `(numéro d'objet, offset de début de "N")`.
+fn parse_header_backwards(data: &[u8], obj_pos: usize) -> Option<(u32, usize)> {
+    let mut i = obj_pos;
+
+    let skip_whitespace_backwards = |data: &[u8], mut i: usize| -> usize {
+        while i > 0 && data[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let read_digits_backwards = |data: &[u8], mut i: usize| -> (usize, usize) {
+        let end = i;
+        while i > 0 && data[i - 1].is_ascii_digit() {
+            i -= 1;
+        }
+        (i, end)
+    };
+
+    i = skip_whitespace_backwards(data, i);
+    let (gen_start, gen_end) = read_digits_backwards(data, i);
+    if gen_start == gen_end {
+        return None; // pas de génération numérique trouvée.
+    }
+
+    i = skip_whitespace_backwards(data, gen_start);
+    let (num_start, num_end) = read_digits_backwards(data, i);
+    if num_start == num_end {
+        return None;
+    }
+
+    let num_str = std::str::from_utf8(&data[num_start..num_end]).ok()?;
+    let num: u32 = num_str.parse().ok()?;
+    Some((num, num_start))
 }

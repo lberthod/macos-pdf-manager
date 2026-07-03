@@ -1,9 +1,10 @@
 //! Modèle document (arbre logique) — architecture.md §4.4.
 
 use crate::error::{PdfError, Result};
+use crate::filters::decode_stream;
 use crate::object::{Dictionary, ObjRef, Object};
 use crate::parser::Parser;
-use crate::xref::{parse_xref_chain, XrefTable};
+use crate::xref::{parse_xref_chain, XrefEntry, XrefTable};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -26,7 +27,7 @@ impl Document {
     }
 
     pub fn object_count(&self) -> usize {
-        self.xref.offsets.len()
+        self.xref.entries.len()
     }
 
     pub fn trailer(&self) -> &Dictionary {
@@ -35,20 +36,69 @@ impl Document {
 
     /// Résout un objet indirect par numéro (la génération n'est pas encore
     /// vérifiée : suffisant tant que les PDF avec objets libérés/réutilisés
-    /// ne sont pas dans le corpus de test prioritaire).
+    /// ne sont pas dans le corpus de test prioritaire). Gère à la fois les
+    /// objets à offset direct et les objets compressés dans un object
+    /// stream (`/Type /ObjStm`, PDF 1.5+).
     pub fn resolve(&self, r: ObjRef) -> Result<Object> {
         if let Some(cached) = self.cache.borrow().get(&r.num) {
             return Ok(cached.clone());
         }
-        let offset = *self
+        let entry = *self
             .xref
-            .offsets
+            .entries
             .get(&r.num)
             .ok_or(PdfError::ObjectNotFound(r.num, r.gen))?;
-        let mut parser = Parser::with_pos(&self.data, offset);
-        let (_num, _gen, object) = parser.parse_indirect_object()?;
+
+        let object = match entry {
+            XrefEntry::Offset(offset) => {
+                let mut parser = Parser::with_pos(&self.data, offset);
+                let (_num, _gen, object) = parser.parse_indirect_object()?;
+                object
+            }
+            XrefEntry::Compressed { stream_num, index } => {
+                self.resolve_compressed(stream_num, index)?
+            }
+        };
+
         self.cache.borrow_mut().insert(r.num, object.clone());
         Ok(object)
+    }
+
+    /// Extrait l'objet d'indice `index` d'un object stream (`/Type /ObjStm`) —
+    /// architecture.md §4.2. L'en-tête du flux décodé liste `/N` paires
+    /// `(numéro d'objet, offset relatif à /First)`.
+    fn resolve_compressed(&self, stream_num: u32, index: u32) -> Result<Object> {
+        let stream_obj = self.resolve(ObjRef::new(stream_num, 0))?;
+        let Object::Stream(stream) = stream_obj else {
+            return Err(PdfError::InvalidObject(
+                0,
+                format!("object {stream_num} is not an object stream"),
+            ));
+        };
+        let n = stream.dict.get_int("N")?;
+        let first = stream.dict.get_int("First")?;
+        let decoded = decode_stream(&stream)?;
+
+        let mut header_parser = Parser::new(&decoded);
+        let mut rel_offset = None;
+        for i in 0..n {
+            let num = header_parser
+                .parse_object()?
+                .as_int()
+                .ok_or(PdfError::UnexpectedType("Integer"))?;
+            let off = header_parser
+                .parse_object()?
+                .as_int()
+                .ok_or(PdfError::UnexpectedType("Integer"))?;
+            if i as u32 == index {
+                rel_offset = Some(off as usize);
+                let _ = num; // le numéro d'objet est déjà connu via la xref.
+            }
+        }
+        let rel_offset = rel_offset.ok_or(PdfError::ObjectNotFound(stream_num, 0))?;
+
+        let mut obj_parser = Parser::with_pos(&decoded, first as usize + rel_offset);
+        obj_parser.parse_object()
     }
 
     /// Retourne l'objet directement si ce n'est pas une référence, ou le
@@ -154,5 +204,31 @@ mod tests {
         let broken = body.as_bytes().to_vec();
         let doc = Document::open(broken).unwrap();
         assert_eq!(doc.object_count(), 2);
+    }
+
+    /// Fixtures réels (générés via reportlab + pikepdf, voir
+    /// `tests/fixtures/README.md`) couvrant xref classique, cross-reference
+    /// streams + object streams (PDF 1.5+), et un fichier corrompu.
+    #[test]
+    fn opens_real_pdf_with_classic_xref() {
+        let bytes = include_bytes!("../tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 5);
+    }
+
+    #[test]
+    fn opens_real_pdf_with_xref_stream_and_object_streams() {
+        let bytes = include_bytes!("../tests/fixtures/multipage_xref_stream.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 5);
+        let root = doc.root().unwrap();
+        assert_eq!(root.get("Type").unwrap().as_name(), Some("Catalog"));
+    }
+
+    #[test]
+    fn recovers_real_pdf_missing_xref_via_catalog_scan() {
+        let bytes = include_bytes!("../tests/fixtures/corrupted_missing_xref.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 5);
     }
 }

@@ -10,7 +10,7 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 - [x] Créer le workspace Cargo (`pdf-core`, `pdf-text`, `pdf-render`, `pdf-edit`, `pdf-app`, `pdf-ui`, `pdf-cli`) avec crates vides.
 - [x] Configurer CI : `cargo fmt --check`, `cargo clippy`, `cargo test` (GitHub Actions).
-- [ ] Constituer un premier corpus de PDF de référence (variés : simples, malformés, scannés, formulaires) — un seul fixture minimal existe pour l'instant, corpus large à faire.
+- [ ] Constituer un premier corpus de PDF de référence (variés : simples, malformés, scannés, formulaires) — 4 fixtures existent (`pdf-core/tests/fixtures/`, voir leur README) : classique, xref stream, object streams, corrompu. Corpus large (centaines de PDF, scans, formulaires, chiffrement) toujours à faire.
 - [ ] Écrire le harnais de comparaison d'images (diff pixel + seuil) pour les futurs tests de rendu.
 - [x] `pdf-cli` minimal (`dump` : ouvre un fichier, affiche sa structure).
 
@@ -36,13 +36,13 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 **Objectif :** reconstruire le graphe complet d'un document PDF.
 
 - [x] Table xref classique (`xref`/`trailer`).
-- [ ] Cross-reference streams (PDF 1.5+) et object streams (`/ObjStm`) — pas encore supportés, nécessaire pour les PDF récents (Acrobat 6+).
+- [x] Cross-reference streams (PDF 1.5+) et object streams (`/ObjStm`) — largeurs `/W` variables, `/Index`, entrées type 0/1/2, décodage complet.
 - [x] Chaînes de mises à jour incrémentales (`/Prev`).
-- [x] Récupération d'erreur : reconstruction par scan `N G obj` si xref corrompue ou `startxref` introuvable.
-- [x] Résolution paresseuse des références + cache d'objets.
-- [x] Filtres de flux prioritaires : `FlateDecode`, `ASCIIHexDecode`, `ASCII85Decode`. `LZWDecode` et prédicteurs PNG/TIFF restent à faire.
+- [x] Récupération d'erreur : reconstruction par balayage **au niveau des octets** (pas du lexer, pour rester robuste face au contenu binaire des flux compressés) si xref corrompue ou `startxref` introuvable, avec repli sur la recherche d'un `/Type /Catalog` si aucun trailer exploitable n'est trouvé.
+- [x] Résolution paresseuse des références + cache d'objets, y compris objets compressés dans un object stream.
+- [x] Filtres de flux prioritaires : `FlateDecode`, `ASCIIHexDecode`, `ASCII85Decode`, `LZWDecode`, prédicteurs PNG (0-4) et TIFF.
 
-**Critère de sortie (fin Phase 1) :** `pdf-cli dump` affiche la structure de n'importe quel PDF du corpus ; ouverture sans crash sur plusieurs centaines de PDF variés. **Statut réel : validé uniquement sur un fixture minimal fait main — le corpus large et les object/xref streams (PDF 1.5+) manquent encore avant de considérer la Phase 1 terminée.**
+**Critère de sortie (fin Phase 1) :** `pdf-cli dump` affiche la structure de n'importe quel PDF du corpus ; ouverture sans crash sur plusieurs centaines de PDF variés. **Statut réel : validé sur un corpus de 4 fixtures (xref classique, xref stream + object streams, PDF corrompu récupéré par balayage) générés à partir d'un vrai PDF reportlab/pikepdf — voir `pdf-core/tests/fixtures/README.md`. Le corpus large « plusieurs centaines de PDF variés » (scans, formulaires, PDF chiffrés, CJK, PDF/A) reste à constituer avant de considérer la Phase 1 formellement close.**
 
 ---
 

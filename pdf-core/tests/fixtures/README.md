@@ -4,6 +4,7 @@
 - `multipage_classic_xref.pdf` — document 5 pages généré avec `reportlab`, re-sauvegardé avec `pikepdf` en forçant une xref classique (`ObjectStreamMode.disable`, `qdf=True`).
 - `multipage_xref_stream.pdf` — même contenu, re-sauvegardé avec `pikepdf` en forçant un cross-reference stream + object streams (`ObjectStreamMode.generate`), représentatif des PDF produits par les outils modernes (PDF 1.5+).
 - `corrupted_missing_xref.pdf` — `multipage_classic_xref.pdf` tronqué juste avant sa table xref finale, pour exercer la reconstruction par balayage (`xref::reconstruct_by_scan`) et la détection de secours du catalogue.
+- `embedded_truetype_font.pdf` — texte "AVIL" en police Monaco **intégrée** (`/FontFile2`, sous-ensemble), générée via `reportlab.pdfbase.ttfonts.TTFont` puis re-sauvegardée en xref classique avec `pikepdf`. Sert à tester l'extraction de contours réels (`font.rs::glyph_outline`) : ce sous-ensemble n'embarque qu'un `cmap` Macintosh (1,0), pas de table Unicode, ce qui exerce le repli par code brut.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -26,6 +27,19 @@ with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
     pdf.save("multipage_classic_xref.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
 with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
     pdf.save("multipage_xref_stream.pdf", object_stream_mode=ObjectStreamMode.generate, static_id=True)
+
+# embedded_truetype_font.pdf
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+pdfmetrics.registerFont(TTFont("Monaco", "/System/Library/Fonts/Monaco.ttf"))
+buf2 = io.BytesIO()
+c2 = canvas.Canvas(buf2, pagesize=letter)
+c2.setFont("Monaco", 36)
+c2.drawString(72, 700, "AVIL")
+c2.showPage()
+c2.save()
+with Pdf.open(io.BytesIO(buf2.getvalue())) as pdf:
+    pdf.save("embedded_truetype_font.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
 ```
 
-Ce corpus reste modeste (4 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9). Un corpus plus large (PDF scannés, formulaires AcroForm, PDF chiffrés, CJK, PDF/A...) reste à constituer — voir sprint.md.
+Ce corpus reste modeste (5 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9). Un corpus plus large (PDF scannés, formulaires AcroForm, PDF chiffrés, CJK, PDF/A...) reste à constituer — voir sprint.md.

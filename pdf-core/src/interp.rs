@@ -378,12 +378,12 @@ impl<'a> Interpreter<'a> {
             );
             let transform = scale.then(&self.text_matrix).then(&self.gs.ctm);
 
-            let (unicode, width_per_mille, advance_is_estimated) = match &font {
+            let (unicode, width_per_mille, advance_is_estimated, outline) = match &font {
                 Some(f) => {
                     let (u, w) = f.decode_simple(code);
-                    (u, w, false)
+                    (u, w, false, f.glyph_outline(code, u))
                 }
-                None => (None, PLACEHOLDER_GLYPH_WIDTH_PER_MILLE, true),
+                None => (None, PLACEHOLDER_GLYPH_WIDTH_PER_MILLE, true, None),
             };
 
             self.display.items.push(DisplayItem::Glyph {
@@ -393,6 +393,7 @@ impl<'a> Interpreter<'a> {
                 transform,
                 color: self.gs.fill_color,
                 advance_is_estimated,
+                outline,
             });
 
             let word_spacing = if code == b' ' {

@@ -14,10 +14,19 @@
 //!   standard retombent sur `DEFAULT_WIDTH`.
 //! - `MacRomanEncoding` est approximé par `WinAnsiEncoding` (tables réelles
 //!   distinctes au-delà de l'ASCII) faute de table dédiée pour l'instant.
+//! - Contours de glyphes : seules les polices **TrueType intégrées**
+//!   (`/FontFile2`) sont supportées, via `ttf-parser`. Les polices CFF/
+//!   Type1C intégrées (`/FontFile3`) et Type1 (`/FontFile`) n'ont pas encore
+//!   de parseur de contours ; les polices standard non intégrées (cas le
+//!   plus courant, Helvetica etc.) n'ont pas de contour du tout — seule la
+//!   substitution système (Core Text, non implémentée) pourrait fournir un
+//!   rendu visuel dans ce cas.
 
+use crate::display::PathSegment;
 use crate::document::Document;
 use crate::encoding::{glyph_name_to_unicode, STANDARD_ENCODING, WIN_ANSI_ENCODING};
 use crate::error::Result;
+use crate::filters::decode_stream;
 use crate::object::{Dictionary, Object};
 
 /// Avance de repli ultime (en millièmes d'em) quand ni `/Widths` ni la table
@@ -29,6 +38,8 @@ pub struct Font {
     encoding: [Option<char>; 256],
     widths: [Option<f64>; 256],
     use_helvetica_fallback: bool,
+    /// Octets bruts d'un `/FontFile2` (TrueType) déjà décodé, s'il y en a un.
+    embedded_truetype: Option<Vec<u8>>,
 }
 
 impl Font {
@@ -97,11 +108,23 @@ impl Font {
 
         let use_helvetica_fallback = subtype != "Type0" && widths.iter().all(|w| w.is_none());
 
+        let embedded_truetype = dict
+            .get("FontDescriptor")
+            .and_then(|o| doc.get(o).ok())
+            .and_then(|desc| desc.as_dict().cloned())
+            .and_then(|desc_dict| desc_dict.get("FontFile2").cloned())
+            .and_then(|obj| doc.get(&obj).ok())
+            .and_then(|obj| match obj {
+                Object::Stream(stream) => decode_stream(&stream).ok(),
+                _ => None,
+            });
+
         Ok(Font {
             subtype,
             encoding,
             widths,
             use_helvetica_fallback,
+            embedded_truetype,
         })
     }
 
@@ -123,6 +146,102 @@ impl Font {
 
     pub fn is_composite(&self) -> bool {
         self.subtype == "Type0"
+    }
+
+    /// Contour vectoriel du glyphe correspondant à un code de caractère 1
+    /// octet, dans l'espace em normalisé (1.0 = une taille de police), déjà
+    /// orienté correctement (Y vers le haut, comme le reste du pipeline
+    /// PDF). `None` si aucune police TrueType intégrée n'est disponible ou
+    /// si le glyphe est introuvable.
+    ///
+    /// Résolution du glyphe : essaie d'abord une table `cmap` Unicode
+    /// (`unicode`, si connu) ; sinon, retombe sur une éventuelle table
+    /// `cmap` Macintosh (plate-forme 1) interrogée directement avec le
+    /// **code brut** — cas fréquent des sous-ensembles TrueType produits
+    /// par des outils comme reportlab, qui n'embarquent qu'un cmap Mac
+    /// Roman indexé par code plutôt que par point de code Unicode.
+    pub fn glyph_outline(&self, code: u8, unicode: Option<char>) -> Option<Vec<PathSegment>> {
+        let data = self.embedded_truetype.as_ref()?;
+        let face = ttf_parser::Face::parse(data, 0).ok()?;
+
+        let gid = unicode.and_then(|u| face.glyph_index(u)).or_else(|| {
+            face.tables().cmap.and_then(|cmap| {
+                cmap.subtables
+                    .into_iter()
+                    .find(|sub| sub.platform_id == ttf_parser::PlatformId::Macintosh)
+                    .and_then(|sub| sub.glyph_index(code as u32))
+            })
+        })?;
+
+        let units_per_em = face.units_per_em() as f64;
+        if units_per_em <= 0.0 {
+            return None;
+        }
+
+        let mut collector = OutlineCollector {
+            segments: Vec::new(),
+            current: (0.0, 0.0),
+            scale: 1.0 / units_per_em,
+        };
+        face.outline_glyph(gid, &mut collector)?;
+        Some(collector.segments)
+    }
+}
+
+/// Convertit les commandes de contour `ttf-parser` (unités de police, Y vers
+/// le haut comme en PDF) en `PathSegment`, à l'échelle 1 unité = 1 em. Les
+/// courbes quadratiques (`quad_to`, format natif TrueType) sont élevées en
+/// cubiques pour rester homogènes avec le reste du pipeline (`c`/`v`/`y`
+/// PDF ne produisent que des cubiques).
+struct OutlineCollector {
+    segments: Vec<PathSegment>,
+    current: (f32, f32),
+    scale: f64,
+}
+
+impl OutlineCollector {
+    fn pt(&self, x: f32, y: f32) -> (f64, f64) {
+        (x as f64 * self.scale, y as f64 * self.scale)
+    }
+}
+
+impl ttf_parser::OutlineBuilder for OutlineCollector {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.segments.push(PathSegment::MoveTo(self.pt(x, y)));
+        self.current = (x, y);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.segments.push(PathSegment::LineTo(self.pt(x, y)));
+        self.current = (x, y);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        // Élévation degré 2 -> 3 : c1 = p0 + 2/3(q-p0), c2 = p2 + 2/3(q-p2).
+        let (x0, y0) = self.current;
+        let c1x = x0 + 2.0 / 3.0 * (x1 - x0);
+        let c1y = y0 + 2.0 / 3.0 * (y1 - y0);
+        let c2x = x + 2.0 / 3.0 * (x1 - x);
+        let c2y = y + 2.0 / 3.0 * (y1 - y);
+        self.segments.push(PathSegment::CurveTo {
+            c1: self.pt(c1x, c1y),
+            c2: self.pt(c2x, c2y),
+            to: self.pt(x, y),
+        });
+        self.current = (x, y);
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.segments.push(PathSegment::CurveTo {
+            c1: self.pt(x1, y1),
+            c2: self.pt(x2, y2),
+            to: self.pt(x, y),
+        });
+        self.current = (x, y);
+    }
+
+    fn close(&mut self) {
+        self.segments.push(PathSegment::ClosePath);
     }
 }
 
@@ -324,5 +443,42 @@ mod tests {
         let dict = font_dict(&[("Subtype", Object::Name("Type0".into()))]);
         let font = Font::load(&doc, &dict).unwrap();
         assert!(font.is_composite());
+    }
+
+    #[test]
+    fn embedded_truetype_fixture_yields_real_glyph_outline() {
+        let bytes = include_bytes!("../tests/fixtures/embedded_truetype_font.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let font_res = page.resources.get("Font").unwrap();
+        let font_dict = doc.get(font_res).unwrap();
+        let embedded = font_dict
+            .as_dict()
+            .unwrap()
+            .iter()
+            .find_map(|(name, obj)| {
+                let resolved = doc.get(obj).ok()?;
+                let d = resolved.as_dict()?;
+                (d.get("Subtype").and_then(|o| o.as_name()) == Some("TrueType")).then(|| {
+                    let _ = name;
+                    d.clone()
+                })
+            })
+            .expect("expected an embedded TrueType font resource in the fixture");
+
+        let font = Font::load(&doc, &embedded).unwrap();
+        let outline = font
+            .glyph_outline(b'A', Some('A'))
+            .expect("expected an outline for 'A' in the embedded Monaco subset");
+        assert!(!outline.is_empty());
+        assert!(matches!(outline[0], PathSegment::MoveTo(_)));
+
+        // Le sous-ensemble Monaco de ce fixture n'embarque qu'un cmap
+        // Macintosh (pas de table Unicode) : sans le repli code-brut, la
+        // résolution par Unicode seul échouerait.
+        let outline_via_code_only = font
+            .glyph_outline(b'A', None)
+            .expect("code-based cmap fallback should still resolve the glyph");
+        assert_eq!(outline, outline_via_code_only);
     }
 }

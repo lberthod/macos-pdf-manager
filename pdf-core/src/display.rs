@@ -115,6 +115,12 @@ pub enum DisplayItem {
     /// composite `/Type0` ou absente des ressources). `advance_is_estimated`
     /// signale que l'avance utilisée pour positionner le glyphe *suivant*
     /// est une heuristique constante plutôt qu'une largeur de police réelle.
+    /// `outline` contient le contour vectoriel du glyphe (espace em, déjà
+    /// combiné à `transform` pour obtenir l'espace page) quand une police
+    /// TrueType intégrée fournit un contour réel (Sprint 7-8+) ; `None` si
+    /// aucun contour n'est disponible (police standard non intégrée,
+    /// CFF/Type1, ou glyphe absent du `cmap`) — le glyphe n'est alors pas
+    /// dessinable tel quel par le rendu (voir `pdf-render`).
     Glyph {
         font: String,
         code: u32,
@@ -122,6 +128,7 @@ pub enum DisplayItem {
         transform: Matrix,
         color: Color,
         advance_is_estimated: bool,
+        outline: Option<Vec<PathSegment>>,
     },
     /// XObject image : seule sa position est connue à ce stade (le
     /// décodage des pixels — JPEG/Flate/CCITT — est prévu Sprint 7-8).

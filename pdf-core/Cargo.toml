@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 flate2 = "1"
 thiserror = "1"
+ttf-parser = "0.24"
 
 [dev-dependencies]

@@ -4,15 +4,19 @@
 //! Sprint 0/2 mais pas encore constitués — voir sprint.md).
 //!
 //! Limitations connues à ce stade :
-//! - Les glyphes ne sont pas dessinés (aucun contour de police disponible :
-//!   ni parsing de police embarquée `/FontFile*`, ni substitution système
-//!   Core Text — prévu Sprint 7-8+ ultérieur). Seuls les chemins vectoriels
-//!   (`DisplayItem::Path`) sont rendus.
+//! - Les glyphes ne sont dessinés que lorsque `DisplayItem::Glyph::outline`
+//!   est renseigné, c'est-à-dire uniquement pour les polices TrueType
+//!   **intégrées** (`/FontFile2`, voir `pdf-core::font`) dont le glyphe a
+//!   été résolu. Les polices standard non intégrées (cas le plus courant,
+//!   Helvetica etc.) et les polices CFF/Type1 intégrées n'ont pas encore de
+//!   contour disponible ; leurs glyphes restent invisibles (aucune forme
+//!   de repli approximatif n'est dessinée, pour ne pas donner une fausse
+//!   impression de fidélité).
 //! - Les images ne sont pas décodées ni dessinées.
 //! - Le clip (`sets_clip`) n'est pas appliqué.
 //! - Espaces colorimétriques : conversion CMYK -> RGB naïve (sans profil ICC).
 
-use pdf_core::display::{Color, DisplayItem, DisplayList, FillRule, PaintOp, PathSegment};
+use pdf_core::display::{Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
 use tiny_skia::{
     Color as SkiaColor, FillRule as SkiaFillRule, Paint, Path, PathBuilder, Pixmap, Stroke,
     Transform,
@@ -74,9 +78,29 @@ fn render_to_pixmap(
                 };
                 pixmap.stroke_path(&path, &paint_stroke, &stroke, Transform::identity(), None);
             }
+        } else if let DisplayItem::Glyph {
+            outline: Some(segments),
+            transform,
+            color,
+            ..
+        } = item
+        {
+            let Some(path) = build_glyph_path(segments, transform, origin_x, origin_y_top) else {
+                continue;
+            };
+            let mut paint_fill = Paint::default();
+            paint_fill.set_color(to_skia_color(*color));
+            paint_fill.anti_alias = true;
+            pixmap.fill_path(
+                &path,
+                &paint_fill,
+                SkiaFillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
-        // DisplayItem::Glyph et DisplayItem::Image : non rendus, voir
-        // limitations en tête de module.
+        // DisplayItem::Glyph sans contour (police non intégrée) et
+        // DisplayItem::Image : non rendus, voir limitations en tête de module.
     }
 
     Some(pixmap)
@@ -105,6 +129,50 @@ fn build_path(segments: &[PathSegment], origin_x: f64, origin_y_top: f64) -> Opt
                 let (x1, y1) = flip(*c1);
                 let (x2, y2) = flip(*c2);
                 let (x3, y3) = flip(*to);
+                pb.cubic_to(x1, y1, x2, y2, x3, y3);
+                has_segment = true;
+            }
+            PathSegment::ClosePath => pb.close(),
+        }
+    }
+    if !has_segment {
+        return None;
+    }
+    pb.finish()
+}
+
+/// Comme `build_path`, mais applique d'abord `transform` (matrice de rendu
+/// du glyphe : échelle police + matrice texte + CTM) à des points en espace
+/// em, avant l'inversion d'axe Y commune à tout le pipeline.
+fn build_glyph_path(
+    segments: &[PathSegment],
+    transform: &Matrix,
+    origin_x: f64,
+    origin_y_top: f64,
+) -> Option<Path> {
+    let map = |p: (f64, f64)| {
+        let (px, py) = transform.apply(p.0, p.1);
+        ((px - origin_x) as f32, (origin_y_top - py) as f32)
+    };
+
+    let mut pb = PathBuilder::new();
+    let mut has_segment = false;
+    for seg in segments {
+        match seg {
+            PathSegment::MoveTo(p) => {
+                let (x, y) = map(*p);
+                pb.move_to(x, y);
+                has_segment = true;
+            }
+            PathSegment::LineTo(p) => {
+                let (x, y) = map(*p);
+                pb.line_to(x, y);
+                has_segment = true;
+            }
+            PathSegment::CurveTo { c1, c2, to } => {
+                let (x1, y1) = map(*c1);
+                let (x2, y2) = map(*c2);
+                let (x3, y3) = map(*to);
                 pb.cubic_to(x1, y1, x2, y2, x3, y3);
                 has_segment = true;
             }
@@ -204,6 +272,44 @@ mod tests {
         assert_eq!(
             &png[0..8],
             &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']
+        );
+    }
+
+    /// Bout en bout sur un vrai PDF avec police TrueType intégrée (Monaco) :
+    /// parsing -> arbre de pages -> interprétation -> résolution de contour
+    /// -> rasterisation. Vérifie qu'au moins un pixel non blanc est peint là
+    /// où le texte "AVIL" est positionné (pas de comparaison pixel-perfect,
+    /// juste une preuve que le glyphe est réellement dessiné).
+    #[test]
+    fn renders_real_embedded_font_glyphs() {
+        use pdf_core::interp::Interpreter;
+        use pdf_core::Document;
+
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/embedded_truetype_font.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        assert!(display.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Glyph {
+                outline: Some(_),
+                ..
+            }
+        )));
+
+        let pixmap = render_page(&display, page.media_box).unwrap();
+        let has_non_white_pixel = (0..pixmap.width()).any(|x| {
+            (0..pixmap.height()).any(|y| {
+                let px = pixmap.pixel(x, y).unwrap();
+                (px.red(), px.green(), px.blue()) != (255, 255, 255)
+            })
+        });
+        assert!(
+            has_non_white_pixel,
+            "expected glyph ink somewhere on the page"
         );
     }
 }

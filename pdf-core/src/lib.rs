@@ -1,0 +1,20 @@
+//! Moteur PDF maison — voir architecture.md pour la vue d'ensemble.
+//!
+//! Couches implémentées à ce stade (Sprint 1-4, voir sprint.md) :
+//! lexer -> objets COS -> xref/trailer -> modèle document minimal.
+//!
+//! Non encore implémenté (sprints ultérieurs) : object streams / xref
+//! streams (PDF 1.5+), filtres autres que ceux listés dans `filters`,
+//! interpréteur de flux de contenu, rendu, polices, édition.
+
+pub mod document;
+pub mod error;
+pub mod filters;
+pub mod lexer;
+pub mod object;
+pub mod parser;
+pub mod xref;
+
+pub use document::Document;
+pub use error::{PdfError, Result};
+pub use object::{Dictionary, Name, ObjRef, Object, Stream};

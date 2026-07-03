@@ -1,0 +1,12 @@
+[package]
+name = "pdf-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pdf-cli"
+path = "src/main.rs"
+
+[dependencies]
+pdf-core = { workspace = true }

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "pdf-core",
+    "pdf-text",
+    "pdf-render",
+    "pdf-edit",
+    "pdf-app",
+    "pdf-ui",
+    "pdf-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Loïc Berthod"]
+
+[workspace.dependencies]
+pdf-core = { path = "pdf-core" }
+pdf-text = { path = "pdf-text" }
+pdf-render = { path = "pdf-render" }
+pdf-edit = { path = "pdf-edit" }
+pdf-app = { path = "pdf-app" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true

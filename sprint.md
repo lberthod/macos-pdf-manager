@@ -8,11 +8,11 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 **Objectif :** poser le socle du repo et de l'outillage, sans encore toucher au parsing PDF.
 
-- [ ] Créer le workspace Cargo (`pdf-core`, `pdf-text`, `pdf-render`, `pdf-edit`, `pdf-app`, `pdf-ui`, `pdf-cli`) avec crates vides.
-- [ ] Configurer CI : `cargo fmt --check`, `cargo clippy`, `cargo test`.
-- [ ] Constituer un premier corpus de PDF de référence (variés : simples, malformés, scannés, formulaires).
+- [x] Créer le workspace Cargo (`pdf-core`, `pdf-text`, `pdf-render`, `pdf-edit`, `pdf-app`, `pdf-ui`, `pdf-cli`) avec crates vides.
+- [x] Configurer CI : `cargo fmt --check`, `cargo clippy`, `cargo test` (GitHub Actions).
+- [ ] Constituer un premier corpus de PDF de référence (variés : simples, malformés, scannés, formulaires) — un seul fixture minimal existe pour l'instant, corpus large à faire.
 - [ ] Écrire le harnais de comparaison d'images (diff pixel + seuil) pour les futurs tests de rendu.
-- [ ] `pdf-cli` minimal (parse les arguments, ouvre un fichier, affiche sa taille).
+- [x] `pdf-cli` minimal (`dump` : ouvre un fichier, affiche sa structure).
 
 **Critère de sortie :** CI verte sur un commit vide, corpus versionné, `pdf-cli` compile et s'exécute.
 
@@ -22,10 +22,10 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 **Objectif :** lire un PDF en tokens puis en objets typés.
 
-- [ ] Lexer/tokenizer (`&[u8]` → `Token`), tolérant aux fichiers malformés.
-- [ ] Modèle `Object` (Null, Boolean, Integer, Real, String, Name, Array, Dictionary, Stream, Reference).
-- [ ] Parser d'objets indirects (`N G obj ... endobj`).
-- [ ] Tests unitaires lexer/parser sur cas limites (chaînes échappées, nombres malformés, commentaires).
+- [x] Lexer/tokenizer (`&[u8]` → `Token`), tolérant aux fichiers malformés.
+- [x] Modèle `Object` (Null, Boolean, Integer, Real, String, Name, Array, Dictionary, Stream, Reference).
+- [x] Parser d'objets indirects (`N G obj ... endobj`).
+- [x] Tests unitaires lexer/parser sur cas limites (chaînes échappées, nombres malformés, commentaires).
 
 **Critère de sortie :** parsing correct d'objets isolés sur un jeu de PDF de test.
 
@@ -35,14 +35,14 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 **Objectif :** reconstruire le graphe complet d'un document PDF.
 
-- [ ] Table xref classique (`xref`/`trailer`).
-- [ ] Cross-reference streams (PDF 1.5+) et object streams (`/ObjStm`).
-- [ ] Chaînes de mises à jour incrémentales (`/Prev`).
-- [ ] Récupération d'erreur : reconstruction par scan `N G obj` si xref corrompue.
-- [ ] Résolution paresseuse des références + cache d'objets.
-- [ ] Filtres de flux prioritaires : `FlateDecode`, `ASCIIHexDecode`, `ASCII85Decode`, prédicteurs PNG/TIFF.
+- [x] Table xref classique (`xref`/`trailer`).
+- [ ] Cross-reference streams (PDF 1.5+) et object streams (`/ObjStm`) — pas encore supportés, nécessaire pour les PDF récents (Acrobat 6+).
+- [x] Chaînes de mises à jour incrémentales (`/Prev`).
+- [x] Récupération d'erreur : reconstruction par scan `N G obj` si xref corrompue ou `startxref` introuvable.
+- [x] Résolution paresseuse des références + cache d'objets.
+- [x] Filtres de flux prioritaires : `FlateDecode`, `ASCIIHexDecode`, `ASCII85Decode`. `LZWDecode` et prédicteurs PNG/TIFF restent à faire.
 
-**Critère de sortie (fin Phase 1) :** `pdf-cli dump` affiche la structure de n'importe quel PDF du corpus ; ouverture sans crash sur plusieurs centaines de PDF variés.
+**Critère de sortie (fin Phase 1) :** `pdf-cli dump` affiche la structure de n'importe quel PDF du corpus ; ouverture sans crash sur plusieurs centaines de PDF variés. **Statut réel : validé uniquement sur un fixture minimal fait main — le corpus large et les object/xref streams (PDF 1.5+) manquent encore avant de considérer la Phase 1 terminée.**
 
 ---
 

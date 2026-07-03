@@ -1,0 +1,11 @@
+[package]
+name = "pdf-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pdf-core = { workspace = true }
+pdf-text = { workspace = true }
+pdf-render = { workspace = true }
+pdf-edit = { workspace = true }

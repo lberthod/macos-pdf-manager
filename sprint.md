@@ -50,13 +50,13 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 **Objectif :** exposer une API document/page typée et interpréter le flux de contenu.
 
-- [ ] Modèle document (`Document`, `Page`, catalogue, arbre des pages, ressources).
-- [ ] Interpréteur de flux de contenu : état graphique (`q/Q/cm/gs`), chemins (`m l c v y re`, peinture, clipping).
-- [ ] Opérateurs texte (`BT/ET`, `Tf`, positionnement, affichage, paramètres).
-- [ ] Opérateurs couleur et espaces colorimétriques de base (`DeviceRGB/Gray/CMYK`).
-- [ ] Sortie : `DisplayList` (glyphes, chemins, images résolus).
+- [x] Modèle document (`Document`, `Page`, catalogue, arbre des pages, ressources) — parcours récursif `/Pages` avec héritage `Resources`/`MediaBox`/`Rotate` et garde anti-cycle (`page.rs`).
+- [x] Interpréteur de flux de contenu : état graphique (`q/Q/cm`, pile), chemins (`m l c v y re`, peinture `S/s/f/F/f*/B/B*/b/b*/n`), clip signalé (`W/W*`) mais pas encore appliqué au rendu. `gs` (ExtGState) partiellement pris en compte (`/LW` seulement).
+- [x] Opérateurs texte (`BT/ET`, `Tf`, `Td/TD/Tm/T*`, `Tj/TJ/'/"`, `Tc/Tw/Tz/TL/Ts`) — un `DisplayItem::Glyph` par code de caractère brut ; **limitation connue** : ni les codes ne sont résolus en Unicode, ni l'avance ne reflète les vraies largeurs de police (`/Widths`, `/FontFile`) — heuristique constante en attendant Sprint 7-8, signalée via `advance_is_estimated`.
+- [x] Opérateurs couleur (`g/G rg/RG k/K sc/scn/SC/SCN`) — espaces colorimétriques déduits du nombre de composantes (1/3/4 = Gray/Rgb/Cmyk) ; `cs/CS` et les espaces nommés (`ICCBased`, `Indexed`, `Separation`) ne sont pas résolus.
+- [x] Sortie : `DisplayList` (`display.rs`) — chemins, glyphes (position seulement), images (position seulement, pas de décodage pixel). XObjects Form gérés récursivement (`Do`, avec garde de profondeur) ; XObjects Image et images inline (`BI/ID/EI`) repérés mais pas décodés.
 
-**Critère de sortie :** display list correcte générée pour un sous-ensemble de PDF simples (texte + formes).
+**Critère de sortie :** display list correcte générée pour un sous-ensemble de PDF simples (texte + formes). **Validé** de bout en bout sur les fixtures réels (`pdf-cli render-info`) : un rectangle rempli → 1 `Path`, une ligne de texte → 1 `Glyph` par caractère. Les limitations ci-dessus (largeurs de police, décodage image, clip réel, espaces colorimétriques avancés) restent à lever aux sprints suivants.
 
 ---
 

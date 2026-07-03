@@ -7,14 +7,19 @@
 //! streams (PDF 1.5+), filtres autres que ceux listés dans `filters`,
 //! interpréteur de flux de contenu, rendu, polices, édition.
 
+pub mod content;
+pub mod display;
 pub mod document;
 pub mod error;
 pub mod filters;
+pub mod interp;
 pub mod lexer;
 pub mod object;
+pub mod page;
 pub mod parser;
 pub mod xref;
 
 pub use document::Document;
 pub use error::{PdfError, Result};
 pub use object::{Dictionary, Name, ObjRef, Object, Stream};
+pub use page::Page;

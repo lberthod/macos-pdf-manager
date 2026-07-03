@@ -1,3 +1,5 @@
+use pdf_core::display::DisplayItem;
+use pdf_core::interp::Interpreter;
 use pdf_core::{Document, Object};
 use std::env;
 use std::fs;
@@ -5,35 +7,41 @@ use std::process::ExitCode;
 
 fn print_usage() {
     eprintln!("usage: pdf-cli dump <file.pdf>");
+    eprintln!("       pdf-cli render-info <file.pdf> [page_index]");
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("dump") => match args.get(2) {
-            Some(path) => match run_dump(path) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            None => {
-                print_usage();
-                ExitCode::FAILURE
-            }
-        },
-        _ => {
+    let result = match args.get(1).map(String::as_str) {
+        Some("dump") => args.get(2).map(|path| run_dump(path)),
+        Some("render-info") => args.get(2).map(|path| {
+            let page_index: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            run_render_info(path, page_index)
+        }),
+        _ => None,
+    };
+
+    match result {
+        Some(Ok(())) => ExitCode::SUCCESS,
+        Some(Err(e)) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+        None => {
             print_usage();
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_dump(path: &str) -> pdf_core::Result<()> {
+fn read_document(path: &str) -> pdf_core::Result<Document> {
     let bytes = fs::read(path)
         .map_err(|e| pdf_core::PdfError::InvalidObject(0, format!("cannot read `{path}`: {e}")))?;
-    let doc = Document::open(bytes)?;
+    Document::open(bytes)
+}
+
+fn run_dump(path: &str) -> pdf_core::Result<()> {
+    let doc = read_document(path)?;
 
     println!("File: {path}");
     println!("Objects (via xref): {}", doc.object_count());
@@ -58,6 +66,44 @@ fn run_dump(path: &str) -> pdf_core::Result<()> {
                 println!("Info /{key}: {}", String::from_utf8_lossy(s));
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Exerce le pipeline complet (Sprint 5-6) : arbre des pages -> flux de
+/// contenu décodé -> interpréteur -> DisplayList, et affiche un résumé.
+fn run_render_info(path: &str, page_index: usize) -> pdf_core::Result<()> {
+    let doc = read_document(path)?;
+    let page = doc.page(page_index)?;
+    let content = doc.page_content(&page)?;
+    let display = Interpreter::run_page(&doc, page.resources.clone(), &content)?;
+
+    println!("File: {path}");
+    println!(
+        "Page: {page_index} (MediaBox {:?}, Rotate {})",
+        page.media_box, page.rotate
+    );
+    println!("Content stream: {} bytes decoded", content.len());
+
+    let (mut paths, mut glyphs, mut images) = (0, 0, 0);
+    for item in &display.items {
+        match item {
+            DisplayItem::Path { .. } => paths += 1,
+            DisplayItem::Glyph { .. } => glyphs += 1,
+            DisplayItem::Image { .. } => images += 1,
+        }
+    }
+    println!(
+        "DisplayList items: {} paths, {} glyphs, {} images",
+        paths, glyphs, images
+    );
+
+    if let Some(text) = display.items.iter().find_map(|item| match item {
+        DisplayItem::Glyph { code, .. } => Some(*code as u8 as char),
+        _ => None,
+    }) {
+        println!("First glyph code: {text:?}");
     }
 
     Ok(())

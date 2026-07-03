@@ -59,6 +59,12 @@ impl<'a> Lexer<'a> {
         self.pos = pos.min(self.data.len());
     }
 
+    /// Octets restants à partir de la position courante (utile pour les
+    /// scans bruts, p. ex. localiser `EI` pour une image inline).
+    pub fn remaining(&self) -> &'a [u8] {
+        &self.data[self.pos..]
+    }
+
     fn peek_byte(&self) -> Option<u8> {
         self.data.get(self.pos).copied()
     }

@@ -121,24 +121,11 @@ impl Document {
             .ok_or(PdfError::UnexpectedType("Dictionary"))
     }
 
-    fn pages_root(&self) -> Result<Dictionary> {
-        let root = self.root()?;
-        let pages_obj = root
-            .get("Pages")
-            .ok_or_else(|| PdfError::MissingKey("Pages".into()))?;
-        let pages = self.get(pages_obj)?;
-        pages
-            .as_dict()
-            .cloned()
-            .ok_or(PdfError::UnexpectedType("Dictionary"))
-    }
-
-    /// Nombre de pages via `/Root /Pages /Count` (ne parcourt pas l'arbre :
-    /// suffisant pour la majorité des PDF bien formés ; le parcours complet
-    /// de l'arbre des pages est prévu Sprint 5-6, voir sprint.md).
+    /// Nombre de pages, obtenu via un parcours réel de l'arbre `/Pages`
+    /// (voir `page.rs`, Sprint 5-6) plutôt que la simple lecture de
+    /// `/Count` (qui peut être absente ou incohérente sur des PDF malformés).
     pub fn page_count(&self) -> Result<usize> {
-        let pages = self.pages_root()?;
-        pages.get_int("Count").map(|n| n as usize)
+        Ok(self.pages()?.len())
     }
 
     pub fn metadata_dict(&self) -> Option<Dictionary> {

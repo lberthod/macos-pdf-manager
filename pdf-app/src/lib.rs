@@ -138,11 +138,13 @@ impl Session {
     /// l'appelant pour convertir les rectangles de `find_matches_on_current_page`
     /// en coordonnées écran.
     pub fn current_page_media_box(&self) -> Result<[f64; 4], String> {
-        Ok(self
-            .doc
-            .page(self.page_index)
-            .map_err(|e| e.to_string())?
-            .media_box)
+        self.page_media_box(self.page_index)
+    }
+
+    /// `MediaBox` de `index`, indépendamment de la page courante (utilisé
+    /// pour dimensionner les lignes du défilement continu).
+    pub fn page_media_box(&self, index: usize) -> Result<[f64; 4], String> {
+        Ok(self.doc.page(index).map_err(|e| e.to_string())?.media_box)
     }
 
     /// Table des matières (`/Outlines`) du document, `[]` si absente. Mise

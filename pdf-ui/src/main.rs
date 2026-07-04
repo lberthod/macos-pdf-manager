@@ -12,11 +12,15 @@
 //! d'occurrence en occurrence page par page **avec surlignage** des
 //! résultats sur la page affichée (`Session::find_matches_on_current_page`),
 //! panneau de miniatures cliquables et panneau de signets (`/Outlines`,
-//! `Session::outline`) pour naviguer directement à une page.
+//! `Session::outline`) pour naviguer directement à une page, et un mode
+//! **défilement continu** (`egui::ScrollArea::show_rows`, virtualisé : seules
+//! les pages proches de la zone visible sont rastérisées) qui affiche
+//! toutes les pages empilées verticalement au lieu d'une à la fois.
 //!
 //! Non géré (voir STATUS.md) : onglets/multi-documents, annotations,
-//! sélection de texte à la souris, scroll continu entre pages (une page à
-//! la fois), raccourcis clavier au-delà des boutons.
+//! sélection de texte à la souris, raccourcis clavier au-delà des boutons.
+//! Limitation du défilement continu : la hauteur de ligne est calculée une
+//! fois sur la page 0 (documents à pages de tailles hétérogènes mal gérés).
 
 use eframe::egui;
 use pdf_app::Session;
@@ -64,6 +68,17 @@ struct ViewerApp {
     show_thumbnails: bool,
     thumbnails: HashMap<usize, egui::TextureHandle>,
     show_outline: bool,
+    continuous_scroll: bool,
+    /// Textures du mode défilement continu, indépendantes de `texture`
+    /// (mode page unique) : une par page déjà rastérisée à l'échelle
+    /// courante. Vidées quand le zoom change (voir `page_textures_zoom_key`).
+    page_textures: HashMap<usize, egui::TextureHandle>,
+    page_textures_zoom_key: Option<u32>,
+    /// Page à faire défiler jusqu'à l'écran au prochain rendu du mode
+    /// continu (navigation depuis la recherche/miniatures/signets/boutons) ;
+    /// consommé (mis à `None`) une fois appliqué pour ne pas entraver le
+    /// défilement manuel de l'utilisateur ensuite.
+    scroll_to_page: Option<usize>,
 }
 
 impl ViewerApp {
@@ -83,6 +98,10 @@ impl ViewerApp {
             show_thumbnails: false,
             thumbnails: HashMap::new(),
             show_outline: false,
+            continuous_scroll: false,
+            page_textures: HashMap::new(),
+            page_textures_zoom_key: None,
+            scroll_to_page: None,
         };
         if let Some(p) = initial_path {
             app.open_path(PathBuf::from(p));
@@ -100,6 +119,9 @@ impl ViewerApp {
         self.highlight_state = None;
         self.highlight_rects.clear();
         self.thumbnails.clear();
+        self.page_textures.clear();
+        self.page_textures_zoom_key = None;
+        self.scroll_to_page = None;
 
         match Session::open(path) {
             Ok(session) => self.session = Some(session),
@@ -121,6 +143,7 @@ impl ViewerApp {
                 self.search_cursor = 0;
                 if let Some(&first) = results.first() {
                     session.goto_page(first);
+                    self.scroll_to_page = Some(first);
                 }
                 self.search_results = Some(results);
                 self.highlighted_query = self.search_query.clone();
@@ -146,9 +169,11 @@ impl ViewerApp {
         let len = results.len() as isize;
         let next = (self.search_cursor as isize + delta).rem_euclid(len) as usize;
         self.search_cursor = next;
+        let target = results[next];
         if let Some(session) = &mut self.session {
-            session.goto_page(results[next]);
+            session.goto_page(target);
         }
+        self.scroll_to_page = Some(target);
     }
 
     /// Re-rastérise la page courante si la page ou le zoom affiché a changé
@@ -313,6 +338,68 @@ fn render_outline_items(
     }
 }
 
+impl ViewerApp {
+    /// Affiche toutes les pages du document empilées verticalement dans une
+    /// seule zone de défilement. Virtualisé via `ScrollArea::show_rows` :
+    /// seules les pages dont la ligne tombe dans (ou près de) la zone
+    /// visible sont rastérisées/chargées en texture, ce qui reste praticable
+    /// sur un document de plusieurs centaines de pages.
+    fn show_continuous_scroll(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let zoom_key = (self.zoom * 1000.0).round() as u32;
+        if self.page_textures_zoom_key != Some(zoom_key) {
+            self.page_textures.clear();
+            self.page_textures_zoom_key = Some(zoom_key);
+        }
+
+        let zoom = self.zoom as f64;
+        let Some(session) = &self.session else {
+            return;
+        };
+        let page_count = session.page_count();
+        if page_count == 0 {
+            return;
+        }
+        // Hauteur de ligne uniforme dérivée de la page 0 (voir limitation
+        // en tête de fichier : documents à pages de tailles hétérogènes).
+        let Ok(media_box) = session.page_media_box(0) else {
+            return;
+        };
+        let row_height = ((media_box[3] - media_box[1]) * zoom) as f32 + 8.0;
+
+        let mut scroll_area = egui::ScrollArea::vertical();
+        if let Some(target) = self.scroll_to_page.take() {
+            scroll_area = scroll_area.vertical_scroll_offset(target as f32 * row_height);
+        }
+
+        let page_textures = &mut self.page_textures;
+        scroll_area.show_rows(ui, row_height, page_count, |ui, row_range| {
+            for index in row_range {
+                if let std::collections::hash_map::Entry::Vacant(entry) = page_textures.entry(index)
+                {
+                    if let Ok(rendered) = session.render_page(index, zoom) {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [rendered.width as usize, rendered.height as usize],
+                            &rendered.rgba,
+                        );
+                        let texture = ctx.load_texture(
+                            format!("page-{index}"),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        entry.insert(texture);
+                    }
+                }
+                if let Some(texture) = page_textures.get(&index) {
+                    ui.vertical_centered(|ui| {
+                        ui.image(texture);
+                    });
+                }
+                ui.add_space(8.0);
+            }
+        });
+    }
+}
+
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -338,6 +425,7 @@ impl eframe::App for ViewerApp {
                 ui.add_enabled_ui(has_doc, |ui| {
                     ui.toggle_value(&mut self.show_thumbnails, "🖼 Miniatures");
                     ui.toggle_value(&mut self.show_outline, "📑 Signets");
+                    ui.toggle_value(&mut self.continuous_scroll, "📜 Continu");
                 });
 
                 ui.separator();
@@ -346,6 +434,7 @@ impl eframe::App for ViewerApp {
                     if ui.button("◀ Précédente").clicked() {
                         if let Some(session) = &mut self.session {
                             session.prev_page();
+                            self.scroll_to_page = Some(session.page_index());
                         }
                     }
                 });
@@ -358,6 +447,7 @@ impl eframe::App for ViewerApp {
                     if ui.button("Suivante ▶").clicked() {
                         if let Some(session) = &mut self.session {
                             session.next_page();
+                            self.scroll_to_page = Some(session.page_index());
                         }
                     }
                 });
@@ -425,6 +515,7 @@ impl eframe::App for ViewerApp {
                 if let Some(session) = &mut self.session {
                     session.goto_page(clicked);
                 }
+                self.scroll_to_page = Some(clicked);
             }
         }
 
@@ -433,6 +524,7 @@ impl eframe::App for ViewerApp {
                 if let Some(session) = &mut self.session {
                     session.goto_page(clicked);
                 }
+                self.scroll_to_page = Some(clicked);
             }
         }
 
@@ -454,6 +546,11 @@ impl eframe::App for ViewerApp {
             let zoom_delta = ctx.input(|i| i.zoom_delta());
             if zoom_delta != 1.0 {
                 self.set_zoom(self.zoom * zoom_delta);
+            }
+
+            if self.continuous_scroll {
+                self.show_continuous_scroll(ui, ctx);
+                return;
             }
 
             self.ensure_texture(ctx);

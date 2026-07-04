@@ -66,11 +66,29 @@ pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
         )));
     }
 
-    let color_space = resolve_color_space(doc, &stream.dict)?;
-    let components = color_space.components();
+    let declared_color_space = resolve_color_space(doc, &stream.dict)?;
 
     let decoded = decode_stream(stream)?;
-    let expected_len = width as usize * height as usize * components;
+
+    // `zune-jpeg` (comme de nombreux décodeurs JPEG, y compris ceux des
+    // navigateurs) convertit certains JPEG CMYK/YCCK en sortie RGB à 3
+    // composantes plutôt que de préserver les 4 composantes d'origine —
+    // observé sur des CMYK JPEG produits par Pillow. Dans ce cas, la
+    // disposition réelle des octets décodés ne correspond plus au
+    // `/ColorSpace` déclaré (`DeviceCMYK`) : on fait confiance à ce que le
+    // décodeur a effectivement produit plutôt qu'à la déclaration PDF.
+    let pixel_count = width as usize * height as usize;
+    let color_space = if declared_color_space == ColorSpaceKind::Cmyk
+        && decoded.len() >= pixel_count * 3
+        && decoded.len() < pixel_count * 4
+    {
+        ColorSpaceKind::Rgb
+    } else {
+        declared_color_space
+    };
+    let components = color_space.components();
+
+    let expected_len = pixel_count * components;
     if decoded.len() < expected_len {
         return Err(PdfError::DecodeError(format!(
             "image data too short: got {} bytes, expected at least {expected_len}",

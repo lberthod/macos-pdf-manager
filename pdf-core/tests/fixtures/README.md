@@ -229,4 +229,189 @@ page12.Contents = pikepdf.Stream(pdf12, f"BT /F1 48 Tf 50 100 Td <{gid_a:04X}{gi
 pdf12.save("type0_cid_truetype.pdf")
 ```
 
-Ce corpus reste modeste (15 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9), mais couvre désormais au moins un représentant de chaque catégorie avancée citée par ce critère (rotation, formulaire, chiffrement, CJK, document de taille non triviale, table des matières, police composite `/Type0`) — un PDF réellement scanné (image plein page sans couche texte) et un PDF/A restent à ajouter.
+- `bold_italic_standard_fonts.pdf` — cinq lignes en polices standard non embarquées **hors Helvetica plain** (`Times-Bold`, `Times-Italic`, `Courier-BoldOblique`, `Helvetica-BoldOblique`, `Symbol`) : exerce la sélection de face gras/italique de la substitution système (`.ttc` avec choix de face) au-delà du seul fixture Helvetica déjà couvert.
+- `landscape_mixed_page_sizes.pdf` — 3 pages de tailles/orientations différentes (Letter portrait, A4 paysage, carré 300×300), générées avec `reportlab.Canvas.setPageSize` entre chaque page. Sert de fixture de non-régression pour la limitation connue du défilement continu de `pdf-ui` (hauteur de ligne dérivée de la page 0 uniquement, voir sprint.md Sprint 9-10) et plus généralement pour vérifier que chaque page garde bien sa propre `/MediaBox`.
+- `cmyk_jpeg.pdf` — photo JPEG **CMYK** (4 composantes, Pillow `Image.new("CMYK", ...)`) plutôt que RGB. A mis en évidence un vrai bug lors de la construction de ce fixture : `zune-jpeg` convertit certains JPEG CMYK/YCCK en sortie RGB (3 composantes) au lieu de préserver les 4 composantes déclarées par `/ColorSpace /DeviceCMYK`, ce qui faisait échouer silencieusement le décodage (`image.rs::decode_image` calculait une taille attendue sur la base des 4 composantes déclarées). Corrigé dans `image.rs::decode_image` : la disposition réelle des octets décodés (déduite de leur longueur) prime sur la déclaration `/ColorSpace` quand les deux divergent.
+- `incremental_updates_chain.pdf` — trois mises à jour incrémentales chaînées (`/Prev -> /Prev -> /Prev`, `pikepdf` réouverture + re-sauvegarde x3), chacune *ajoutant* une ligne de texte au flux de contenu existant (`/Contents` devient un tableau) plutôt que de le remplacer — contre le seul niveau simple déjà couvert par `corrupted_missing_xref.pdf`. Sert à vérifier que la chaîne complète reste résolvable et que le contenu de chaque révision reste lisible.
+- `malformed_wrong_length.pdf` — `/Length` d'un flux de contenu délibérément trop court de 10 octets (erreur d'auteurs réelle courante, différente de la xref tronquée déjà couverte par `corrupted_missing_xref.pdf`). Sert à vérifier que le parseur retrouve la fin réelle du flux via le mot-clé `endstream` plutôt que de tronquer silencieusement le contenu à la valeur (fausse) de `/Length`.
+- `encrypted_aes256.pdf` — PDF chiffré **AES-256** (`pikepdf.Encryption(..., R=6, aes=True)`), complémentaire à `encrypted_rc4.pdf` (RC4 40 bits) : vérifie que `PdfError::Encrypted` est bien renvoyé pour ce filtre de chiffrement aussi, pas seulement pour RC4.
+- `indexed_color_image.pdf` — image `/ColorSpace /Indexed /DeviceRGB` (palette 4 couleurs + échantillons 1 octet/pixel), construite à la main avec pikepdf. `/Indexed` n'est pas résolu (`image.rs::resolve_color_space`, limitation documentée) : ce fixture sert de non-régression pour la dégradation gracieuse attendue — la page s'ouvre et se rend sans planter, l'image apparaît dans la `DisplayList` avec `pixels: None` plutôt que de faire échouer toute la page.
+- `scanned_page_like.pdf` — page pleine (850×1100) occupée entièrement par une seule image JPEG (damier synthétique en niveaux proches, Pillow), sans aucun texte ni police — reproduit la structure d'un vrai PDF scanné (image plein page, pas de couche texte) sans nécessiter `CCITTFaxDecode`/`JBIG2Decode` (hors périmètre de cette passe, voir sprint.md) : comble partiellement le manque signalé de longue date dans ce README, sur le chemin `DCTDecode` déjà supporté.
+- `pdfa_like_minimal.pdf` — approximation structurelle minimale de PDF/A : `/Metadata` (flux XMP avec `pdfaid:part`/`pdfaid:conformance`) + `/OutputIntents` (`/S /GTS_PDFA1`), sans validation de conformité PDF/A complète (hors périmètre de cette passe). Sert à exercer le chemin `/Metadata`/`/OutputIntents`, absent du reste du corpus.
+- `type0_cid_cff.pdf` — texte chinois simplifié (`你好`) en police composite **`/Type0`/`CIDFontType0`** (CFF CID-keyed, `/FontFile3` sous-type `CIDFontType0C`) : sous-ensemble réel de Hiragino Sans GB (`/System/Library/Fonts/Hiragino Sans GB.ttc`, police système CJK, `/ROS Adobe-GB1`) extrait via `fonttools subset --font-number=0 --text="你好"`. Les codes du flux de contenu (`<07760B46>`) sont les **CID** (1914 et 2886, lus dans le charset CFF du sous-ensemble après coup, `cid01914`/`cid02886`) — pas des GID : contrairement à `type0_cid_truetype.pdf` (`/CIDFontType2`, `/CIDToGIDMap /Identity`), ce chemin résout le glyphe via le charset interne de la table CFF (`font.rs::cid_glyph_outline`, `ttf_parser::cff::Table::glyph_cid` inversé), sans jamais consulter `/CIDToGIDMap`. Construit à la main avec pikepdf (comme `embedded_cff_font.pdf`/`type0_cid_truetype.pdf`), avec `/ToUnicode` et `/W` par CID. Comble le manque signalé dans sprint.md (Sprint 7-8) : premier fixture réel `/CIDFontType0` du corpus (les tests correspondants dans `font.rs` restaient synthétiques). Validé par rendu PNG (724 pixels non blancs) et `pdf-cli text` (`"你好"` recomposé exactement).
+
+Ce corpus compte désormais 25 fichiers : toujours loin du « plusieurs centaines de PDF variés » au sens littéral du critère de sortie de la Phase 1 (architecture.md §9) — obtenir des centaines de PDF *réels* (scans, formulaires remplis en pratique, PDF/A produits par des outils tiers variés) demanderait une source externe (web, jeux de données publics) qui n'est pas accessible depuis cet environnement de développement, et ne serait de toute façon qu'une accumulation de volume, pas de diversité structurelle si elle n'est pas triée. À la place, ce corpus a été élargi en profondeur : il couvre maintenant un représentant de chaque catégorie avancée citée par le critère (rotation, formulaire, chiffrement RC4 **et** AES-256, CJK avec police composite `/CIDFontType0` **et** `/CIDFontType2`, document de taille non triviale, table des matières, tailles de page hétérogènes, chaîne de mises à jour incrémentales à 3 niveaux, corruption de flux par `/Length` erroné, espace colorimétrique non supporté avec dégradation gracieuse, image CMYK, page pleine image façon scan, métadonnées PDF/A-like) plutôt qu'une seule variante par grande catégorie. Chaque fixture visuel est aussi désormais comparé pixel par pixel à une image de référence (`pdf-render/tests/golden.rs` + `pdf-render-gpu/tests/cross_backend.rs`, voir ces fichiers) plutôt que seulement vérifié "ça n'a pas planté" — ce qui répond au deuxième trou identifié dès le Sprint 0 (harnais de comparaison d'images). Un vrai corpus de volume avec des scans/PDF/A authentiques reste une tâche distincte, à mener avec un accès à des jeux de données externes.
+
+Régénération des 10 fixtures les plus récentes (nécessite le même venv que ci-dessus) :
+
+```python
+# bold_italic_standard_fonts.pdf
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.setFont("Times-Bold", 24); c.drawString(72, 740, "Times-Bold heading")
+c.setFont("Times-Italic", 18); c.drawString(72, 710, "Times-Italic subheading")
+c.setFont("Courier-BoldOblique", 16); c.drawString(72, 680, "Courier-BoldOblique code")
+c.setFont("Helvetica-BoldOblique", 16); c.drawString(72, 650, "Helvetica-BoldOblique emphasis")
+c.setFont("Symbol", 20); c.drawString(72, 620, "abgd")
+c.showPage(); c.save()
+with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
+    pdf.save("bold_italic_standard_fonts.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# landscape_mixed_page_sizes.pdf (Letter -> A4 paysage -> carré)
+from reportlab.lib.pagesizes import A4, landscape
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.drawString(72, 720, "Page 1 - Letter portrait"); c.rect(72, 600, 200, 100); c.showPage()
+c.setPageSize(landscape(A4)); c.drawString(72, 400, "Page 2 - A4 landscape"); c.rect(72, 300, 200, 80); c.showPage()
+c.setPageSize((300, 300)); c.drawString(30, 260, "Page 3 - square"); c.rect(30, 100, 150, 100); c.showPage()
+c.save()
+with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
+    pdf.save("landscape_mixed_page_sizes.pdf", object_stream_mode=ObjectStreamMode.generate, static_id=True)
+
+# cmyk_jpeg.pdf (nécessite aussi Pillow)
+img = Image.new("CMYK", (100, 80))
+px = img.load()
+for y in range(80):
+    for x in range(100):
+        px[x, y] = (int(255 * x / 99), int(255 * y / 79), 40, 10)
+jpeg_buf = io.BytesIO(); img.save(jpeg_buf, format="JPEG", quality=90); jpeg_buf.seek(0)
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.drawString(72, 750, "CMYK JPEG test")
+c.drawImage(ImageReader(jpeg_buf), 72, 600, width=200, height=160)
+c.showPage(); c.save()
+with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
+    pdf.save("cmyk_jpeg.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# incremental_updates_chain.pdf (3 sauvegardes incrémentales chaînées)
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.drawString(72, 720, "Revision 1"); c.showPage(); c.save()
+data = buf.getvalue()
+for i in range(2, 5):
+    with Pdf.open(io.BytesIO(data)) as pdf:
+        page = pdf.pages[0]
+        content = f"BT /F1 24 Tf 72 {680 - i * 20} Td (Revision {i}) Tj ET".encode("ascii")
+        new_stream = pikepdf.Stream(pdf, content)
+        existing = page.Contents
+        page.Contents = (pikepdf.Array([existing, new_stream]) if not isinstance(existing, pikepdf.Array)
+                          else pikepdf.Array(list(existing) + [new_stream]))
+        out = io.BytesIO()
+        pdf.save(out, object_stream_mode=ObjectStreamMode.disable, linearize=False)
+        data = out.getvalue()
+with open("incremental_updates_chain.pdf", "wb") as f:
+    f.write(data)
+
+# malformed_wrong_length.pdf (base sauvegardée en qdf=True, /Length raccourci de 10)
+import re
+with open("_wrong_length_base.pdf", "rb") as f:
+    raw = bytearray(f.read())
+m = re.search(rb"/Length (\d+)", raw)
+new_len = max(int(m.group(1)) - 10, 1)
+raw = raw[: m.start(1)] + str(new_len).encode() + raw[m.end(1):]
+with open("malformed_wrong_length.pdf", "wb") as f:
+    f.write(raw)
+
+# encrypted_aes256.pdf
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.drawString(72, 720, "AES-256 encrypted PDF test"); c.showPage(); c.save()
+with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
+    pdf.save("encrypted_aes256.pdf", encryption=pikepdf.Encryption(owner="ownerpass", user="", R=6, aes=True))
+
+# indexed_color_image.pdf
+pdf = pikepdf.new()
+page = pdf.add_blank_page(page_size=(200, 200))
+palette = bytes([0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255])
+width, height = 50, 50
+samples = bytes([(x // 13 + y // 13) % 4 for y in range(height) for x in range(width)])
+image_stream = pikepdf.Stream(pdf, samples)
+image_stream.Type = pikepdf.Name.XObject; image_stream.Subtype = pikepdf.Name.Image
+image_stream.Width = width; image_stream.Height = height; image_stream.BitsPerComponent = 8
+image_stream.ColorSpace = pikepdf.Array([
+    pikepdf.Name.Indexed, pikepdf.Name.DeviceRGB, 3, pikepdf.String(palette.decode("latin1"))
+])
+page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=image_stream))
+page.Contents = pikepdf.Stream(pdf, b"q 150 0 0 150 25 25 cm /Im0 Do Q")
+pdf.save("indexed_color_image.pdf")
+
+# scanned_page_like.pdf
+img = Image.new("RGB", (850, 1100))
+px = img.load()
+for y in range(1100):
+    for x in range(850):
+        px[x, y] = (245, 245, 240) if (x // 40 + y // 40) % 2 == 0 else (238, 238, 230)
+jpeg_buf = io.BytesIO(); img.save(jpeg_buf, format="JPEG", quality=80); jpeg_buf.seek(0)
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=(850, 1100))
+c.drawImage(ImageReader(jpeg_buf), 0, 0, width=850, height=1100)
+c.showPage(); c.save()
+with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
+    pdf.save("scanned_page_like.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# pdfa_like_minimal.pdf
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.drawString(72, 720, "PDF/A-like metadata test"); c.showPage(); c.save()
+with Pdf.open(io.BytesIO(buf.getvalue())) as pdf:
+    xmp = b"""<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
+   <pdfaid:part>1</pdfaid:part>
+   <pdfaid:conformance>B</pdfaid:conformance>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"""
+    meta_stream = pdf.make_indirect(pikepdf.Stream(pdf, xmp))
+    meta_stream.Type = pikepdf.Name.Metadata; meta_stream.Subtype = pikepdf.Name.XML
+    pdf.Root.Metadata = meta_stream
+    output_intent = pdf.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name.OutputIntent, S=pikepdf.Name.GTS_PDFA1,
+        OutputConditionIdentifier=pikepdf.String("sRGB"),
+    ))
+    pdf.Root.OutputIntents = pikepdf.Array([output_intent])
+    pdf.save("pdfa_like_minimal.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# type0_cid_cff.pdf (nécessite fonttools ; police système Hiragino Sans GB, CFF CID-keyed)
+from fontTools.ttLib import TTFont as _TTFont2
+# 1) sous-ensembler en ligne de commande :
+#    python -m fontTools.subset "/System/Library/Fonts/Hiragino Sans GB.ttc" \
+#      --font-number=0 --text="你好" --output-file=hiragino_gb_subset.otf --no-layout-closure
+subset_font = _TTFont2("hiragino_gb_subset.otf")
+cff = subset_font["CFF "].cff
+charset = cff[cff.fontNames[0]].charset  # ['.notdef', 'cid01914', 'cid02886']
+cid_ni, cid_hao = [int(name[3:]) for name in charset if name != ".notdef"]
+cff_bytes = subset_font.reader["CFF "]
+
+pdf = pikepdf.new()
+page = pdf.add_blank_page(page_size=(400, 200))
+font_file3 = pikepdf.Stream(pdf, cff_bytes)
+font_file3.Subtype = pikepdf.Name.CIDFontType0C
+descriptor = pdf.make_indirect(pikepdf.Dictionary(
+    Type=pikepdf.Name.FontDescriptor, FontName=pikepdf.Name("/HiraginoSansGB-CID"), Flags=32,
+    FontBBox=pikepdf.Array([-100, -200, 1000, 900]), ItalicAngle=0, Ascent=900,
+    Descent=-200, CapHeight=700, StemV=80, FontFile3=font_file3,
+))
+cid_font = pdf.make_indirect(pikepdf.Dictionary(
+    Type=pikepdf.Name.Font, Subtype=pikepdf.Name.CIDFontType0, BaseFont=pikepdf.Name("/HiraginoSansGB-CID"),
+    CIDSystemInfo=pikepdf.Dictionary(Registry="Adobe", Ordering="GB1", Supplement=6),
+    FontDescriptor=descriptor, DW=1000,
+    W=pikepdf.Array([cid_ni, pikepdf.Array([980]), cid_hao, pikepdf.Array([1000])]),
+))
+to_unicode = (
+    "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+    "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+    "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n2 beginbfchar\n"
+    f"<{cid_ni:04X}> <4F60>\n<{cid_hao:04X}> <597D>\nendbfchar\nendcmap\nend\nend\n"
+).encode("ascii")
+font = pdf.make_indirect(pikepdf.Dictionary(
+    Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type0, BaseFont=pikepdf.Name("/HiraginoSansGB-CID"),
+    Encoding=pikepdf.Name("/Identity-H"), DescendantFonts=pikepdf.Array([cid_font]),
+    ToUnicode=pikepdf.Stream(pdf, to_unicode),
+))
+page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+page.Contents = pikepdf.Stream(pdf, f"BT /F1 48 Tf 50 100 Td <{cid_ni:04X}{cid_hao:04X}> Tj ET".encode("ascii"))
+pdf.save("type0_cid_cff.pdf")
+```

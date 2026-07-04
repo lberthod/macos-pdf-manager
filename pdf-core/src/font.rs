@@ -83,11 +83,15 @@ enum CidToGid {
 /// selon le sous-type du descendant (`/CIDFontType0` vs `/CIDFontType2`,
 /// voir la doc de module).
 enum CidGlyphSource {
-    TrueType { cid_to_gid: CidToGid },
+    TrueType {
+        cid_to_gid: CidToGid,
+    },
     /// CID -> GID précalculé une fois au chargement en parcourant tous les
     /// glyphes de la table CFF (`ttf_parser::cff::Table::glyph_cid`, qui ne
     /// donne que le sens GID -> CID) — pas de coût par glyphe affiché.
-    Cff { cid_to_gid: HashMap<u32, u16> },
+    Cff {
+        cid_to_gid: HashMap<u32, u16>,
+    },
 }
 
 /// Données propres à une police composite (`/Type0`), résolues une fois au
@@ -1183,8 +1187,7 @@ mod tests {
             .find_map(|(_, obj)| {
                 let resolved = doc.get(obj).ok()?;
                 let d = resolved.as_dict()?;
-                (d.get("Subtype").and_then(|o| o.as_name()) == Some("TrueType"))
-                    .then(|| d.clone())
+                (d.get("Subtype").and_then(|o| o.as_name()) == Some("TrueType")).then(|| d.clone())
             })
             .expect("expected an embedded TrueType font resource in the fixture");
 

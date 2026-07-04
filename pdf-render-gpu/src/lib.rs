@@ -62,7 +62,9 @@ use lyon::tessellation::{
     FillVertexConstructor, StrokeOptions, StrokeTessellator, StrokeVertex, StrokeVertexConstructor,
     VertexBuffers,
 };
-use pdf_core::display::{ClipStack, Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
+use pdf_core::display::{
+    ClipStack, Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+};
 use std::rc::Rc;
 
 /// Image RGBA8 rastérisée par ce backend — même forme que
@@ -132,7 +134,10 @@ impl GpuRenderer {
     /// via `Arc`, comme les expose `egui_wgpu::RenderState`) plutôt que d'en
     /// renégocier — c'est ce qui rend ce backend viable dans une boucle de
     /// rendu interactive (voir la doc de `GpuRenderer`).
-    pub fn from_shared(device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Self {
+    pub fn from_shared(
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> Self {
         GpuRenderer(GpuContext { device, queue })
     }
 
@@ -619,22 +624,20 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                 color,
                 ..
             } => {
-                let cached = glyph_cache
-                    .entry((font.clone(), *code))
-                    .or_insert_with(|| {
-                        let path = build_lyon_path(segments)?;
-                        let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-                        let _ = fill_tessellator.tessellate_path(
-                            &path,
-                            &FillOptions::default(), // nonzero, correct pour des glyphes.
-                            &mut BuffersBuilder::new(&mut geometry, RawPosition),
-                        );
-                        if geometry.indices.is_empty() {
-                            None
-                        } else {
-                            Some((geometry.vertices, geometry.indices))
-                        }
-                    });
+                let cached = glyph_cache.entry((font.clone(), *code)).or_insert_with(|| {
+                    let path = build_lyon_path(segments)?;
+                    let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+                    let _ = fill_tessellator.tessellate_path(
+                        &path,
+                        &FillOptions::default(), // nonzero, correct pour des glyphes.
+                        &mut BuffersBuilder::new(&mut geometry, RawPosition),
+                    );
+                    if geometry.indices.is_empty() {
+                        None
+                    } else {
+                        Some((geometry.vertices, geometry.indices))
+                    }
+                });
                 if let Some(geometry) = cached.as_ref() {
                     append_cached_glyph(geometry, transform, to_rgba(*color), mapper, pending);
                 }
@@ -909,38 +912,42 @@ impl GpuContext {
             ],
         }];
 
-        let make_solid_pipeline = |label: &str,
-                                    depth_stencil: wgpu::DepthStencilState,
-                                    color_writes: wgpu::ColorWrites| {
-            self.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&solid_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &solid_shader,
-                        entry_point: "vs_main",
-                        compilation_options: Default::default(),
-                        buffers: &solid_vertex_buffers,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &solid_shader,
-                        entry_point: "fs_main",
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: color_writes,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: Some(depth_stencil),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: None,
-                })
-        };
-        let content_pipeline =
-            make_solid_pipeline("pdf-render-gpu-content", no_stencil_test.clone(), wgpu::ColorWrites::ALL);
+        let make_solid_pipeline =
+            |label: &str,
+             depth_stencil: wgpu::DepthStencilState,
+             color_writes: wgpu::ColorWrites| {
+                self.device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&solid_pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &solid_shader,
+                            entry_point: "vs_main",
+                            compilation_options: Default::default(),
+                            buffers: &solid_vertex_buffers,
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &solid_shader,
+                            entry_point: "fs_main",
+                            compilation_options: Default::default(),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                                write_mask: color_writes,
+                            })],
+                        }),
+                        primitive: wgpu::PrimitiveState::default(),
+                        depth_stencil: Some(depth_stencil),
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview: None,
+                        cache: None,
+                    })
+            };
+        let content_pipeline = make_solid_pipeline(
+            "pdf-render-gpu-content",
+            no_stencil_test.clone(),
+            wgpu::ColorWrites::ALL,
+        );
         let content_pipeline_clipped = make_solid_pipeline(
             "pdf-render-gpu-content-clipped",
             masked_by_stencil.clone(),
@@ -1064,20 +1071,20 @@ impl GpuContext {
                         if geometry.indices.is_empty() {
                             continue;
                         }
-                        let vertex_buffer = self.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("pdf-render-gpu-vertices"),
-                                contents: bytemuck::cast_slice(&geometry.vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        );
-                        let index_buffer = self.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("pdf-render-gpu-indices"),
-                                contents: bytemuck::cast_slice(&geometry.indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            },
-                        );
+                        let vertex_buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("pdf-render-gpu-vertices"),
+                                    contents: bytemuck::cast_slice(&geometry.vertices),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        let index_buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("pdf-render-gpu-indices"),
+                                    contents: bytemuck::cast_slice(&geometry.indices),
+                                    usage: wgpu::BufferUsages::INDEX,
+                                });
                         let pipeline = if is_clipped {
                             &content_pipeline_clipped
                         } else {
@@ -1123,9 +1130,7 @@ impl GpuContext {
                                 entries: &[
                                     wgpu::BindGroupEntry {
                                         binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            &texture_view,
-                                        ),
+                                        resource: wgpu::BindingResource::TextureView(&texture_view),
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 1,
@@ -1134,20 +1139,20 @@ impl GpuContext {
                                 ],
                             });
                         let (vertices, indices) = quad;
-                        let vertex_buffer = self.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("pdf-render-gpu-image-vertices"),
-                                contents: bytemuck::cast_slice(vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        );
-                        let index_buffer = self.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("pdf-render-gpu-image-indices"),
-                                contents: bytemuck::cast_slice(indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            },
-                        );
+                        let vertex_buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("pdf-render-gpu-image-vertices"),
+                                    contents: bytemuck::cast_slice(vertices),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        let index_buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("pdf-render-gpu-image-indices"),
+                                    contents: bytemuck::cast_slice(indices),
+                                    usage: wgpu::BufferUsages::INDEX,
+                                });
                         let pipeline = if is_clipped {
                             &image_pipeline_clipped
                         } else {
@@ -1274,10 +1279,16 @@ mod tests {
         };
 
         let red = renderer
-            .render_page(&rect_display(Color::Rgb(1.0, 0.0, 0.0)), [0.0, 0.0, 100.0, 100.0])
+            .render_page(
+                &rect_display(Color::Rgb(1.0, 0.0, 0.0)),
+                [0.0, 0.0, 100.0, 100.0],
+            )
             .unwrap();
         let blue = renderer
-            .render_page(&rect_display(Color::Rgb(0.0, 0.0, 1.0)), [0.0, 0.0, 100.0, 100.0])
+            .render_page(
+                &rect_display(Color::Rgb(0.0, 0.0, 1.0)),
+                [0.0, 0.0, 100.0, 100.0],
+            )
             .unwrap();
 
         let red_center = pixel(&red, 50, 50);

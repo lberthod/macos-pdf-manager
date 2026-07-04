@@ -406,7 +406,15 @@ impl<'a> Interpreter<'a> {
                 for cid in f.decode_composite(bytes) {
                     let (unicode, width_per_mille) = f.cid_metrics(cid);
                     let outline = f.cid_glyph_outline(cid);
-                    self.emit_glyph(&font_name, cid, unicode, width_per_mille, false, outline, false);
+                    self.emit_glyph(
+                        &font_name,
+                        cid,
+                        unicode,
+                        width_per_mille,
+                        false,
+                        outline,
+                        false,
+                    );
                 }
             }
             Some(f) => {
@@ -481,10 +489,9 @@ impl<'a> Interpreter<'a> {
         } else {
             0.0
         };
-        let advance = (width_per_mille / 1000.0 * self.gs.font_size
-            + self.gs.char_spacing
-            + word_spacing)
-            * self.gs.h_scale;
+        let advance =
+            (width_per_mille / 1000.0 * self.gs.font_size + self.gs.char_spacing + word_spacing)
+                * self.gs.h_scale;
         self.text_matrix = Matrix::translation(advance, 0.0).then(&self.text_matrix);
     }
 
@@ -757,15 +764,18 @@ mod tests {
 
         let doc = Document::open(bytes).unwrap();
         let page = doc.page(0).unwrap();
-        let display =
-            Interpreter::run_page(&doc, page.resources, content.as_bytes()).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources, content.as_bytes()).unwrap();
 
         let glyphs: Vec<&DisplayItem> = display
             .items
             .iter()
             .filter(|i| matches!(i, DisplayItem::Glyph { .. }))
             .collect();
-        assert_eq!(glyphs.len(), 2, "expected 2 glyphs (one per CID), not one per byte");
+        assert_eq!(
+            glyphs.len(),
+            2,
+            "expected 2 glyphs (one per CID), not one per byte"
+        );
 
         let DisplayItem::Glyph {
             code: first_code, ..
@@ -973,6 +983,48 @@ mod tests {
                 "expected a real outline for each glyph of the Type0 fixture"
             );
             assert!(!advance_is_estimated);
+        }
+    }
+
+    /// Symétrique de `real_type0_fixture_recovers_unicode_text_and_real_outlines`
+    /// pour l'autre variante `/Type0` citée comme manquante dans sprint.md
+    /// (Sprint 7-8) : `/CIDFontType0` (CFF CID-keyed, `/FontFile3` sous-type
+    /// `CIDFontType0C`), où le code du flux de contenu est le CID résolu via
+    /// le charset interne de la table CFF plutôt que via `/CIDToGIDMap`
+    /// (`font.rs::cid_glyph_outline`). Sous-ensemble réel de Hiragino Sans GB
+    /// (police système CJK CID-keyed, `/ROS Adobe-GB1`).
+    #[test]
+    fn real_cid_keyed_cff_fixture_recovers_unicode_text_and_real_outlines() {
+        let bytes = include_bytes!("../tests/fixtures/type0_cid_cff.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        let glyphs: Vec<&DisplayItem> = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyph { .. }))
+            .collect();
+        assert_eq!(glyphs.len(), 2);
+
+        let text: String = glyphs
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Glyph { unicode, .. } => *unicode,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "你好");
+
+        for glyph in &glyphs {
+            let DisplayItem::Glyph { outline, .. } = glyph else {
+                unreachable!()
+            };
+            assert!(
+                outline.as_ref().is_some_and(|o| !o.is_empty()),
+                "expected a real outline for each glyph of the CIDFontType0 fixture"
+            );
         }
     }
 

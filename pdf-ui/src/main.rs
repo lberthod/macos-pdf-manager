@@ -56,10 +56,9 @@ fn main() -> eframe::Result<()> {
         "PDF Manager (prototype)",
         options,
         Box::new(|cc| {
-            let gpu = cc
-                .wgpu_render_state
-                .as_ref()
-                .map(|rs| pdf_render_gpu::GpuRenderer::from_shared(rs.device.clone(), rs.queue.clone()));
+            let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
+                pdf_render_gpu::GpuRenderer::from_shared(rs.device.clone(), rs.queue.clone())
+            });
             Ok(Box::new(ViewerApp::new(std::env::args().nth(1), gpu)))
         }),
     )

@@ -270,6 +270,103 @@ mod tests {
         }
     }
 
+    /// Symétrique de `rejects_encrypted_pdf_with_a_clear_error` pour un
+    /// filtre de chiffrement différent (AES-256/R=6, `pikepdf.Encryption(...,
+    /// aes=True)`) plutôt que le seul RC4 40 bits déjà couvert : les deux
+    /// doivent échouer de la même façon claire, pas seulement le premier
+    /// chemin de code de déchiffrement rencontré.
+    #[test]
+    fn rejects_aes256_encrypted_pdf_with_a_clear_error() {
+        let bytes = include_bytes!("../tests/fixtures/encrypted_aes256.pdf").to_vec();
+        match Document::open(bytes) {
+            Err(PdfError::Encrypted) => {}
+            Err(other) => panic!("expected PdfError::Encrypted, got {other:?}"),
+            Ok(_) => panic!("expected an error, encrypted PDF opened successfully"),
+        }
+    }
+
+    /// Trois mises à jour incrémentales chaînées (`/Prev -> /Prev -> /Prev`),
+    /// contre le seul niveau simple déjà couvert par
+    /// `corrupted_missing_xref.pdf` : la chaîne complète doit rester
+    /// résolvable et le contenu de chaque révision (accumulé, pas remplacé)
+    /// doit rester lisible.
+    #[test]
+    fn resolves_a_three_level_incremental_update_chain() {
+        let bytes = include_bytes!("../tests/fixtures/incremental_updates_chain.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 1);
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let text = String::from_utf8_lossy(&content);
+        for revision in ["Revision 1", "Revision 2", "Revision 3", "Revision 4"] {
+            assert!(
+                text.contains(revision),
+                "expected content stream to contain '{revision}', got: {text}"
+            );
+        }
+    }
+
+    /// Un document dont chaque page a une `/MediaBox` différente (portrait
+    /// Letter, paysage A4, carré) doit ouvrir et exposer la bonne taille par
+    /// page — condition posée par la limitation connue du défilement continu
+    /// de `pdf-ui` (hauteur de ligne dérivée de la page 0 uniquement, voir
+    /// sprint.md Sprint 9-10).
+    #[test]
+    fn opens_document_with_differently_sized_pages() {
+        let bytes = include_bytes!("../tests/fixtures/landscape_mixed_page_sizes.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 3);
+        assert_eq!(doc.page(0).unwrap().media_box, [0.0, 0.0, 612.0, 792.0]);
+        assert_eq!(doc.page(1).unwrap().media_box, [0.0, 0.0, 841.0, 595.0]);
+        assert_eq!(doc.page(2).unwrap().media_box, [0.0, 0.0, 300.0, 300.0]);
+    }
+
+    /// PDF avec un `/Length` de flux de contenu délibérément trop court
+    /// (erreur d'auteurs réelle courante), différente de la corruption déjà
+    /// couverte (xref tronquée) : le parseur doit retrouver la fin réelle du
+    /// flux via `endstream` plutôt que de tronquer silencieusement le
+    /// contenu à la valeur (fausse) de `/Length`.
+    #[test]
+    fn recovers_full_stream_content_despite_a_wrong_length_entry() {
+        let bytes = include_bytes!("../tests/fixtures/malformed_wrong_length.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let text = String::from_utf8_lossy(&content);
+        assert!(
+            text.contains("ET"),
+            "expected the full content stream (including its closing ET) to be recovered, got: {text}"
+        );
+    }
+
+    /// `/ColorSpace /Indexed` sur une image n'est pas supporté
+    /// (`image.rs::resolve_color_space`) : ouvrir le document et interpréter
+    /// la page ne doit pas planter, et l'image doit apparaître dans la
+    /// `DisplayList` avec `pixels: None` (dégradation gracieuse déjà
+    /// documentée) plutôt que de faire échouer toute la page.
+    #[test]
+    fn indexed_color_space_image_degrades_gracefully_instead_of_crashing() {
+        let bytes = include_bytes!("../tests/fixtures/indexed_color_image.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display =
+            crate::interp::Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+        let images: Vec<&crate::display::DisplayItem> = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, crate::display::DisplayItem::Image { .. }))
+            .collect();
+        assert_eq!(images.len(), 1);
+        let crate::display::DisplayItem::Image { pixels, .. } = images[0] else {
+            unreachable!()
+        };
+        assert!(
+            pixels.is_none(),
+            "Indexed color space is not supported yet — expected no decoded pixels"
+        );
+    }
+
     #[test]
     fn opens_pdf_with_embedded_cjk_font_without_crashing() {
         // Texte CJK dessiné avec une police TrueType embarquée (Songti) : le

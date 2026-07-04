@@ -20,6 +20,8 @@ pub enum PdfError {
     UnsupportedFilter(String),
     #[error("stream decode error: {0}")]
     DecodeError(String),
+    #[error("encrypted PDF documents are not supported (/Encrypt present in trailer)")]
+    Encrypted,
 }
 
 pub type Result<T> = std::result::Result<T, PdfError>;

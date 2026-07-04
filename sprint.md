@@ -10,7 +10,7 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 
 - [x] Créer le workspace Cargo (`pdf-core`, `pdf-text`, `pdf-render`, `pdf-edit`, `pdf-app`, `pdf-ui`, `pdf-cli`) avec crates vides.
 - [x] Configurer CI : `cargo fmt --check`, `cargo clippy`, `cargo test` (GitHub Actions).
-- [ ] Constituer un premier corpus de PDF de référence (variés : simples, malformés, scannés, formulaires) — 4 fixtures existent (`pdf-core/tests/fixtures/`, voir leur README) : classique, xref stream, object streams, corrompu. Corpus large (centaines de PDF, scans, formulaires, chiffrement) toujours à faire.
+- [ ] Constituer un premier corpus de PDF de référence (variés : simples, malformés, scannés, formulaires) — 13 fixtures existent (`pdf-core/tests/fixtures/`, voir leur README) : classique, xref stream, object streams, corrompu, police pivotée (`/Rotate`), formulaire AcroForm, chiffré (RC4), CJK, document 60 pages. Ce corpus élargi a mis en évidence deux bugs réels, corrigés dans la foulée : `/Rotate` parsé mais jamais appliqué au rendu (`pdf-render::render_page_rotated`), et un PDF chiffré échouait avec une erreur de bas niveau trompeuse au lieu d'un message clair (`PdfError::Encrypted`). Corpus large (centaines de PDF, scans réels, PDF/A) toujours à faire.
 - [ ] Écrire le harnais de comparaison d'images (diff pixel + seuil) pour les futurs tests de rendu.
 - [x] `pdf-cli` minimal (`dump` : ouvre un fichier, affiche sa structure).
 

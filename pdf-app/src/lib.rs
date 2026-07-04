@@ -136,8 +136,9 @@ impl Session {
             .media_box)
     }
 
-    /// Rastérise la page courante à l'échelle `scale` (voir
-    /// `pdf_render::render_page_scaled`). Mis en cache par `(page, échelle)`.
+    /// Rastérise la page courante à l'échelle `scale`, `/Rotate` appliqué
+    /// (voir `pdf_render::render_page_rotated`). Mis en cache par `(page,
+    /// échelle)`.
     pub fn render_current_page(&self, scale: f64) -> Result<Rc<RenderedPage>, String> {
         self.render_page(self.page_index, scale)
     }
@@ -154,7 +155,7 @@ impl Session {
         }
 
         let (page, display) = self.page_display(index)?;
-        let pixmap = pdf_render::render_page_scaled(&display, page.media_box, scale)
+        let pixmap = pdf_render::render_page_rotated(&display, page.media_box, page.rotate, scale)
             .ok_or_else(|| "render target allocation failed".to_string())?;
         let rendered = Rc::new(RenderedPage {
             width: pixmap.width(),

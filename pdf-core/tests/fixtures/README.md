@@ -8,6 +8,11 @@
 - `image_jpeg.pdf` — texte + photo JPEG intégrée (dégradé RGB synthétique généré via Pillow, 120×80), insérée avec `reportlab.Canvas.drawImage` puis re-sauvegardée en xref classique avec `pikepdf`. Le flux résultant chaîne `ASCII85Decode` + `DCTDecode` (comportement par défaut de reportlab), ce qui exerce la chaîne de filtres complète en plus du décodeur JPEG lui-même (`filters.rs::dct_decode`, `image.rs::decode_image`).
 - `embedded_cff_font.pdf` — texte "ABC" en police STIX (`STIXGeneral.otf`, système macOS) intégrée en **CFF/Type1C** (`/FontFile3`, sous-ensemble de 3 glyphes extrait via `fonttools subset` puis sa table `CFF ` brute isolée). Construit **à la main avec pikepdf** (`Dictionary`/`Stream` directs) plutôt qu'avec reportlab, qui n'a pas de support intégré pour produire ce mode d'embarquement. Sert à tester `font.rs::glyph_outline` sur le chemin `ttf_parser::cff::Table` (CFF brut, sans conteneur OpenType).
 - `image_smask.pdf` — rectangle bleu opaque recouvert d'un carré rouge cramoisi **semi-transparent** (`/SMask`, alpha uniforme ~128/255), généré via une image RGBA Pillow insérée avec `reportlab.Canvas.drawImage(..., mask='auto')` (c'est ce paramètre qui déclenche l'extraction de l'alpha en `/SMask` séparé plutôt que de l'aplatir). Sert à tester `image.rs::apply_soft_mask` et la prémultiplication dans `pdf-render`.
+- `rotated_page.pdf` — page avec `/Rotate 90`, générée avec `reportlab` puis `pikepdf` (`pdf.pages[0].Rotate = 90`). Sert à tester l'application de la rotation au rendu (`pdf-render::render_page_rotated`) : a mis en évidence que `/Rotate` était parsé (`Page::rotate`) mais jamais appliqué avant ce fixture.
+- `acroform_textfield.pdf` — page avec un champ de formulaire texte simple (`reportlab.Canvas.acroForm.textfield`). Sert à vérifier que la présence d'un `/AcroForm` n'empêche pas l'ouverture ni l'extraction du texte de la page (le remplissage de formulaire lui-même n'est pas implémenté, voir `pdf-edit`).
+- `encrypted_rc4.pdf` — PDF chiffré RC4 40 bits (`pikepdf.Encryption(owner=..., user="", R=4)`), mot de passe utilisateur vide. Sert à vérifier que `Document::open` échoue avec une erreur claire (`PdfError::Encrypted`) plutôt qu'une erreur de bas niveau trompeuse (ex. `FlateDecode: corrupt deflate stream` sur un flux resté chiffré).
+- `cjk_text.pdf` — texte chinois simplifié (`你好，世界`) en police Songti **intégrée** (`/System/Library/Fonts/Supplemental/Songti.ttc`, choisie parce qu'elle a des contours TrueType `glyf` — la plupart des polices CJK système macOS sont CFF/OTF, non supportées par l'embarqueur TrueType de reportlab). Sert à vérifier que le pipeline ne panique pas sur du texte non latin : les glyphes se rendent correctement (contour résolu via le `cmap` de la police), mais aucun caractère n'est récupéré par `pdf-text` (l'encodage `/Encoding` WinAnsi/StandardEncoding ne couvre pas ces codes) — limite documentée dans STATUS.md.
+- `large_60_pages.pdf` — document de 60 pages (texte + rectangle par page, cross-reference stream + object streams), pour les tests de navigation/recherche/miniatures sur un document de taille non triviale.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -108,6 +113,60 @@ c5.showPage()
 c5.save()
 with Pdf.open(io.BytesIO(buf5.getvalue())) as pdf:
     pdf.save("image_smask.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# rotated_page.pdf
+buf6 = io.BytesIO()
+c6 = canvas.Canvas(buf6, pagesize=letter)
+c6.drawString(72, 720, "Rotated page test")
+c6.rect(72, 600, 200, 100)
+c6.showPage()
+c6.save()
+with Pdf.open(io.BytesIO(buf6.getvalue())) as pdf:
+    pdf.pages[0].Rotate = 90
+    pdf.save("rotated_page.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# acroform_textfield.pdf
+buf7 = io.BytesIO()
+c7 = canvas.Canvas(buf7, pagesize=letter)
+c7.drawString(72, 750, "Simple AcroForm test")
+c7.acroForm.textfield(name="name_field", tooltip="Your name", x=72, y=650, width=200, height=20, borderStyle="inset", forceBorder=True)
+c7.showPage()
+c7.save()
+with Pdf.open(io.BytesIO(buf7.getvalue())) as pdf:
+    pdf.save("acroform_textfield.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# encrypted_rc4.pdf
+buf8 = io.BytesIO()
+c8 = canvas.Canvas(buf8, pagesize=letter)
+c8.drawString(72, 720, "Encrypted PDF test - if you can read this, decryption worked")
+c8.showPage()
+c8.save()
+with Pdf.open(io.BytesIO(buf8.getvalue())) as pdf:
+    pdf.save("encrypted_rc4.pdf", encryption=pikepdf.Encryption(owner="ownerpass", user="", R=4))
+
+# cjk_text.pdf (police Songti : glyf TrueType, contrairement à la plupart
+# des polices CJK système macOS qui sont CFF/OTF et non supportées par
+# l'embarqueur TrueType de reportlab)
+pdfmetrics.registerFont(TTFont("Songti", "/System/Library/Fonts/Supplemental/Songti.ttc", subfontIndex=0))
+buf9 = io.BytesIO()
+c9 = canvas.Canvas(buf9, pagesize=letter)
+c9.setFont("Songti", 24)
+c9.drawString(72, 700, u"你好，世界")
+c9.showPage()
+c9.save()
+with Pdf.open(io.BytesIO(buf9.getvalue())) as pdf:
+    pdf.save("cjk_text.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# large_60_pages.pdf
+buf10 = io.BytesIO()
+c10 = canvas.Canvas(buf10, pagesize=letter)
+for i in range(60):
+    c10.drawString(72, 720, f"Page {i+1} of 60 - large document stress test")
+    c10.rect(72, 600, 200, 100)
+    c10.showPage()
+c10.save()
+with Pdf.open(io.BytesIO(buf10.getvalue())) as pdf:
+    pdf.save("large_60_pages.pdf", object_stream_mode=ObjectStreamMode.generate, static_id=True)
 ```
 
-Ce corpus reste modeste (8 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9). Un corpus plus large (PDF scannés, formulaires AcroForm, PDF chiffrés, CJK, PDF/A...) reste à constituer — voir sprint.md.
+Ce corpus reste modeste (13 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9), mais couvre désormais au moins un représentant de chaque catégorie avancée citée par ce critère (rotation, formulaire, chiffrement, CJK, document de taille non triviale) — un PDF réellement scanné (image plein page sans couche texte) et un PDF/A restent à ajouter.

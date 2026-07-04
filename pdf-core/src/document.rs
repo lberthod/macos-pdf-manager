@@ -18,6 +18,14 @@ pub struct Document {
 impl Document {
     pub fn open(data: Vec<u8>) -> Result<Self> {
         let (xref, trailer) = parse_xref_chain(&data)?;
+        // `/Encrypt` (RC4/AES, ISO 32000-1 §7.6) n'est pas implémenté : sans
+        // ce contrôle explicite, les flux/chaînes restent chiffrés et
+        // échouent plus loin avec des erreurs de bas niveau trompeuses
+        // (ex. "FlateDecode: corrupt deflate stream" au lieu de la vraie
+        // cause). Voir sprint.md Sprint 18+ (chiffrement).
+        if trailer.get("Encrypt").is_some() {
+            return Err(PdfError::Encrypted);
+        }
         Ok(Self {
             data,
             xref,
@@ -217,5 +225,69 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/corrupted_missing_xref.pdf").to_vec();
         let doc = Document::open(bytes).unwrap();
         assert_eq!(doc.page_count().unwrap(), 5);
+    }
+
+    /// Corpus élargi (voir `tests/fixtures/README.md`) : PDF avec des
+    /// caractéristiques avancées non encore supportées nativement, mais qui
+    /// doivent au moins s'ouvrir sans paniquer et donner un comportement
+    /// documenté (succès dégradé ou erreur claire, jamais un panic ou une
+    /// erreur de bas niveau trompeuse).
+    #[test]
+    fn opens_pdf_with_rotate_and_exposes_it_on_the_page() {
+        let bytes = include_bytes!("../tests/fixtures/rotated_page.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        assert_eq!(page.rotate, 90);
+    }
+
+    #[test]
+    fn opens_pdf_with_acroform_without_crashing() {
+        // Le champ de formulaire n'est pas rendu comme un widget interactif
+        // (pdf-edit ne gère pas encore les AcroForm), mais le texte de la
+        // page doit tout de même être extrait normalement : le formulaire
+        // ne doit pas faire échouer le reste du pipeline.
+        let bytes = include_bytes!("../tests/fixtures/acroform_textfield.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 1);
+        let root = doc.root().unwrap();
+        assert!(
+            root.get("AcroForm").is_some(),
+            "fixture should actually contain an AcroForm entry"
+        );
+    }
+
+    /// `/Encrypt` (RC4/AES) n'est pas supporté : `Document::open` doit
+    /// échouer avec une erreur claire (`PdfError::Encrypted`), pas avec un
+    /// message de bas niveau trompeur comme une erreur `FlateDecode` sur du
+    /// contenu resté chiffré.
+    #[test]
+    fn rejects_encrypted_pdf_with_a_clear_error() {
+        let bytes = include_bytes!("../tests/fixtures/encrypted_rc4.pdf").to_vec();
+        match Document::open(bytes) {
+            Err(PdfError::Encrypted) => {}
+            Err(other) => panic!("expected PdfError::Encrypted, got {other:?}"),
+            Ok(_) => panic!("expected an error, encrypted PDF opened successfully"),
+        }
+    }
+
+    #[test]
+    fn opens_pdf_with_embedded_cjk_font_without_crashing() {
+        // Texte CJK dessiné avec une police TrueType embarquée (Songti) : le
+        // pipeline ne doit pas paniquer même si la résolution Unicode via
+        // `/Encoding` (pensée pour WinAnsi/StandardEncoding) ne couvre pas
+        // ces codes — voir STATUS.md pour la limite documentée (glyphes
+        // dessinés via le contour, mais 0 caractère Unicode récupéré).
+        let bytes = include_bytes!("../tests/fixtures/cjk_text.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn opens_large_multipage_pdf() {
+        let bytes = include_bytes!("../tests/fixtures/large_60_pages.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 60);
+        let last_page = doc.page(59).unwrap();
+        assert_eq!(last_page.media_box, [0.0, 0.0, 612.0, 792.0]);
     }
 }

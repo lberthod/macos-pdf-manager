@@ -16,6 +16,9 @@
 //! - Le clip (`W`/`W*`, porté par `DisplayItem::*::clip`) est appliqué via un
 //!   masque `tiny_skia::Mask` rastérisé par intersection des clips imbriqués.
 //! - Espaces colorimétriques : conversion CMYK -> RGB naïve (sans profil ICC).
+//! - La rotation de page (`/Rotate`, voir `render_page_rotated`) est
+//!   appliquée en aval de la rasterisation via une matrice, pas nativement
+//!   par tiny-skia.
 
 use std::rc::Rc;
 
@@ -31,7 +34,8 @@ use tiny_skia::{
 /// Rasterise une page entière en se basant sur son `MediaBox`
 /// (`[x0, y0, x1, y1]`, ISO 32000-1 §7.7.3.3) : la taille du pixmap suit la
 /// largeur/hauteur du MediaBox en points PDF (1 pixel = 1 point). Équivalent
-/// à `render_page_scaled(display, media_box, 1.0)`.
+/// à `render_page_scaled(display, media_box, 1.0)`. N'applique pas
+/// `/Rotate` — voir `render_page_rotated` pour ça.
 pub fn render_page(display: &DisplayList, media_box: [f64; 4]) -> Option<Pixmap> {
     render_page_scaled(display, media_box, 1.0)
 }
@@ -44,18 +48,76 @@ pub fn render_page_scaled(
     media_box: [f64; 4],
     scale: f64,
 ) -> Option<Pixmap> {
+    render_page_rotated(display, media_box, 0, scale)
+}
+
+/// Comme `render_page_scaled`, en appliquant en plus la rotation de page
+/// (`/Rotate`, ISO 32000-1 §7.7.3.3 : multiple de 90° dans le sens horaire,
+/// vu du lecteur). Les dimensions du pixmap sont permutées pour 90°/270°
+/// (portrait -> paysage). `rotate` est normalisé au multiple de 90 le plus
+/// proche modulo 360 (robustesse face à une valeur non conforme).
+pub fn render_page_rotated(
+    display: &DisplayList,
+    media_box: [f64; 4],
+    rotate: i32,
+    scale: f64,
+) -> Option<Pixmap> {
     let scale = scale.max(0.01);
-    let width = ((media_box[2] - media_box[0]) * scale).round().max(1.0) as u32;
-    let height = ((media_box[3] - media_box[1]) * scale).round().max(1.0) as u32;
-    render_to_pixmap(display, width, height, media_box[0], media_box[3], scale)
+    let rotate = normalize_rotate(rotate);
+    let unrotated_w = (media_box[2] - media_box[0]) * scale;
+    let unrotated_h = (media_box[3] - media_box[1]) * scale;
+    let (out_w, out_h) = if rotate == 90 || rotate == 270 {
+        (unrotated_h, unrotated_w)
+    } else {
+        (unrotated_w, unrotated_h)
+    };
+    let width = out_w.round().max(1.0) as u32;
+    let height = out_h.round().max(1.0) as u32;
+
+    // Espace utilisateur PDF (origine bas-gauche) -> espace "device" non
+    // pivoté (origine haut-gauche, taille de page) -> espace pixmap final
+    // (dimensions permutées si 90°/270°, voir `rotation_matrix`).
+    let device = page_flip_matrix(media_box[0], media_box[3], scale).then(&rotation_matrix(
+        rotate,
+        unrotated_w,
+        unrotated_h,
+    ));
+
+    render_to_pixmap(display, width, height, &device, scale)
+}
+
+/// Normalise une valeur `/Rotate` arbitraire au multiple de 90 le plus
+/// proche dans `{0, 90, 180, 270}` (le spec impose un multiple de 90, mais
+/// un PDF malformé pourrait contenir autre chose).
+fn normalize_rotate(rotate: i32) -> i32 {
+    let r = rotate.rem_euclid(360);
+    match r {
+        315..=359 | 0..=44 => 0,
+        45..=134 => 90,
+        135..=224 => 180,
+        _ => 270,
+    }
+}
+
+/// Transforme les coordonnées de l'espace "device" non pivoté (taille de
+/// page, origine haut-gauche) vers l'espace pixmap final, pour un `rotate`
+/// déjà normalisé (0/90/180/270). Dérivée en considérant que pivoter la
+/// page dans le sens horaire déplace son coin haut-gauche vers le coin
+/// haut-droit du canevas final (pour 90°), etc.
+fn rotation_matrix(rotate: i32, unrotated_w: f64, unrotated_h: f64) -> Matrix {
+    match rotate {
+        90 => Matrix::new(0.0, 1.0, -1.0, 0.0, unrotated_h, 0.0),
+        180 => Matrix::new(-1.0, 0.0, 0.0, -1.0, unrotated_w, unrotated_h),
+        270 => Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, unrotated_w),
+        _ => Matrix::IDENTITY,
+    }
 }
 
 fn render_to_pixmap(
     display: &DisplayList,
     width: u32,
     height: u32,
-    origin_x: f64,
-    origin_y_top: f64,
+    device: &Matrix,
     scale: f64,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
@@ -74,7 +136,7 @@ fn render_to_pixmap(
                 return cached_mask.clone();
             }
         }
-        let mask = build_clip_mask(clip, width, height, origin_x, origin_y_top, scale);
+        let mask = build_clip_mask(clip, width, height, device);
         mask_cache = Some((ptr, mask.clone()));
         mask
     };
@@ -91,7 +153,7 @@ fn render_to_pixmap(
             ..
         } = item
         {
-            let Some(path) = build_path(segments, origin_x, origin_y_top, scale) else {
+            let Some(path) = build_path(segments, device) else {
                 continue;
             };
             let mask = mask_for(clip);
@@ -137,8 +199,7 @@ fn render_to_pixmap(
             ..
         } = item
         {
-            let Some(path) = build_glyph_path(segments, transform, origin_x, origin_y_top, scale)
-            else {
+            let Some(path) = build_glyph_path(segments, transform, device) else {
                 continue;
             };
             let mask = mask_for(clip);
@@ -160,15 +221,7 @@ fn render_to_pixmap(
         } = item
         {
             let mask = mask_for(clip);
-            draw_image(
-                &mut pixmap,
-                image,
-                transform,
-                origin_x,
-                origin_y_top,
-                scale,
-                mask.as_ref(),
-            );
+            draw_image(&mut pixmap, image, transform, device, mask.as_ref());
         }
         // DisplayItem::Glyph sans contour et DisplayItem::Image sans pixels
         // décodés : non rendus, voir limitations en tête de module.
@@ -186,13 +239,11 @@ fn build_clip_mask(
     clip: &[pdf_core::display::ClipPath],
     width: u32,
     height: u32,
-    origin_x: f64,
-    origin_y_top: f64,
-    scale: f64,
+    device: &Matrix,
 ) -> Option<Mask> {
     let mut mask: Option<Mask> = None;
     for clip_path in clip {
-        let Some(path) = build_path(&clip_path.segments, origin_x, origin_y_top, scale) else {
+        let Some(path) = build_path(&clip_path.segments, device) else {
             continue;
         };
         let rule = match clip_path.fill_rule {
@@ -215,14 +266,13 @@ fn build_clip_mask(
 /// unité `[0,1]×[0,1]` (espace image PDF, ISO 32000-1 §8.9.5) dans l'espace
 /// de la page ; on compose avec la mise à l'échelle pixel->unité (et le flip
 /// vertical propre aux données image, dont la première ligne correspond au
-/// *haut* de l'image) puis le flip page->pixmap commun au reste du pipeline.
+/// *haut* de l'image) puis `device` (flip+rotation page->pixmap communs au
+/// reste du pipeline).
 fn draw_image(
     pixmap: &mut Pixmap,
     image: &DecodedImage,
     transform: &Matrix,
-    origin_x: f64,
-    origin_y_top: f64,
-    scale: f64,
+    device: &Matrix,
     mask: Option<&Mask>,
 ) {
     if image.width == 0 || image.height == 0 {
@@ -245,8 +295,7 @@ fn draw_image(
         0.0,
         1.0,
     );
-    let page_flip = page_flip_matrix(origin_x, origin_y_top, scale);
-    let total = pixel_to_unit_square.then(transform).then(&page_flip);
+    let total = pixel_to_unit_square.then(transform).then(device);
 
     let skia_transform = Transform::from_row(
         total.a as f32,
@@ -276,8 +325,10 @@ fn premultiply_if_needed(rgba: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Matrice PDF (page, origine bas-gauche) -> pixmap (origine haut-gauche),
-/// avec mise à l'échelle du zoom incluse.
+/// Matrice PDF (page, origine bas-gauche) -> espace "device" non pivoté
+/// (origine haut-gauche), avec mise à l'échelle du zoom incluse. Composée
+/// ensuite avec `rotation_matrix` pour obtenir la matrice `device` complète
+/// utilisée par le reste du module.
 fn page_flip_matrix(origin_x: f64, origin_y_top: f64, scale: f64) -> Matrix {
     Matrix::new(
         scale,
@@ -289,19 +340,10 @@ fn page_flip_matrix(origin_x: f64, origin_y_top: f64, scale: f64) -> Matrix {
     )
 }
 
-fn build_path(
-    segments: &[PathSegment],
-    origin_x: f64,
-    origin_y_top: f64,
-    scale: f64,
-) -> Option<Path> {
-    // Espace utilisateur PDF (origine bas-gauche, Y vers le haut) -> espace
-    // pixmap (origine haut-gauche, Y vers le bas), zoom inclus.
-    let flip = |(x, y): (f64, f64)| {
-        (
-            ((x - origin_x) * scale) as f32,
-            ((origin_y_top - y) * scale) as f32,
-        )
+fn build_path(segments: &[PathSegment], device: &Matrix) -> Option<Path> {
+    let map = |p: (f64, f64)| {
+        let (x, y) = device.apply(p.0, p.1);
+        (x as f32, y as f32)
     };
 
     let mut pb = PathBuilder::new();
@@ -309,19 +351,19 @@ fn build_path(
     for seg in segments {
         match seg {
             PathSegment::MoveTo(p) => {
-                let (x, y) = flip(*p);
+                let (x, y) = map(*p);
                 pb.move_to(x, y);
                 has_segment = true;
             }
             PathSegment::LineTo(p) => {
-                let (x, y) = flip(*p);
+                let (x, y) = map(*p);
                 pb.line_to(x, y);
                 has_segment = true;
             }
             PathSegment::CurveTo { c1, c2, to } => {
-                let (x1, y1) = flip(*c1);
-                let (x2, y2) = flip(*c2);
-                let (x3, y3) = flip(*to);
+                let (x1, y1) = map(*c1);
+                let (x2, y2) = map(*c2);
+                let (x3, y3) = map(*to);
                 pb.cubic_to(x1, y1, x2, y2, x3, y3);
                 has_segment = true;
             }
@@ -336,20 +378,12 @@ fn build_path(
 
 /// Comme `build_path`, mais applique d'abord `transform` (matrice de rendu
 /// du glyphe : échelle police + matrice texte + CTM) à des points en espace
-/// em, avant l'inversion d'axe Y commune à tout le pipeline.
-fn build_glyph_path(
-    segments: &[PathSegment],
-    transform: &Matrix,
-    origin_x: f64,
-    origin_y_top: f64,
-    scale: f64,
-) -> Option<Path> {
+/// em, avant `device` (flip+rotation page->pixmap).
+fn build_glyph_path(segments: &[PathSegment], transform: &Matrix, device: &Matrix) -> Option<Path> {
+    let combined = transform.then(device);
     let map = |p: (f64, f64)| {
-        let (px, py) = transform.apply(p.0, p.1);
-        (
-            ((px - origin_x) * scale) as f32,
-            ((origin_y_top - py) * scale) as f32,
-        )
+        let (x, y) = combined.apply(p.0, p.1);
+        (x as f32, y as f32)
     };
 
     let mut pb = PathBuilder::new();
@@ -738,6 +772,72 @@ mod tests {
             (px.red(), px.green(), px.blue()),
             (0, 0, 255),
             "pixel looks like pure opaque blue: image was likely not drawn"
+        );
+    }
+
+    /// `render_page` (sans rotation) et `render_page_rotated(rotate=0)`
+    /// doivent produire des dimensions identiques : la normalisation ne
+    /// doit rien changer pour la valeur la plus courante.
+    #[test]
+    fn rotate_zero_matches_unrotated_dimensions() {
+        let display = rect_display(Color::Rgb(1.0, 0.0, 0.0));
+        let plain = render_page(&display, [0.0, 0.0, 100.0, 60.0]).unwrap();
+        let rotated = render_page_rotated(&display, [0.0, 0.0, 100.0, 60.0], 0, 1.0).unwrap();
+        assert_eq!((plain.width(), plain.height()), (100, 60));
+        assert_eq!((rotated.width(), rotated.height()), (100, 60));
+    }
+
+    /// `/Rotate 90` doit permuter largeur/hauteur du pixmap (portrait ->
+    /// paysage) — c'est le signe le plus visible que la rotation est
+    /// appliquée plutôt qu'ignorée.
+    #[test]
+    fn rotate_90_swaps_pixmap_dimensions() {
+        let display = rect_display(Color::Rgb(1.0, 0.0, 0.0));
+        let pixmap = render_page_rotated(&display, [0.0, 0.0, 100.0, 60.0], 90, 1.0).unwrap();
+        assert_eq!((pixmap.width(), pixmap.height()), (60, 100));
+    }
+
+    /// Un rectangle qui occupe le coin bas-gauche de la page (espace PDF)
+    /// doit se retrouver dans le coin haut-gauche du canevas final après une
+    /// rotation `/Rotate 90` (rotation horaire de la page vue du lecteur —
+    /// voir la dérivation dans `rotation_matrix`).
+    #[test]
+    fn rotate_90_moves_bottom_left_content_to_top_left() {
+        let display = DisplayList {
+            items: vec![DisplayItem::Path {
+                segments: vec![
+                    PathSegment::MoveTo((0.0, 0.0)),
+                    PathSegment::LineTo((20.0, 0.0)),
+                    PathSegment::LineTo((20.0, 20.0)),
+                    PathSegment::LineTo((0.0, 20.0)),
+                    PathSegment::ClosePath,
+                ],
+                paint: PaintOp::Fill,
+                fill_rule: FillRule::NonZero,
+                fill_color: Color::Gray(0.0),
+                stroke_color: Color::default(),
+                line_width: 1.0,
+                sets_clip: false,
+                clip: None,
+            }],
+        };
+        let pixmap = render_page_rotated(&display, [0.0, 0.0, 100.0, 60.0], 90, 1.0).unwrap();
+        assert_eq!((pixmap.width(), pixmap.height()), (60, 100));
+
+        let top_left = pixmap.pixel(5, 5).unwrap();
+        assert_eq!(
+            (top_left.red(), top_left.green(), top_left.blue()),
+            (0, 0, 0),
+            "bottom-left PDF content should land top-left after a 90° rotation"
+        );
+        let bottom_right = pixmap.pixel(55, 95).unwrap();
+        assert_eq!(
+            (
+                bottom_right.red(),
+                bottom_right.green(),
+                bottom_right.blue()
+            ),
+            (255, 255, 255)
         );
     }
 }

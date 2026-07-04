@@ -150,9 +150,10 @@ fn run_render(path: &str, out_path: &str, page_index: usize) -> pdf_core::Result
     let content = doc.page_content(&page)?;
     let display = Interpreter::run_page(&doc, page.resources.clone(), &content)?;
 
-    let pixmap = pdf_render::render_page(&display, page.media_box).ok_or_else(|| {
-        pdf_core::PdfError::InvalidObject(0, "failed to allocate render target".to_string())
-    })?;
+    let pixmap = pdf_render::render_page_rotated(&display, page.media_box, page.rotate, 1.0)
+        .ok_or_else(|| {
+            pdf_core::PdfError::InvalidObject(0, "failed to allocate render target".to_string())
+        })?;
     let png = pdf_render::encode_png(&pixmap);
     fs::write(out_path, &png).map_err(|e| {
         pdf_core::PdfError::InvalidObject(0, format!("cannot write `{out_path}`: {e}"))

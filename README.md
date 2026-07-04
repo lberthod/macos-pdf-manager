@@ -13,7 +13,7 @@
 
 ## État actuel (voir [STATUS.md](./STATUS.md) pour le détail précis)
 
-Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu → rendu CPU en PNG, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType **intégrées** comme polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier...).
+Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu → rendu CPU en PNG, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType et CFF/Type1C **intégrées**, comme polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier...).
 
 Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, l'UI graphique, les polices composites CJK, les images CCITT/JBIG2/JPX (le JPEG fonctionne). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
 

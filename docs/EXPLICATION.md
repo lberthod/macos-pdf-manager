@@ -154,13 +154,14 @@ C'est la couche qui transforme un **code de caractère brut** (un octet dans `(H
 
 1. **Un caractère Unicode** — via `/Encoding` : tables `WinAnsiEncoding`/`StandardEncoding` complètes, surchargées par `/Differences` (noms de glyphes résolus via un sous-ensemble de l'Adobe Glyph List : `eacute` → é, `uni00E9` → é...).
 2. **Une largeur d'avance** (millièmes d'em) — via `/Widths` + `/FirstChar` ; à défaut, table AFM Helvetica intégrée en dur (les polices standard ne portent pas de `/Widths` : le lecteur est censé les connaître) ; à défaut, 500/1000.
-3. **Un contour vectoriel** (`glyph_outline`) — deux sources :
-   - **Police intégrée** `/FontFile2` (TrueType) : décodée puis parsée par `ttf-parser`. Résolution du glyphe par cmap Unicode, avec **repli sur le cmap Macintosh interrogé par code brut** — les sous-ensembles générés par reportlab & co n'ont souvent *que* ce cmap. Les courbes quadratiques TrueType sont élevées en cubiques pour rester homogènes avec le pipeline.
+3. **Un contour vectoriel** (`glyph_outline`) — trois sources, essayées dans cet ordre :
+   - **Police intégrée TrueType** `/FontFile2` : décodée puis parsée par `ttf_parser::Face`. Résolution du glyphe par cmap Unicode, avec **repli sur le cmap Macintosh interrogé par code brut** — les sous-ensembles générés par reportlab & co n'ont souvent *que* ce cmap. Les courbes quadratiques TrueType sont élevées en cubiques pour rester homogènes avec le pipeline.
+   - **Police intégrée CFF/Type1C** `/FontFile3` : deux sous-cas selon le `/Subtype` du flux lui-même — `OpenType` (conteneur sfnt complet, réutilise le chemin `ttf_parser::Face` ci-dessus, qui gère glyf et CFF de façon transparente) ou `Type1C`/`CIDFontType0C` (CFF **brut**, sans conteneur sfnt : parsé directement via `ttf_parser::cff::Table::parse`, qui fonctionne sur ces octets tels quels). Résolution du glyphe par l'encodage/charset natif de la table CFF (`Table::glyph_index(code)`, par code brut — la CFF n'a pas de notion de cmap Unicode). Mise à l'échelle via la FontMatrix de la table (`sx`, `0.001` dans l'immense majorité des fontes).
    - **Substitution système** (module `system_font`) : pour les polices standard non intégrées, mapping nom → fichier de `/System/Library/Fonts` (Helvetica/Times/Courier `.ttc`, Symbol, ZapfDingbats ; Arial → Helvetica), sélection de la face gras/italique dans la collection, cache global des fichiers (un `.ttc` fait ~2 Mo, on ne le lit qu'une fois par processus). Les préfixes de sous-ensemble `ABCDEF+Nom` sont retirés avant le mapping.
 
 Les contours sont émis en **espace em normalisé** (1.0 = taille de police) ; c'est le renderer qui applique `transform` (qui contient déjà taille × matrice texte × CTM).
 
-Ce qui n'est **pas** géré : polices composites `/Type0`/CID (codes 2 octets — CJK), `/ToUnicode`, contours CFF (`/FontFile3`) et Type1 (`/FontFile`). Dans ces cas le pipeline dégrade proprement : glyphe sans contour (non dessiné), largeur placeholder signalée par `advance_is_estimated`.
+Ce qui n'est **pas** géré : polices composites `/Type0`/CID (codes 2 octets — CJK), `/ToUnicode`, Type1 historique (`/FontFile`, le format pré-CFF d'Adobe — rare aujourd'hui). Dans ces cas le pipeline dégrade proprement : glyphe sans contour (non dessiné), largeur placeholder signalée par `advance_is_estimated`.
 
 ## 10. Images ([pdf-core/src/image.rs](../pdf-core/src/image.rs))
 

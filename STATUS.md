@@ -1,6 +1,6 @@
 # État précis du projet
 
-**Dernière mise à jour :** 2026-07-04 (décodage JPEG + prototype UI egui ajoutés)
+**Dernière mise à jour :** 2026-07-04 (contours CFF/Type1C ajoutés)
 **But de ce document :** donner une image exacte et vérifiable de ce qui fonctionne, de ce qui est simulé (placeholder), et de ce qui n'existe pas encore — par opposition à [architecture.md](./architecture.md) (la cible) et [sprint.md](./sprint.md) (le plan). Chaque affirmation ci-dessous est vérifiable en lisant le fichier cité ou en lançant la commande indiquée.
 
 ---
@@ -49,7 +49,12 @@ cargo run --bin pdf-ui -- pdf-core/tests/fixtures/image_jpeg.pdf
 ```
 ouvre une **vraie fenêtre native** (prototype `egui`/`eframe`) affichant la page rendue, avec navigation page suivante/précédente et zoom (re-rasterisation, pas un agrandissement d'image) — vérifié visuellement par capture d'écran.
 
-**Tests :** 54 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
+```bash
+cargo run --bin pdf-cli -- render pdf-core/tests/fixtures/embedded_cff_font.pdf /tmp/out4.png 0
+```
+produit un PNG où "ABC" est dessiné avec de vrais contours **CFF/Type1C** (police STIX intégrée en `/FontFile3`, sous-ensemble de 953 octets) — vérifié visuellement.
+
+**Tests :** 56 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
 
 ---
 
@@ -64,7 +69,7 @@ ouvre une **vraie fenêtre native** (prototype `egui`/`eframe`) affichant la pag
 | Contenu | ~40 opérateurs : état graphique, chemins, texte, couleur, Form XObjects (récursif, garde de profondeur) | Clip (`W`/`W*`) signalé mais pas appliqué ; patterns/shadings ignorés ; contenu marqué ignoré |
 | Police — largeurs | `/Widths`+`/FirstChar` ; repli sur table AFM Helvetica intégrée si absent | Les 13 autres polices standard (Times, Courier...) n'ont pas de table dédiée, retombent sur une largeur par défaut arbitraire (500/1000 em) |
 | Police — encodage | `WinAnsiEncoding`/`StandardEncoding` complets (256 codes) + `/Differences` via un sous-ensemble de l'Adobe Glyph List | `/ToUnicode` (CMap dédié, souvent plus précis) n'est pas lu ; `MacRomanEncoding` est approximé par WinAnsi au-delà de l'ASCII |
-| Police — contours | Polices **TrueType intégrées** (`/FontFile2`) via `ttf-parser` (repli cmap Macintosh par code brut si pas de cmap Unicode) ; **substitution système macOS** pour les polices standard non intégrées : Helvetica/Times/Courier/Symbol/ZapfDingbats + alias Arial, sélection de la face gras/italique dans les `.ttc`, cache global des fichiers | CFF/Type1C (`/FontFile3`), Type1 (`/FontFile`) : aucun contour. Substitution par lecture directe de `/System/Library/Fonts` (chemins macOS codés en dur, pas via l'API Core Text) — non portable en l'état |
+| Police — contours | Polices **TrueType intégrées** (`/FontFile2`) et **CFF/Type1C intégrées** (`/FontFile3`, sous-types `Type1C` via `ttf_parser::cff::Table` brut, ou `OpenType` via `ttf_parser::Face`) ; repli cmap Macintosh par code brut si pas de cmap Unicode (TrueType) ou encodage CFF natif par code brut (CFF) ; **substitution système macOS** pour les polices standard non intégrées : Helvetica/Times/Courier/Symbol/ZapfDingbats + alias Arial, sélection de la face gras/italique dans les `.ttc`, cache global des fichiers | Type1 (`/FontFile`, format historique pré-CFF) : aucun contour. Substitution par lecture directe de `/System/Library/Fonts` (chemins macOS codés en dur, pas via l'API Core Text) — non portable en l'état |
 | Rendu | Chemins (fill/stroke/fill+stroke, nonzero/even-odd, courbes de Bézier), glyphes (intégrés **et** substitués), **images décodées** (JPEG et échantillons bruts 8 bits), conversion Gray/RGB/CMYK | Pas d'application du clip, pas de GPU, pas de canal alpha (`/SMask`) sur les images |
 | Images | `DCTDecode` (JPEG) via `zune-jpeg` ; interprétation `/ColorSpace` DeviceGray/RGB/CMYK et `ICCBased` (approximé par `/N`, sans le profil ICC) à 8 bits/composante ; dessinées à la bonne position/orientation dans `pdf-render` | Pas de CCITT/JBIG2/JPX, pas d'espaces `Indexed`/`Separation`/`Lab`, pas de 1/2/4/16 bits, pas de `/SMask` ni `/Mask` |
 | Interface graphique (`pdf-ui`) | Fenêtre `egui`/`eframe` fonctionnelle : ouverture de fichier (dialogue natif `rfd`), navigation page suivante/précédente, zoom par re-rasterisation (`pdf_render::render_page_scaled`). Vérifié visuellement par capture d'écran sur un fixture réel | Parle directement à `pdf-core`/`pdf-render`, contourne `pdf-app` (toujours un stub) ; pas de menus macOS natifs, pas de raccourcis clavier, pas de miniatures/recherche, pas de packaging `.app` |
@@ -86,12 +91,13 @@ ouvre une **vraie fenêtre native** (prototype `egui`/`eframe`) affichant la pag
 
 ## 4. Corpus de test
 
-6 fixtures dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) :
+7 fixtures dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) :
 - `minimal.pdf` — PDF minimal fait main.
 - `multipage_classic_xref.pdf` / `multipage_xref_stream.pdf` — même contenu (5 pages, texte + rectangle), sauvegardé en xref classique et en xref stream + object streams (PDF 1.5+).
 - `corrupted_missing_xref.pdf` — fichier tronqué pour tester la reconstruction.
 - `embedded_truetype_font.pdf` — police Monaco intégrée en TrueType, pour tester l'extraction de contours réelle.
 - `image_jpeg.pdf` — photo JPEG intégrée (filtres chaînés `ASCII85Decode`+`DCTDecode`), pour tester le décodage et le rendu d'images.
+- `embedded_cff_font.pdf` — police STIX intégrée en CFF/Type1C (`/FontFile3`, sous-ensemble 3 glyphes, construit à la main avec pikepdf faute de support reportlab pour ce format d'embarquement), pour tester l'extraction de contours CFF.
 
 C'est **loin** du corpus « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9). Aucun PDF scanné, formulaire AcroForm, PDF chiffré, ou document CJK n'a été testé.
 
@@ -100,8 +106,7 @@ C'est **loin** du corpus « plusieurs centaines de PDF variés » visé par le c
 ## 5. Prochaines étapes logiques (par ordre de valeur/effort)
 
 1. **Corpus de test large** — condition pour véritablement clore la Phase 1/2 et détecter les régressions sur des cas réels variés.
-2. **Contours CFF/Type1C (`/FontFile3`)** — deuxième format de police intégrée le plus courant après TrueType.
-3. **`/SMask` (canal alpha)** — nécessaire pour les images avec transparence, assez fréquentes (logos, captures d'écran).
-4. **`pdf-app`** — faire porter l'état de session (document ouvert, undo/redo) par la couche applicative plutôt que par `pdf-ui` directement, pour permettre ensuite le chrome natif macOS (`objc2`/`cacao`) sans dupliquer la logique.
+2. **`/SMask` (canal alpha)** — nécessaire pour les images avec transparence, assez fréquentes (logos, captures d'écran).
+3. **`pdf-app`** — faire porter l'état de session (document ouvert, undo/redo) par la couche applicative plutôt que par `pdf-ui` directement, pour permettre ensuite le chrome natif macOS (`objc2`/`cacao`) sans dupliquer la logique.
 
 Pour le contexte produit (pourquoi ce projet, contraintes, décisions à trancher), voir [architecture.md §1](./architecture.md#1-objectif-et-périmètre) et [§12](./architecture.md#12-points-à-trancher-avec-le-développeur-avant-le-démarrage).

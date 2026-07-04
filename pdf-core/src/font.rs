@@ -15,13 +15,16 @@
 //! - `MacRomanEncoding` est approximé par `WinAnsiEncoding` (tables réelles
 //!   distinctes au-delà de l'ASCII) faute de table dédiée pour l'instant.
 //! - Contours de glyphes : polices **TrueType intégrées** (`/FontFile2`)
-//!   via `ttf-parser`, et **substitution système macOS** pour les polices
+//!   et **CFF/Type1C intégrées** (`/FontFile3`, sous-types `Type1C` — CFF
+//!   brut — et `OpenType` — conteneur OpenType complet, traité comme du
+//!   TrueType puisque `ttf-parser` gère les deux formats de façon unifiée)
+//!   via `ttf-parser`, plus **substitution système macOS** pour les polices
 //!   standard non intégrées (Helvetica/Times/Courier + alias Arial,
 //!   sélection de face gras/italique dans les `.ttc`, voir `system_font`).
-//!   Les polices CFF/Type1C intégrées (`/FontFile3`) et Type1 (`/FontFile`)
-//!   n'ont pas encore de parseur de contours. La substitution lit
-//!   directement les fichiers de `/System/Library/Fonts` (chemins macOS
-//!   codés en dur) — un portage passerait par Core Text ou fontconfig.
+//!   Type1 (`/FontFile`, format historique pré-CFF) n'a pas de parseur de
+//!   contours. La substitution lit directement les fichiers de
+//!   `/System/Library/Fonts` (chemins macOS codés en dur) — un portage
+//!   passerait par Core Text ou fontconfig.
 
 use crate::display::PathSegment;
 use crate::document::Document;
@@ -41,6 +44,9 @@ pub struct Font {
     use_helvetica_fallback: bool,
     /// Octets bruts d'un `/FontFile2` (TrueType) déjà décodé, s'il y en a un.
     embedded_truetype: Option<Vec<u8>>,
+    /// Octets bruts d'un `/FontFile3` `/Subtype /Type1C` (CFF brut, sans
+    /// conteneur OpenType) déjà décodé, s'il y en a un.
+    embedded_cff: Option<Vec<u8>>,
     /// Police système de substitution (octets du fichier partagés via cache
     /// global + index de face dans la collection `.ttc`), pour les polices
     /// standard non intégrées. `None` si la police est intégrée ou si aucune
@@ -114,26 +120,51 @@ impl Font {
 
         let use_helvetica_fallback = subtype != "Type0" && widths.iter().all(|w| w.is_none());
 
-        let embedded_truetype = dict
+        let descriptor_dict = dict
             .get("FontDescriptor")
             .and_then(|o| doc.get(o).ok())
-            .and_then(|desc| desc.as_dict().cloned())
-            .and_then(|desc_dict| desc_dict.get("FontFile2").cloned())
+            .and_then(|desc| desc.as_dict().cloned());
+
+        let mut embedded_truetype = descriptor_dict
+            .as_ref()
+            .and_then(|d| d.get("FontFile2").cloned())
             .and_then(|obj| doc.get(&obj).ok())
             .and_then(|obj| match obj {
                 Object::Stream(stream) => decode_stream(&stream).ok(),
                 _ => None,
             });
 
-        let system_fallback = if embedded_truetype.is_none() && subtype != "Type0" {
-            let base_font = dict
-                .get("BaseFont")
-                .and_then(|o| o.as_name())
-                .unwrap_or("Helvetica");
-            system_font::lookup(base_font)
-        } else {
-            None
-        };
+        let mut embedded_cff = None;
+        if embedded_truetype.is_none() {
+            if let Some(Object::Stream(stream)) = descriptor_dict
+                .as_ref()
+                .and_then(|d| d.get("FontFile3").cloned())
+                .and_then(|obj| doc.get(&obj).ok())
+            {
+                let file_subtype = stream.dict.get("Subtype").and_then(|o| o.as_name());
+                if let Ok(bytes) = decode_stream(&stream) {
+                    match file_subtype {
+                        // Conteneur OpenType complet : ttf-parser::Face
+                        // gère indifféremment glyf et CFF en interne.
+                        Some("OpenType") => embedded_truetype = Some(bytes),
+                        // CFF brut (`Type1C`/`CIDFontType0C`) : pas de
+                        // table sfnt, nécessite le parseur CFF dédié.
+                        _ => embedded_cff = Some(bytes),
+                    }
+                }
+            }
+        }
+
+        let system_fallback =
+            if embedded_truetype.is_none() && embedded_cff.is_none() && subtype != "Type0" {
+                let base_font = dict
+                    .get("BaseFont")
+                    .and_then(|o| o.as_name())
+                    .unwrap_or("Helvetica");
+                system_font::lookup(base_font)
+            } else {
+                None
+            };
 
         Ok(Font {
             subtype,
@@ -141,6 +172,7 @@ impl Font {
             widths,
             use_helvetica_fallback,
             embedded_truetype,
+            embedded_cff,
             system_fallback,
         })
     }
@@ -168,15 +200,18 @@ impl Font {
     /// Contour vectoriel du glyphe correspondant à un code de caractère 1
     /// octet, dans l'espace em normalisé (1.0 = une taille de police), déjà
     /// orienté correctement (Y vers le haut, comme le reste du pipeline
-    /// PDF). `None` si aucune police TrueType intégrée n'est disponible ou
-    /// si le glyphe est introuvable.
+    /// PDF). `None` si aucune police (intégrée ou substituée) n'est
+    /// disponible ou si le glyphe est introuvable.
     ///
-    /// Résolution du glyphe : essaie d'abord une table `cmap` Unicode
-    /// (`unicode`, si connu) ; sinon, retombe sur une éventuelle table
-    /// `cmap` Macintosh (plate-forme 1) interrogée directement avec le
-    /// **code brut** — cas fréquent des sous-ensembles TrueType produits
-    /// par des outils comme reportlab, qui n'embarquent qu'un cmap Mac
-    /// Roman indexé par code plutôt que par point de code Unicode.
+    /// Résolution du glyphe, TrueType/OpenType : essaie d'abord une table
+    /// `cmap` Unicode (`unicode`, si connu) ; sinon, retombe sur une
+    /// éventuelle table `cmap` Macintosh (plate-forme 1) interrogée
+    /// directement avec le **code brut** — cas fréquent des sous-ensembles
+    /// produits par des outils comme reportlab, qui n'embarquent qu'un cmap
+    /// Mac Roman indexé par code plutôt que par point de code Unicode.
+    /// Résolution CFF : l'encodage/charset intégré à la table CFF elle-même
+    /// est interrogé directement par code brut (`cff::Table::glyph_index`),
+    /// pas de notion de cmap Unicode dans ce format.
     pub fn glyph_outline(&self, code: u8, unicode: Option<char>) -> Option<Vec<PathSegment>> {
         if let Some(data) = self.embedded_truetype.as_ref() {
             let face = ttf_parser::Face::parse(data, 0).ok()?;
@@ -189,6 +224,21 @@ impl Font {
                 })
             })?;
             return outline_from_face(&face, gid);
+        }
+
+        if let Some(data) = self.embedded_cff.as_ref() {
+            let table = ttf_parser::cff::Table::parse(data)?;
+            let gid = table.glyph_index(code)?;
+            // `sx` de la FontMatrix CFF (0.001 dans l'immense majorité des
+            // fontes) : on ignore kx/ky/tx/ty, quasi toujours nuls en pratique.
+            let scale = table.matrix().sx as f64;
+            let mut collector = OutlineCollector {
+                segments: Vec::new(),
+                current: (0.0, 0.0),
+                scale: if scale != 0.0 { scale } else { 1.0 / 1000.0 },
+            };
+            table.outline(gid, &mut collector).ok()?;
+            return Some(collector.segments);
         }
 
         // Substitution système (police standard non intégrée) : les polices
@@ -601,5 +651,29 @@ mod tests {
             .glyph_outline(b'A', None)
             .expect("code-based cmap fallback should still resolve the glyph");
         assert_eq!(outline, outline_via_code_only);
+    }
+
+    #[test]
+    fn embedded_cff_fixture_yields_real_glyph_outline() {
+        let bytes = include_bytes!("../tests/fixtures/embedded_cff_font.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let font_res = page.resources.get("Font").unwrap();
+        let font_dict = doc.get(font_res).unwrap();
+        let font_entry = font_dict
+            .as_dict()
+            .unwrap()
+            .iter()
+            .next()
+            .map(|(_, obj)| doc.get(obj).unwrap())
+            .expect("expected a font resource in the fixture");
+        let font_dict = font_entry.as_dict().unwrap();
+
+        let font = Font::load(&doc, font_dict).unwrap();
+        let outline = font
+            .glyph_outline(b'A', Some('A'))
+            .expect("expected a CFF outline for 'A' in the embedded STIX subset");
+        assert!(!outline.is_empty());
+        assert!(matches!(outline[0], PathSegment::MoveTo(_)));
     }
 }

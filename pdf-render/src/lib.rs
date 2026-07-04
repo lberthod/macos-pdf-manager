@@ -456,4 +456,38 @@ mod tests {
             "expected glyph ink somewhere on the page"
         );
     }
+
+    /// Comme `renders_real_embedded_font_glyphs`, mais pour une police
+    /// CFF/Type1C intégrée (`/FontFile3`) plutôt que TrueType.
+    #[test]
+    fn renders_real_embedded_cff_font_glyphs() {
+        use pdf_core::interp::Interpreter;
+        use pdf_core::Document;
+
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/embedded_cff_font.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        assert!(display.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Glyph {
+                outline: Some(_),
+                ..
+            }
+        )));
+
+        let pixmap = render_page(&display, page.media_box).unwrap();
+        let has_non_white_pixel = (0..pixmap.width()).any(|x| {
+            (0..pixmap.height()).any(|y| {
+                let px = pixmap.pixel(x, y).unwrap();
+                (px.red(), px.green(), px.blue()) != (255, 255, 255)
+            })
+        });
+        assert!(
+            has_non_white_pixel,
+            "expected CFF glyph ink somewhere on the page"
+        );
+    }
 }

@@ -12,3 +12,4 @@ path = "src/main.rs"
 pdf-core = { workspace = true }
 pdf-render = { workspace = true }
 pdf-text = { workspace = true }
+pdf-edit = { workspace = true }

@@ -117,6 +117,205 @@ impl<'a> Interpreter<'a> {
         Ok(interp.display)
     }
 
+    /// Comme `run_page`, en ajoutant ensuite le rendu des apparences
+    /// d'annotations (`/Annots`, Sprint 13-14) — surlignages, notes,
+    /// champs de formulaire remplis, etc., chacun via son flux `/AP /N`.
+    /// Variante à part plutôt que fusionnée dans `run_page` : la plupart des
+    /// appelants existants (tests, `pdf-cli render-info`) n'ont pas besoin
+    /// de résoudre `/Annots` et passent directement des ressources sans le
+    /// dictionnaire de page complet.
+    pub fn run_page_with_annotations(
+        doc: &'a Document,
+        page: &crate::page::Page,
+        content: &[u8],
+    ) -> Result<DisplayList> {
+        let mut interp = Self::new(doc, page.resources.clone());
+        interp.run(content)?;
+        interp.append_annotations(page)?;
+        Ok(interp.display)
+    }
+
+    /// Rend chaque annotation visible de `page.dict /Annots` via son flux
+    /// d'apparence normale (`/AP /N`, ISO 32000-1 §12.5.5) : transforme le
+    /// `/BBox` de l'apparence par sa `/Matrix`, calcule la boîte englobante
+    /// du résultat, puis la matrice qui fait correspondre cette boîte au
+    /// `/Rect` de l'annotation dans l'espace page — exactement l'algorithme
+    /// que suivrait un lecteur PDF conforme, pas une approximation. Ignore
+    /// silencieusement toute annotation sans apparence exploitable
+    /// (`/AP` absent, `/BBox` absent, dimensions dégénérées) plutôt que
+    /// d'échouer toute la page : une annotation mal formée ne doit jamais
+    /// empêcher le reste de s'afficher.
+    fn append_annotations(&mut self, page: &crate::page::Page) -> Result<()> {
+        let Some(annots_obj) = page.dict.get("Annots") else {
+            return Ok(());
+        };
+        let annots = self.doc.get(annots_obj)?;
+        let Some(annot_refs) = annots.as_array() else {
+            return Ok(());
+        };
+
+        for annot_ref in annot_refs {
+            let Ok(annot_obj) = self.doc.get(annot_ref) else {
+                continue;
+            };
+            let Some(annot_dict) = annot_obj.as_dict() else {
+                continue;
+            };
+
+            // Bits `Hidden` (2) et `NoView` (6), ISO 32000-1 §12.5.3 tableau 165.
+            if let Some(flags) = annot_dict.get("F").and_then(|o| o.as_int()) {
+                if flags & 0x2 != 0 || flags & 0x20 != 0 {
+                    continue;
+                }
+            }
+
+            let Some(rect) = annot_dict
+                .get("Rect")
+                .and_then(|o| o.as_array())
+                .filter(|r| r.len() >= 4)
+            else {
+                continue;
+            };
+            let rect = [
+                obj_num(&rect[0]),
+                obj_num(&rect[1]),
+                obj_num(&rect[2]),
+                obj_num(&rect[3]),
+            ];
+
+            let Some(stream) = self.resolve_normal_appearance(annot_dict)? else {
+                continue;
+            };
+
+            let Some(bbox) = stream
+                .dict
+                .get("BBox")
+                .and_then(|o| o.as_array())
+                .filter(|b| b.len() >= 4)
+            else {
+                continue;
+            };
+            let bbox = [
+                obj_num(&bbox[0]),
+                obj_num(&bbox[1]),
+                obj_num(&bbox[2]),
+                obj_num(&bbox[3]),
+            ];
+            let matrix = stream
+                .dict
+                .get("Matrix")
+                .and_then(|o| o.as_array())
+                .and_then(matrix_from)
+                .unwrap_or(Matrix::IDENTITY);
+
+            let corners = [
+                (bbox[0], bbox[1]),
+                (bbox[2], bbox[1]),
+                (bbox[2], bbox[3]),
+                (bbox[0], bbox[3]),
+            ];
+            let transformed: Vec<(f64, f64)> =
+                corners.iter().map(|&(x, y)| matrix.apply(x, y)).collect();
+            let min_x = transformed
+                .iter()
+                .map(|p| p.0)
+                .fold(f64::INFINITY, f64::min);
+            let max_x = transformed
+                .iter()
+                .map(|p| p.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = transformed
+                .iter()
+                .map(|p| p.1)
+                .fold(f64::INFINITY, f64::min);
+            let max_y = transformed
+                .iter()
+                .map(|p| p.1)
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            let bbox_w = (max_x - min_x).max(1e-6);
+            let bbox_h = (max_y - min_y).max(1e-6);
+            let rect_x0 = rect[0].min(rect[2]);
+            let rect_y0 = rect[1].min(rect[3]);
+            let rect_w = (rect[2] - rect[0]).abs().max(1e-6);
+            let rect_h = (rect[3] - rect[1]).abs().max(1e-6);
+
+            // Boîte transformée -> espace page : translation à l'origine,
+            // mise à l'échelle boîte -> Rect, puis translation au coin du Rect.
+            let fit = Matrix::translation(-min_x, -min_y)
+                .then(&Matrix::new(
+                    rect_w / bbox_w,
+                    0.0,
+                    0.0,
+                    rect_h / bbox_h,
+                    0.0,
+                    0.0,
+                ))
+                .then(&Matrix::translation(rect_x0, rect_y0));
+            let final_matrix = matrix.then(&fit);
+
+            let Ok(decoded) = crate::filters::decode_stream(&stream) else {
+                continue;
+            };
+            let form_resources = match stream.dict.get("Resources") {
+                Some(obj) => self
+                    .doc
+                    .get(obj)?
+                    .as_dict()
+                    .cloned()
+                    .unwrap_or_else(Dictionary::new),
+                None => self.resources_stack.first().cloned().unwrap_or_default(),
+            };
+
+            let saved_gs = self.gs.clone();
+            self.gs = GraphicsState {
+                ctm: final_matrix,
+                ..GraphicsState::default()
+            };
+            self.resources_stack.push(form_resources);
+            self.depth += 1;
+            let _ = self.run(&decoded);
+            self.depth -= 1;
+            self.resources_stack.pop();
+            self.gs = saved_gs;
+        }
+        Ok(())
+    }
+
+    /// Résout `/AP /N` d'une annotation en un flux directement utilisable :
+    /// soit un flux unique, soit un dictionnaire d'états indexé par `/AS`
+    /// (ex. cases à cocher, boutons radio) dont on ne prend que l'état actif.
+    fn resolve_normal_appearance(
+        &self,
+        annot_dict: &Dictionary,
+    ) -> Result<Option<crate::object::Stream>> {
+        let Some(ap_obj) = annot_dict.get("AP") else {
+            return Ok(None);
+        };
+        let Some(ap_dict) = self.doc.get(ap_obj)?.as_dict().cloned() else {
+            return Ok(None);
+        };
+        let Some(n_obj) = ap_dict.get("N") else {
+            return Ok(None);
+        };
+        match self.doc.get(n_obj)? {
+            Object::Stream(s) => Ok(Some(s)),
+            Object::Dictionary(states) => {
+                let Some(state_name) = annot_dict.get("AS").and_then(|o| o.as_name()) else {
+                    return Ok(None);
+                };
+                let Some(state_obj) = states.get(state_name) else {
+                    return Ok(None);
+                };
+                match self.doc.get(state_obj)? {
+                    Object::Stream(s) => Ok(Some(s)),
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn run(&mut self, content: &[u8]) -> Result<()> {
         let instructions = parse_content_stream(content)?;
         for instr in instructions {
@@ -599,6 +798,17 @@ fn num(ops: &[Object], index: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Comme `num`, mais pour un `Object` déjà en main plutôt qu'un opérande de
+/// flux de contenu (utilisé pour `/Rect`/`/BBox`, qui viennent d'un
+/// dictionnaire d'annotation, pas d'une instruction).
+fn obj_num(o: &Object) -> f64 {
+    match o {
+        Object::Integer(n) => *n as f64,
+        Object::Real(f) => *f,
+        _ => 0.0,
+    }
+}
+
 fn matrix_from(ops: &[Object]) -> Option<Matrix> {
     if ops.len() < 6 {
         return None;
@@ -1072,5 +1282,124 @@ mod tests {
         // /SMask a été ignoré).
         let alphas: Vec<u8> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
         assert!(alphas.iter().any(|&a| a < 250));
+    }
+
+    /// Sprint 13-14 : une annotation (`/Annots`) avec une apparence normale
+    /// (`/AP /N`) doit être rendue à la bonne position — son `/BBox`
+    /// `[0 0 1 1]` (le carré unité, cas le plus courant en pratique) mappé
+    /// sur son `/Rect [100 100 200 150]` doit reproduire ce rectangle
+    /// exactement dans l'espace page, pas juste "quelque part".
+    #[test]
+    fn annotation_appearance_stream_is_rendered_at_the_rect_position() {
+        let ap_content = "1 0 0 rg 0 0 1 1 re f";
+        let body = format!(
+            "%PDF-1.7\n\
+             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+             2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+             3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << >> /Contents 4 0 R /Annots [5 0 R] >>\nendobj\n\
+             4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n\
+             5 0 obj\n<< /Type /Annot /Subtype /Highlight /Rect [100 100 200 150] \
+             /AP << /N 6 0 R >> >>\nendobj\n\
+             6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Length {} >>\n\
+             stream\n{}\nendstream\nendobj\n",
+            ap_content.len(),
+            ap_content
+        );
+        let mut bytes = body.into_bytes();
+        let offset_of = |data: &[u8], needle: &str| -> usize {
+            data.windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+                .unwrap()
+        };
+        let offsets: Vec<usize> = (1..=6)
+            .map(|n| offset_of(&bytes, &format!("{n} 0 obj")))
+            .collect();
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len() + 1,
+            xref_offset
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page_with_annotations(&doc, &page, &content).unwrap();
+
+        let paths: Vec<&DisplayItem> = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Path { .. }))
+            .collect();
+        assert_eq!(
+            paths.len(),
+            1,
+            "expected exactly the annotation's rectangle"
+        );
+        match paths[0] {
+            DisplayItem::Path {
+                segments,
+                fill_color,
+                ..
+            } => {
+                assert_eq!(*fill_color, Color::Rgb(1.0, 0.0, 0.0));
+                assert_eq!(segments[0], PathSegment::MoveTo((100.0, 100.0)));
+                assert_eq!(segments[2], PathSegment::LineTo((200.0, 150.0)));
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    /// Une annotation cachée (`/F` bit `Hidden`, valeur 2) ne doit produire
+    /// aucun élément de rendu, même si son `/AP` est par ailleurs valide.
+    #[test]
+    fn hidden_annotation_is_not_rendered() {
+        let ap_content = "1 0 0 rg 0 0 1 1 re f";
+        let body = format!(
+            "%PDF-1.7\n\
+             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+             2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+             3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << >> /Contents 4 0 R /Annots [5 0 R] >>\nendobj\n\
+             4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n\
+             5 0 obj\n<< /Type /Annot /Subtype /Highlight /Rect [100 100 200 150] \
+             /F 2 /AP << /N 6 0 R >> >>\nendobj\n\
+             6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Length {} >>\n\
+             stream\n{}\nendstream\nendobj\n",
+            ap_content.len(),
+            ap_content
+        );
+        let mut bytes = body.into_bytes();
+        let offset_of = |data: &[u8], needle: &str| -> usize {
+            data.windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+                .unwrap()
+        };
+        let offsets: Vec<usize> = (1..=6)
+            .map(|n| offset_of(&bytes, &format!("{n} 0 obj")))
+            .collect();
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len() + 1,
+            xref_offset
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page_with_annotations(&doc, &page, &content).unwrap();
+        assert!(display.items.is_empty());
     }
 }

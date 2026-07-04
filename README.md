@@ -34,7 +34,7 @@ Workspace Cargo multi-crates :
 | `pdf-app` | État de session (ouverture, navigation, rendu, recherche, cache) partagé entre `pdf-ui` et les futurs fronts | Fonctionnel |
 | `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`, `text`) | Fonctionnel |
 | `pdf-ui` | Viewer (`egui`/`eframe`) avec chrome natif macOS : menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre ; navigation, zoom, recherche, miniatures, signets, défilement continu, sélection de texte | Fonctionnel, packagé en `.app`/`.dmg` (voir STATUS.md) |
-| `pdf-edit` | Opérations d'édition, journal, undo/redo | Stub vide (Sprint 13-14+) |
+| `pdf-edit` | Annotations (`/Highlight`), remplissage de champs AcroForm, journal `EditOp` + undo/redo, sauvegarde incrémentale | Fonctionnel au niveau moteur (pas encore d'interface `pdf-ui`) |
 
 ## Essayer
 
@@ -53,6 +53,12 @@ cargo run --bin pdf-cli -- render chemin/vers/fichier.pdf sortie.png 0
 
 # Extraire le texte d'une page
 cargo run --bin pdf-cli -- text chemin/vers/fichier.pdf 0
+
+# Ajouter une annotation de surlignage et sauvegarder incrémentalement
+cargo run --bin pdf-cli -- highlight in.pdf out.pdf 0 100 600 300 630 1 1 0
+
+# Remplir un champ de formulaire AcroForm
+cargo run --bin pdf-cli -- fill-form in.pdf out.pdf nom_du_champ "valeur"
 
 # Ouvrir le prototype de viewer graphique
 cargo run --bin pdf-ui -- chemin/vers/fichier.pdf
@@ -91,4 +97,8 @@ Pour régénérer volontairement les images de référence après un changement 
 
 ## Statut
 
-Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer, chrome natif & packaging) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu, sélection de texte **et** chrome natif macOS (menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre), packagé en `.app`/`.dmg`. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.
+Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer, chrome natif & packaging) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu, sélection de texte **et** chrome natif macOS (menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre), packagé en `.app`/`.dmg`.
+
+Phase 4 (annotations & formulaires) a un premier socle moteur fonctionnel : `pdf-edit` sait ajouter une annotation `/Highlight`, remplir un champ de formulaire texte (avec régénération de l'apparence visible au rendu), et propose un vrai historique undo/redo — le tout persisté par sauvegarde incrémentale (`pdf-core::writer` + `Document::save_incremental`) et vérifié bout en bout (sauvegarde, réouverture, rendu réel). Il manque encore l'interface `pdf-ui` pour déclencher ces opérations sans passer par `pdf-cli`/l'API Rust directement — voir [sprint.md](./sprint.md) Sprint 13-14.
+
+Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.

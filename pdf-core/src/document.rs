@@ -4,7 +4,8 @@ use crate::error::{PdfError, Result};
 use crate::filters::decode_stream;
 use crate::object::{Dictionary, ObjRef, Object};
 use crate::parser::Parser;
-use crate::xref::{parse_xref_chain, XrefEntry, XrefTable};
+use crate::writer::{write_indirect_object, write_object};
+use crate::xref::{find_startxref_offset, parse_xref_chain, XrefEntry, XrefTable};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -141,6 +142,80 @@ impl Document {
         let info = self.get(info_obj).ok()?;
         info.as_dict().cloned()
     }
+
+    /// Plus petit numéro d'objet libre (Sprint 13-14, `pdf-edit`) : plus
+    /// grand numéro déjà utilisé dans la table xref courante, +1. Ne
+    /// consulte pas `/Size` du trailer (qui peut être incohérent sur un PDF
+    /// malformé) — la table xref réellement résolue fait foi.
+    pub fn next_free_object_num(&self) -> u32 {
+        self.xref.entries.keys().copied().max().unwrap_or(0) + 1
+    }
+
+    /// Sauvegarde incrémentale (ISO 32000-1 §7.5.6, Sprint 13-14) : ajoute
+    /// `objects` (nouveaux objets **ou** mises à jour d'objets existants) à
+    /// la fin du fichier original, suivis d'une nouvelle section xref
+    /// classique et d'un nouveau `trailer` chaîné par `/Prev` à l'ancien
+    /// `startxref` — le fichier d'origine n'est jamais modifié en place,
+    /// seulement complété (`append`), ce qui rend l'opération sûre même en
+    /// cas d'échec à mi-chemin (le fichier original reste un PDF valide en
+    /// préfixe). Retourne les octets complets du nouveau fichier ; c'est
+    /// l'appelant qui les écrit sur disque.
+    pub fn save_incremental(&self, objects: &[(ObjRef, Object)]) -> Result<Vec<u8>> {
+        let prev_offset = find_startxref_offset(&self.data)?;
+        let root_obj = self
+            .trailer
+            .get("Root")
+            .cloned()
+            .ok_or_else(|| PdfError::MissingKey("Root".into()))?;
+
+        let mut out = self.data.clone();
+        if !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+
+        let mut offsets: Vec<(u32, usize)> = Vec::with_capacity(objects.len());
+        for (r, obj) in objects {
+            offsets.push((r.num, out.len()));
+            write_indirect_object(r.num, r.gen, obj, &mut out);
+        }
+        offsets.sort_by_key(|(num, _)| *num);
+
+        let xref_offset = out.len();
+        out.extend_from_slice(b"xref\n");
+        let mut i = 0;
+        while i < offsets.len() {
+            let mut j = i;
+            while j + 1 < offsets.len() && offsets[j + 1].0 == offsets[j].0 + 1 {
+                j += 1;
+            }
+            let start_num = offsets[i].0;
+            let count = j - i + 1;
+            out.extend_from_slice(format!("{start_num} {count}\n").as_bytes());
+            for entry in &offsets[i..=j] {
+                // Format ISO 32000-1 §7.5.4 : 10 chiffres, espace, 5
+                // chiffres, espace, 'n', espace, fin de ligne (20 octets) —
+                // notre propre parseur ne l'exige pas (il tokenise plutôt
+                // que de lire à largeur fixe) mais d'autres lecteurs si.
+                out.extend_from_slice(format!("{:010} 00000 n \n", entry.1).as_bytes());
+            }
+            i = j + 1;
+        }
+
+        let max_existing = self.xref.entries.keys().copied().max().unwrap_or(0);
+        let max_new = offsets.last().map(|(num, _)| *num).unwrap_or(0);
+        let size = max_existing.max(max_new) + 1;
+
+        let mut trailer_dict = Dictionary::new();
+        trailer_dict.insert("Size", Object::Integer(size as i64));
+        trailer_dict.insert("Root", root_obj);
+        trailer_dict.insert("Prev", Object::Integer(prev_offset as i64));
+
+        out.extend_from_slice(b"trailer\n");
+        write_object(&Object::Dictionary(trailer_dict), &mut out);
+        out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +259,56 @@ mod tests {
         assert_eq!(doc.page_count().unwrap(), 1);
         let root = doc.root().unwrap();
         assert_eq!(root.get("Type").unwrap().as_name(), Some("Catalog"));
+    }
+
+    /// Sprint 13-14 : sauvegarde incrémentale — ajoute un nouvel objet (une
+    /// "annotation" simplifiée à un seul entier, le contenu réel importe peu
+    /// ici) et met à jour la page existante pour y pointer, puis vérifie
+    /// qu'une réouverture complète du fichier obtenu retrouve les deux :
+    /// l'objet existant modifié **et** le nouvel objet, sans avoir touché
+    /// à un seul octet du fichier original (préfixe inchangé).
+    #[test]
+    fn save_incremental_appends_new_and_updated_objects_readable_after_reopen() {
+        let original = minimal_pdf();
+        let doc = Document::open(original.clone()).unwrap();
+        let next_num = doc.next_free_object_num();
+        assert_eq!(next_num, 4, "objects 1..3 already used by minimal_pdf()");
+
+        // Nouvel objet, numéro jamais vu dans le fichier original.
+        let new_marker = Object::Integer(999);
+        let new_ref = ObjRef::new(next_num, 0);
+
+        // Objet existant (la page, numéro 3) mis à jour pour référencer le
+        // nouvel objet — simule ce que ferait une vraie annotation ajoutée
+        // à `/Annots`.
+        let mut updated_page = doc
+            .resolve(ObjRef::new(3, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        updated_page.insert("Marker", Object::Reference(new_ref));
+
+        let new_bytes = doc
+            .save_incremental(&[
+                (new_ref, new_marker),
+                (ObjRef::new(3, 0), Object::Dictionary(updated_page)),
+            ])
+            .unwrap();
+
+        assert!(
+            new_bytes.starts_with(&original),
+            "incremental save must never rewrite the original file bytes, only append"
+        );
+
+        let reopened = Document::open(new_bytes).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 1);
+
+        let page = reopened.page(0).unwrap();
+        let marker_ref = page.dict.get("Marker").unwrap().as_reference().unwrap();
+        assert_eq!(marker_ref, new_ref);
+        let marker_value = reopened.resolve(marker_ref).unwrap();
+        assert_eq!(marker_value.as_int(), Some(999));
     }
 
     #[test]

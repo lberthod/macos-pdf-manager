@@ -21,6 +21,7 @@ pub mod object;
 pub mod outline;
 pub mod page;
 pub mod parser;
+pub mod writer;
 pub mod xref;
 
 pub use document::Document;

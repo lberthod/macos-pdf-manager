@@ -22,8 +22,11 @@ pub struct XrefTable {
     pub entries: BTreeMap<u32, XrefEntry>,
 }
 
-/// Cherche `startxref` en partant de la fin du fichier et lit l'offset qui suit.
-fn find_startxref_offset(data: &[u8]) -> Result<usize> {
+/// Cherche `startxref` en partant de la fin du fichier et lit l'offset qui
+/// suit. `pub(crate)` : réutilisé par `document::save_incremental` (Sprint
+/// 13-14) pour retrouver l'offset auquel chaîner via `/Prev` la nouvelle
+/// section xref ajoutée en fin de fichier.
+pub(crate) fn find_startxref_offset(data: &[u8]) -> Result<usize> {
     const NEEDLE: &[u8] = b"startxref";
     let tail_start = data.len().saturating_sub(2048);
     let search_zone = &data[tail_start..];

@@ -10,6 +10,10 @@ fn print_usage() {
     eprintln!("       pdf-cli render-info <file.pdf> [page_index]");
     eprintln!("       pdf-cli render <file.pdf> <out.png> [page_index]");
     eprintln!("       pdf-cli text <file.pdf> [page_index]");
+    eprintln!(
+        "       pdf-cli highlight <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1> [r] [g] [b]"
+    );
+    eprintln!("       pdf-cli fill-form <in.pdf> <out.pdf> <field_name> <value>");
 }
 
 fn main() -> ExitCode {
@@ -28,6 +32,12 @@ fn main() -> ExitCode {
             let page_index: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             run_text(path, page_index)
         }),
+        Some("highlight") => run_highlight_args(&args),
+        Some("fill-form") => args.get(2).zip(args.get(3)).and_then(|(input, out)| {
+            args.get(4)
+                .zip(args.get(5))
+                .map(|(field, value)| run_fill_form(input, out, field, value).map_err(pdf_error))
+        }),
         _ => None,
     };
 
@@ -42,6 +52,58 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `pdf-edit` renvoie `Result<_, String>` (pas de dépendance de `pdf-edit`
+/// vers l'enum d'erreurs de `pdf-core`) ; ce binaire ne connaît qu'un seul
+/// type d'erreur de bout en bout, donc on enveloppe.
+fn pdf_error(e: String) -> pdf_core::PdfError {
+    pdf_core::PdfError::InvalidObject(0, e)
+}
+
+/// Analyse les arguments de `pdf-cli highlight`, séparément du reste
+/// (contrairement aux autres commandes, elle a un nombre d'arguments
+/// variable : couleur optionnelle).
+fn run_highlight_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let page_index: usize = args.get(4)?.parse().ok()?;
+    let x0: f64 = args.get(5)?.parse().ok()?;
+    let y0: f64 = args.get(6)?.parse().ok()?;
+    let x1: f64 = args.get(7)?.parse().ok()?;
+    let y1: f64 = args.get(8)?.parse().ok()?;
+    let r: f32 = args.get(9).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let g: f32 = args.get(10).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let b: f32 = args.get(11).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    Some(run_highlight(input, out, page_index, [x0, y0, x1, y1], (r, g, b)).map_err(pdf_error))
+}
+
+/// Sprint 13-14 : ajoute une annotation `/Highlight` (`pdf-edit`) et
+/// sauvegarde incrémentalement — preuve en ligne de commande que le
+/// pipeline complet (annotation -> `/AP` -> sauvegarde incrémentale ->
+/// relecture) fonctionne sur un vrai fichier, pas seulement en test.
+fn run_highlight(
+    input: &str,
+    out: &str,
+    page_index: usize,
+    rect: [f64; 4],
+    color: (f32, f32, f32),
+) -> Result<(), String> {
+    let mut session = pdf_edit::EditSession::open(input)?;
+    session.add_highlight_annotation(page_index, rect, color, vec![])?;
+    session.save_as(out)?;
+    println!("Added highlight annotation on page {page_index} of {input}, saved to {out}");
+    Ok(())
+}
+
+/// Sprint 13-14 : remplit un champ AcroForm (`pdf-edit`) et sauvegarde
+/// incrémentalement.
+fn run_fill_form(input: &str, out: &str, field_name: &str, value: &str) -> Result<(), String> {
+    let mut session = pdf_edit::EditSession::open(input)?;
+    session.set_form_field_value(field_name, value)?;
+    session.save_as(out)?;
+    println!("Set field '{field_name}' = {value:?} in {input}, saved to {out}");
+    Ok(())
 }
 
 fn read_document(path: &str) -> pdf_core::Result<Document> {
@@ -87,7 +149,7 @@ fn run_render_info(path: &str, page_index: usize) -> pdf_core::Result<()> {
     let doc = read_document(path)?;
     let page = doc.page(page_index)?;
     let content = doc.page_content(&page)?;
-    let display = Interpreter::run_page(&doc, page.resources.clone(), &content)?;
+    let display = Interpreter::run_page_with_annotations(&doc, &page, &content)?;
 
     println!("File: {path}");
     println!(
@@ -148,7 +210,7 @@ fn run_render(path: &str, out_path: &str, page_index: usize) -> pdf_core::Result
     let doc = read_document(path)?;
     let page = doc.page(page_index)?;
     let content = doc.page_content(&page)?;
-    let display = Interpreter::run_page(&doc, page.resources.clone(), &content)?;
+    let display = Interpreter::run_page_with_annotations(&doc, &page, &content)?;
 
     let pixmap = pdf_render::render_page_rotated(&display, page.media_box, page.rotate, 1.0)
         .ok_or_else(|| {

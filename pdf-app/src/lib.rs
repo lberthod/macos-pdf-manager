@@ -315,8 +315,12 @@ impl Session {
     ) -> Result<(pdf_core::Page, pdf_core::display::DisplayList), String> {
         let page = self.doc.page(index).map_err(|e| e.to_string())?;
         let content = self.doc.page_content(&page).map_err(|e| e.to_string())?;
+        // `run_page_with_annotations` plutôt que `run_page` : les annotations
+        // (surlignages, notes, champs de formulaire remplis — Sprint 13-14)
+        // doivent apparaître dans le rendu normal du viewer, pas seulement
+        // dans un chemin de test dédié.
         let display =
-            pdf_core::interp::Interpreter::run_page(&self.doc, page.resources.clone(), &content)
+            pdf_core::interp::Interpreter::run_page_with_annotations(&self.doc, &page, &content)
                 .map_err(|e| e.to_string())?;
         Ok((page, display))
     }

@@ -62,15 +62,15 @@ fn main() -> eframe::Result<()> {
             let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
                 pdf_render_gpu::GpuRenderer::from_shared(rs.device.clone(), rs.queue.clone())
             });
-            // `MainThreadMarker::new()` ne renvoie `Some` que sur le thread
-            // principal : garanti ici, ce callback tournant avant que la
-            // boucle d'événements `winit`/AppKit ne démarre.
-            let native_menu = objc2::MainThreadMarker::new().map(NativeMenu::install);
-            Ok(Box::new(ViewerApp::new(
-                std::env::args().nth(1),
-                gpu,
-                native_menu,
-            )))
+            // La barre de menus native n'est **pas** installée ici : ce
+            // callback tourne avant que la boucle d'événements `winit`
+            // démarre réellement, et `winit` installe son propre menu par
+            // défaut (juste "Quitter") au démarrage de cette boucle — après
+            // ce callback. L'installer ici risquait donc de se faire
+            // silencieusement écraser. `ViewerApp::update` l'installe plutôt
+            // à sa toute première frame, garantie de tourner une fois la
+            // boucle `winit`/AppKit pleinement démarrée.
+            Ok(Box::new(ViewerApp::new(std::env::args().nth(1), gpu)))
         }),
     )
 }
@@ -136,15 +136,11 @@ struct ViewerApp {
 }
 
 impl ViewerApp {
-    fn new(
-        initial_path: Option<String>,
-        gpu: Option<pdf_render_gpu::GpuRenderer>,
-        native_menu: Option<NativeMenu>,
-    ) -> Self {
+    fn new(initial_path: Option<String>, gpu: Option<pdf_render_gpu::GpuRenderer>) -> Self {
         let mut app = Self {
             session: None,
             gpu,
-            native_menu,
+            native_menu: None,
             zoom: 1.0,
             texture: None,
             texture_state: None,
@@ -585,6 +581,17 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Installée ici (première frame seulement) plutôt que dans le
+        // callback de création de `main` : à ce stade, la boucle
+        // d'événements `winit`/AppKit a fini son propre démarrage (qui
+        // installe un menu par défaut), donc la nôtre ne se fait plus
+        // écraser — voir la doc de `main` et `NativeMenu::install`.
+        if self.native_menu.is_none() {
+            if let Some(mtm) = objc2::MainThreadMarker::new() {
+                self.native_menu = Some(NativeMenu::install(mtm));
+            }
+        }
+
         // Commandes émises par la barre de menus native depuis la dernière
         // frame (voir `native_menu.rs`) — traitées ici plutôt que dans le
         // callback Objective-C lui-même, pour ne coupler `MenuTarget` qu'à

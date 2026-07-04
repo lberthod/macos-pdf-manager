@@ -111,6 +111,15 @@ impl NativeMenu {
 
         app.setMainMenu(Some(&main_menu));
 
+        // Requis pour un binaire lancé "nu" (`cargo run`, pas un vrai `.app`
+        // bundle avec un `Info.plist`) : sans ça, l'app peut rester en
+        // arrière-plan côté AppKit même si sa fenêtre est visible, et sa
+        // barre de menus ne devient jamais celle affichée par le système.
+        // Voir l'exemple officiel `objc2`/`objc2-app-kit`
+        // (`hello_world_app.rs`), qui documente exactement ce cas.
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+
         Self {
             _target: target,
             commands,

@@ -7,6 +7,7 @@
 - `embedded_truetype_font.pdf` — texte "AVIL" en police Monaco **intégrée** (`/FontFile2`, sous-ensemble), générée via `reportlab.pdfbase.ttfonts.TTFont` puis re-sauvegardée en xref classique avec `pikepdf`. Sert à tester l'extraction de contours réels (`font.rs::glyph_outline`) : ce sous-ensemble n'embarque qu'un `cmap` Macintosh (1,0), pas de table Unicode, ce qui exerce le repli par code brut.
 - `image_jpeg.pdf` — texte + photo JPEG intégrée (dégradé RGB synthétique généré via Pillow, 120×80), insérée avec `reportlab.Canvas.drawImage` puis re-sauvegardée en xref classique avec `pikepdf`. Le flux résultant chaîne `ASCII85Decode` + `DCTDecode` (comportement par défaut de reportlab), ce qui exerce la chaîne de filtres complète en plus du décodeur JPEG lui-même (`filters.rs::dct_decode`, `image.rs::decode_image`).
 - `embedded_cff_font.pdf` — texte "ABC" en police STIX (`STIXGeneral.otf`, système macOS) intégrée en **CFF/Type1C** (`/FontFile3`, sous-ensemble de 3 glyphes extrait via `fonttools subset` puis sa table `CFF ` brute isolée). Construit **à la main avec pikepdf** (`Dictionary`/`Stream` directs) plutôt qu'avec reportlab, qui n'a pas de support intégré pour produire ce mode d'embarquement. Sert à tester `font.rs::glyph_outline` sur le chemin `ttf_parser::cff::Table` (CFF brut, sans conteneur OpenType).
+- `image_smask.pdf` — rectangle bleu opaque recouvert d'un carré rouge cramoisi **semi-transparent** (`/SMask`, alpha uniforme ~128/255), généré via une image RGBA Pillow insérée avec `reportlab.Canvas.drawImage(..., mask='auto')` (c'est ce paramètre qui déclenche l'extraction de l'alpha en `/SMask` séparé plutôt que de l'aplatir). Sert à tester `image.rs::apply_soft_mask` et la prémultiplication dans `pdf-render`.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -88,6 +89,25 @@ font = pdf4.make_indirect(pikepdf.Dictionary(
 page4.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
 page4.Contents = pikepdf.Stream(pdf4, b"BT /F1 48 Tf 50 100 Td (ABC) Tj ET")
 pdf4.save("embedded_cff_font.pdf")
+
+# image_smask.pdf (nécessite aussi Pillow)
+img = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+px = img.load()
+for y in range(100):
+    for x in range(100):
+        px[x, y] = (220, 20, 60, 128)  # rouge cramoisi, alpha 128/255
+img.save("/tmp/translucent.png")
+
+from reportlab.lib.utils import ImageReader
+buf5 = io.BytesIO()
+c5 = canvas.Canvas(buf5, pagesize=letter)
+c5.setFillColorRGB(0, 0, 1)
+c5.rect(50, 600, 200, 150, fill=1, stroke=0)  # rectangle bleu opaque en dessous
+c5.drawImage("/tmp/translucent.png", 100, 620, width=150, height=150, mask='auto')
+c5.showPage()
+c5.save()
+with Pdf.open(io.BytesIO(buf5.getvalue())) as pdf:
+    pdf.save("image_smask.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
 ```
 
-Ce corpus reste modeste (7 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9). Un corpus plus large (PDF scannés, formulaires AcroForm, PDF chiffrés, CJK, PDF/A...) reste à constituer — voir sprint.md.
+Ce corpus reste modeste (8 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9). Un corpus plus large (PDF scannés, formulaires AcroForm, PDF chiffrés, CJK, PDF/A...) reste à constituer — voir sprint.md.

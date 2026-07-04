@@ -709,4 +709,29 @@ mod tests {
         assert_eq!(image.height, 80);
         assert_eq!(image.rgba.len(), 120 * 80 * 4);
     }
+
+    #[test]
+    fn real_fixture_decodes_smask_alpha_channel() {
+        let bytes = include_bytes!("../tests/fixtures/image_smask.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        let image = display
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image { pixels, .. } => pixels.as_ref(),
+                _ => None,
+            })
+            .expect("expected a decoded image in the DisplayList");
+
+        // L'image source est uniformément rouge cramoisi à alpha ~128/255
+        // (voir pdf-core/tests/fixtures/README.md) : le canal alpha ne doit
+        // donc pas être resté à 255 partout (ce qui indiquerait que le
+        // /SMask a été ignoré).
+        let alphas: Vec<u8> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
+        assert!(alphas.iter().any(|&a| a < 250));
+    }
 }

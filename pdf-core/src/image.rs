@@ -10,11 +10,16 @@
 //! Supporté : `DeviceGray`/`DeviceRGB`/`DeviceCMYK` (+ `CalGray`/`CalRGB`
 //! traités comme leurs équivalents `Device*`) et `ICCBased` (approximé par
 //! son nombre de composantes `/N`, sans tenir compte du profil ICC lui-même),
-//! à 8 bits par composante.
+//! à 8 bits par composante. Canal alpha via `/SMask` (masque de fondu en
+//! niveaux de gris, ISO 32000-1 §11.6.5.3) : décodé récursivement comme une
+//! image `DeviceGray` à part entière, puis rééchantillonné au plus proche
+//! voisin si ses dimensions diffèrent de l'image principale (rare, mais
+//! légal selon la spec).
 //!
 //! Non supporté (voir sprint.md) : `CCITTFaxDecode`, `JBIG2Decode`,
 //! `JPXDecode`, espaces `Indexed`/`Separation`/`Lab`, profondeurs 1/2/4/16
-//! bits, canal alpha (`/SMask`, `/Mask`), `/ImageMask`.
+//! bits, `/Mask` (masque de détourage 1 bit ou par plage de couleurs,
+//! différent de `/SMask`), `/ImageMask`.
 
 use crate::display::DecodedImage;
 use crate::document::Document;
@@ -83,11 +88,46 @@ pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
         rgba.extend_from_slice(&[r, g, b, 255]);
     }
 
+    if let Some(smask_obj) = stream.dict.get("SMask") {
+        if let Ok(Object::Stream(smask_stream)) = doc.get(smask_obj) {
+            if let Ok(smask) = decode_image(doc, &smask_stream) {
+                apply_soft_mask(&mut rgba, width, height, &smask);
+            }
+        }
+    }
+
     Ok(DecodedImage {
         width,
         height,
         rgba,
     })
+}
+
+/// Applique un masque de fondu (`/SMask`) déjà décodé comme canal alpha,
+/// en rééchantillonnant au plus proche voisin si ses dimensions diffèrent
+/// de l'image principale. Le niveau de gris (canal R, puisque R=G=B pour
+/// une image `DeviceGray` décodée) devient directement la valeur alpha.
+fn apply_soft_mask(rgba: &mut [u8], width: u32, height: u32, smask: &DecodedImage) {
+    for y in 0..height {
+        let sy = if height == smask.height {
+            y
+        } else {
+            (y as u64 * smask.height as u64 / height as u64) as u32
+        };
+        for x in 0..width {
+            let sx = if width == smask.width {
+                x
+            } else {
+                (x as u64 * smask.width as u64 / width as u64) as u32
+            };
+            let src_idx = (sy as usize * smask.width as usize + sx as usize) * 4;
+            let Some(&alpha) = smask.rgba.get(src_idx) else {
+                continue;
+            };
+            let dst_idx = (y as usize * width as usize + x as usize) * 4 + 3;
+            rgba[dst_idx] = alpha;
+        }
+    }
 }
 
 fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
@@ -168,5 +208,33 @@ mod tests {
         assert_eq!(ColorSpaceKind::Gray.components(), 1);
         assert_eq!(ColorSpaceKind::Rgb.components(), 3);
         assert_eq!(ColorSpaceKind::Cmyk.components(), 4);
+    }
+
+    #[test]
+    fn soft_mask_same_size_sets_alpha_directly() {
+        // Image principale 2x1, opaque (alpha=255) au départ.
+        let mut rgba = vec![255, 0, 0, 255, 0, 255, 0, 255];
+        let smask = DecodedImage {
+            width: 2,
+            height: 1,
+            // Gris décodé : R=G=B=valeur. Pixel 0 opaque, pixel 1 transparent.
+            rgba: vec![255, 255, 255, 255, 0, 0, 0, 255],
+        };
+        apply_soft_mask(&mut rgba, 2, 1, &smask);
+        assert_eq!(rgba, vec![255, 0, 0, 255, 0, 255, 0, 0]);
+    }
+
+    #[test]
+    fn soft_mask_smaller_size_is_upsampled_nearest_neighbor() {
+        // Image principale 4x1, masque 2x1 (moitié gauche opaque, droite transparente).
+        let mut rgba = [10, 10, 10, 255].repeat(4);
+        let smask = DecodedImage {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 255, 255, 255, 0, 0, 0, 255],
+        };
+        apply_soft_mask(&mut rgba, 4, 1, &smask);
+        let alphas: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
+        assert_eq!(alphas, vec![255, 255, 0, 0]);
     }
 }

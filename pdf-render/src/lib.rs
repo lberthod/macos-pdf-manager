@@ -10,8 +10,9 @@
 //!   n'ont pas encore de contour disponible.
 //! - Les images ne sont dessinées que lorsque `DisplayItem::Image::pixels`
 //!   est renseigné (voir `pdf-core::image` pour les formats supportés :
-//!   `DCTDecode`/JPEG et échantillons bruts 8 bits DeviceGray/RGB/CMYK ;
-//!   pas de CCITT/JBIG2/JPX, pas de canal alpha `/SMask`).
+//!   `DCTDecode`/JPEG et échantillons bruts 8 bits DeviceGray/RGB/CMYK,
+//!   canal alpha via `/SMask` prémultiplié ici avant rendu ; pas de
+//!   CCITT/JBIG2/JPX).
 //! - Le clip (`sets_clip`) n'est pas appliqué.
 //! - Espaces colorimétriques : conversion CMYK -> RGB naïve (sans profil ICC).
 
@@ -144,7 +145,12 @@ fn draw_image(
     if image.width == 0 || image.height == 0 {
         return;
     }
-    let Some(src) = PixmapRef::from_bytes(&image.rgba, image.width, image.height) else {
+    // `DecodedImage::rgba` est en alpha "straight" (non prémultiplié) ;
+    // tiny-skia s'attend à du prémultiplié. Sans `/SMask` (cas courant),
+    // alpha vaut 255 partout et les deux représentations coïncident — on
+    // évite alors la copie.
+    let premultiplied = premultiply_if_needed(&image.rgba);
+    let Some(src) = PixmapRef::from_bytes(&premultiplied, image.width, image.height) else {
         return;
     };
 
@@ -169,6 +175,22 @@ fn draw_image(
     );
 
     pixmap.draw_pixmap(0, 0, src, &PixmapPaint::default(), skia_transform, None);
+}
+
+/// Convertit du RGBA8 "straight" en prémultiplié (format attendu par
+/// `tiny_skia::Pixmap`/`PixmapRef`), sans copie si l'image est déjà opaque.
+fn premultiply_if_needed(rgba: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if rgba.chunks_exact(4).all(|p| p[3] == 255) {
+        return std::borrow::Cow::Borrowed(rgba);
+    }
+    let mut out = rgba.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        let a = pixel[3] as u32;
+        pixel[0] = ((pixel[0] as u32 * a) / 255) as u8;
+        pixel[1] = ((pixel[1] as u32 * a) / 255) as u8;
+        pixel[2] = ((pixel[2] as u32 * a) / 255) as u8;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Matrice PDF (page, origine bas-gauche) -> pixmap (origine haut-gauche),
@@ -419,6 +441,58 @@ mod tests {
         assert_eq!((right.red(), right.green(), right.blue()), (0, 0, 255));
     }
 
+    #[test]
+    fn premultiply_if_needed_skips_copy_when_opaque() {
+        let rgba = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        let out = premultiply_if_needed(&rgba);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*out, rgba.as_slice());
+    }
+
+    #[test]
+    fn premultiply_if_needed_scales_color_by_alpha() {
+        // Rouge à 50% d'alpha : (255,0,0,128) -> (~128,0,0,128) prémultiplié.
+        let rgba = vec![255u8, 0, 0, 128];
+        let out = premultiply_if_needed(&rgba);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert_eq!(out[0], (255u32 * 128 / 255) as u8);
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 128);
+    }
+
+    /// Une image semi-transparente peinte sur le fond blanc de la page doit
+    /// se fondre avec lui (rouge à 50% -> rose), pas juste apparaître en
+    /// rouge plein comme si l'alpha était ignoré.
+    #[test]
+    fn semi_transparent_image_blends_with_page_background() {
+        let width = 4u32;
+        let height = 4u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            rgba.extend_from_slice(&[255, 0, 0, 128]); // rouge à ~50% d'alpha.
+        }
+        let image = DecodedImage {
+            width,
+            height,
+            rgba,
+        };
+        let display = DisplayList {
+            items: vec![DisplayItem::Image {
+                resource: "Im0".into(),
+                transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
+                pixels: Some(image),
+            }],
+        };
+        let pixmap = render_page(&display, [0.0, 0.0, 100.0, 100.0]).unwrap();
+        let center = pixmap.pixel(50, 50).unwrap();
+        // Ni blanc pur (alpha ignoré à 0) ni rouge pur (alpha ignoré à 255) :
+        // un mélange, avec un vert/bleu résiduel du fond blanc.
+        assert!(center.green() > 0 && center.green() < 255);
+        assert_eq!(center.green(), center.blue());
+        assert!(center.red() > center.green());
+    }
+
     /// Bout en bout sur un vrai PDF avec police TrueType intégrée (Monaco) :
     /// parsing -> arbre de pages -> interprétation -> résolution de contour
     /// -> rasterisation. Vérifie qu'au moins un pixel non blanc est peint là
@@ -488,6 +562,44 @@ mod tests {
         assert!(
             has_non_white_pixel,
             "expected CFF glyph ink somewhere on the page"
+        );
+    }
+
+    /// Bout en bout sur un vrai PDF avec une image semi-transparente
+    /// (`/SMask`) recouvrant partiellement un rectangle bleu opaque : la
+    /// zone de recouvrement doit être un mélange (violet), ni le bleu pur
+    /// du dessous ni le rouge cramoisi pur de l'image (ce qui indiquerait
+    /// que l'alpha a été ignoré dans un sens ou dans l'autre).
+    #[test]
+    fn renders_real_smask_image_blended_over_opaque_rect() {
+        use pdf_core::interp::Interpreter;
+        use pdf_core::Document;
+
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/image_smask.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+        let pixmap = render_page(&display, page.media_box).unwrap();
+
+        // La page fait 612x792 ; le rectangle bleu va de (50,600) à
+        // (250,750) en espace PDF, l'image de (100,620) à (250,770) -- leur
+        // recouvrement est autour de (150-250, 620-750). On sonde un point
+        // qui devrait être dans cette zone après inversion d'axe Y.
+        let px = pixmap.pixel(180, 792 - 680).unwrap();
+        assert!(px.blue() > 0, "expected residual blue from the rect below");
+        assert!(
+            px.red() > 0,
+            "expected residual red from the translucent image"
+        );
+        assert!(
+            !(px.red() > 240 && px.green() < 15 && px.blue() < 15),
+            "pixel looks fully opaque crimson: alpha was likely ignored"
+        );
+        assert_ne!(
+            (px.red(), px.green(), px.blue()),
+            (0, 0, 255),
+            "pixel looks like pure opaque blue: image was likely not drawn"
         );
     }
 }

@@ -172,7 +172,9 @@ Une image XObject (`/Subtype /Image`) est décodée en deux temps, au moment de 
 
 Un échec de décodage (format non supporté, dimensions incohérentes) ne fait pas échouer toute la page : `do_xobject` capture l'erreur et pose `pixels: None`, que `pdf-render` traite comme « rien à dessiner ».
 
-**Non géré** : `CCITTFaxDecode`/`JBIG2Decode`/`JPXDecode`, espaces `Indexed`/`Separation`/`Lab`, profondeurs autres que 8 bits/composante, canal alpha (`/SMask`, `/Mask`), `/ImageMask`.
+Le canal alpha (`/SMask`, masque de fondu en niveaux de gris) est géré : décodé récursivement comme une image `DeviceGray` à part entière, rééchantillonné au plus proche voisin si ses dimensions diffèrent de l'image principale, puis placé dans le canal alpha du RGBA8 straight (non prémultiplié) — c'est `pdf-render` qui prémultiplie avant de construire le pixmap `tiny-skia` (voir §11).
+
+**Non géré** : `CCITTFaxDecode`/`JBIG2Decode`/`JPXDecode`, espaces `Indexed`/`Separation`/`Lab`, profondeurs autres que 8 bits/composante, `/Mask` (masque de détourage, différent de `/SMask`), `/ImageMask`.
 
 ## 11. Rendu ([pdf-render/src/lib.rs](../pdf-render/src/lib.rs))
 
@@ -182,7 +184,7 @@ Un échec de décodage (format non supporté, dimensions incohérentes) ne fait 
 - **Inversion d'axe** : l'espace PDF a l'origine en **bas-gauche**, Y vers le haut ; le pixmap a l'origine en haut-gauche. Tous les points passent par `flip`.
 - **Chemins** : `fill_path`/`stroke_path` avec la règle de remplissage PDF correspondante (nonzero → Winding, even-odd → EvenOdd), anti-aliasing activé.
 - **Glyphes** : le contour em-normalisé est transformé par la matrice du glyphe (`transform.apply`) puis rempli. Pas de hinting, pas d'atlas — correct d'abord, rapide ensuite (le GPU/wgpu est prévu Phase 3).
-- **Images** : le bitmap RGBA8 décodé est composé de trois transformations enchaînées (`Matrix::then`) : pixel→carré unité (mise à l'échelle + inversion, la ligne 0 des données étant le *haut* de l'image), carré unité→espace page (`DisplayItem::Image::transform`, la CTM au moment du `Do`), puis page→pixmap (le même flip que les chemins). Le tout est converti en `tiny_skia::Transform` et passé à `draw_pixmap`.
+- **Images** : le bitmap RGBA8 décodé est composé de trois transformations enchaînées (`Matrix::then`) : pixel→carré unité (mise à l'échelle + inversion, la ligne 0 des données étant le *haut* de l'image), carré unité→espace page (`DisplayItem::Image::transform`, la CTM au moment du `Do`), puis page→pixmap (le même flip que les chemins). Le tout est converti en `tiny_skia::Transform` et passé à `draw_pixmap`. Le RGBA fourni par `pdf-core` est **straight** (non prémultiplié) ; `premultiply_if_needed` le convertit avant `draw_pixmap` (`tiny-skia` attend du prémultiplié), sans copie dans le cas courant où l'image est entièrement opaque (pas de `/SMask`).
 - **Couleurs** : Gray/RGB directs ; CMYK converti naïvement (`(1-c)(1-k)`...) sans profil ICC.
 
 ## 12. Interface graphique ([pdf-ui/src/main.rs](../pdf-ui/src/main.rs))

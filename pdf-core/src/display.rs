@@ -148,9 +148,11 @@ pub enum DisplayItem {
 pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` octets, RGBA8 ligne par ligne depuis le haut de
-    /// l'image (convention raster standard). Alpha toujours 255 : pas de
-    /// support `/SMask` (canal de transparence) pour l'instant.
+    /// `width * height * 4` octets, RGBA8 (**straight**, non prémultiplié)
+    /// ligne par ligne depuis le haut de l'image (convention raster
+    /// standard). Alpha vaut 255 partout sauf si un `/SMask` a été résolu
+    /// (voir `image.rs::apply_soft_mask`) ; `pdf-render` doit prémultiplier
+    /// avant de construire un `tiny_skia::Pixmap`.
     pub rgba: Vec<u8>,
 }
 

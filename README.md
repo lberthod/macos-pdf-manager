@@ -24,7 +24,7 @@ Workspace Cargo multi-crates :
 | Crate | Rôle | État |
 |---|---|---|
 | `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices, filtres | Fonctionnel sur un sous-ensemble réel (voir STATUS.md) |
-| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels, glyphes (intégrés et substitués système), images (JPEG + échantillons bruts) | Fonctionnel, partiel (pas de clip, pas d'alpha) |
+| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels, glyphes (TrueType/CFF intégrés et substitués système), images (JPEG + échantillons bruts, canal alpha `/SMask`) | Fonctionnel, partiel (pas de clip) |
 | `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`) | Fonctionnel |
 | `pdf-ui` | Prototype de viewer (`egui`/`eframe`) : ouverture, navigation, zoom | Fonctionnel, minimal (pas de chrome natif macOS, voir STATUS.md) |
 | `pdf-text` | Extraction / analyse / réécriture de la couche texte | Stub vide |

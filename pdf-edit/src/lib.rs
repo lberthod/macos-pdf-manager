@@ -327,6 +327,236 @@ impl EditSession {
         r
     }
 
+    /// Construit le flux de contenu d'une apparence texte : un fond plein
+    /// optionnel (`background`, ISO 32000-1 — sert au "masquer l'ancien" du
+    /// remplacement par superposition, Sprint 17+ 6b) suivi du texte
+    /// lui-même en Helvetica non intégrée (résolue par la substitution
+    /// système au rendu, comme `alloc_helvetica_font`). Partagé par
+    /// `add_free_text_annotation` (6a) et `replace_text_with_overlay` (6b) :
+    /// les deux ne diffèrent que par la présence ou non d'un fond.
+    fn build_text_appearance_content(
+        width: f64,
+        height: f64,
+        text: &str,
+        font_size: f64,
+        text_color: (f32, f32, f32),
+        background: Option<(f32, f32, f32)>,
+    ) -> String {
+        let mut content = String::new();
+        if let Some((r, g, b)) = background {
+            content.push_str(&format!(
+                "{r:.3} {g:.3} {b:.3} rg 0 0 {width:.3} {height:.3} re f\n"
+            ));
+        }
+        let baseline_y = (height - font_size).max(1.0) / 2.0 + font_size * 0.2;
+        content.push_str(&format!(
+            "q\nBT\n/Helv {font_size:.2} Tf\n{:.3} {:.3} {:.3} rg\n2 {baseline_y:.2} Td\n({}) Tj\nET\nQ",
+            text_color.0,
+            text_color.1,
+            text_color.2,
+            escape_pdf_literal(text)
+        ));
+        content
+    }
+
+    /// Ajoute une annotation `/FreeText` (Sprint 17+, 6a : "ajout de nouveau
+    /// texte") sur la page `page_index`, avec une apparence réelle générée
+    /// (pas seulement `/Contents`/`/DA`, que ce moteur ne synthétise pas au
+    /// rendu — voir `set_form_field_value` pour la même contrainte côté
+    /// formulaires). Gérée par l'éditeur au même titre que les surlignages :
+    /// `remove_annotation` la retire, `undo`/`redo` s'appliquent normalement.
+    pub fn add_free_text_annotation(
+        &mut self,
+        page_index: usize,
+        rect: [f64; 4],
+        text: &str,
+        font_size: f64,
+        text_color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.add_text_overlay_annotation(page_index, rect, text, font_size, text_color, None)
+    }
+
+    /// Remplacement de texte existant par superposition (Sprint 17+, 6b) :
+    /// "masquer l'ancien + redessiner", pas une édition chirurgicale du flux
+    /// de contenu d'origine (6c, hors périmètre — voir sprint.md). Couvre
+    /// `rect` d'un rectangle plein de `background` (typiquement le blanc de
+    /// la page) puis dessine `text` par-dessus — une nouvelle annotation
+    /// `/FreeText`, le contenu original sous-jacent n'est jamais modifié ni
+    /// supprimé (il reste dans le flux de la page, simplement recouvert).
+    pub fn replace_text_with_overlay(
+        &mut self,
+        page_index: usize,
+        rect: [f64; 4],
+        text: &str,
+        font_size: f64,
+        text_color: (f32, f32, f32),
+        background: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.add_text_overlay_annotation(
+            page_index,
+            rect,
+            text,
+            font_size,
+            text_color,
+            Some(background),
+        )
+    }
+
+    fn add_text_overlay_annotation(
+        &mut self,
+        page_index: usize,
+        rect: [f64; 4],
+        text: &str,
+        font_size: f64,
+        text_color: (f32, f32, f32),
+        background: Option<(f32, f32, f32)>,
+    ) -> Result<(), String> {
+        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
+        let page_ref = page
+            .object_ref
+            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+
+        let (x0, y0, x1, y1) = (
+            rect[0].min(rect[2]),
+            rect[1].min(rect[3]),
+            rect[0].max(rect[2]),
+            rect[1].max(rect[3]),
+        );
+        let width = (x1 - x0).max(1.0);
+        let height = (y1 - y0).max(1.0);
+
+        let font_ref = self.alloc_helvetica_font();
+        let mut font_res = Dictionary::new();
+        font_res.insert("Helv", Object::Reference(font_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_res));
+
+        let content = Self::build_text_appearance_content(
+            width, height, text, font_size, text_color, background,
+        );
+
+        let ap_num = self.alloc_num();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("Type", Object::Name("XObject".to_string()));
+        ap_dict.insert("Subtype", Object::Name("Form".to_string()));
+        ap_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(width),
+                Object::Real(height),
+            ]),
+        );
+        ap_dict.insert("Resources", Object::Dictionary(resources));
+        let ap_stream = Object::Stream(Stream {
+            dict: ap_dict,
+            raw_data: content.into_bytes(),
+        });
+        self.pending.insert(ap_num, ap_stream);
+
+        let annot_num = self.alloc_num();
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("Type", Object::Name("Annot".to_string()));
+        annot_dict.insert("Subtype", Object::Name("FreeText".to_string()));
+        annot_dict.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Real(x0),
+                Object::Real(y0),
+                Object::Real(x1),
+                Object::Real(y1),
+            ]),
+        );
+        annot_dict.insert("Contents", Object::String(text.as_bytes().to_vec()));
+        annot_dict.insert(
+            "DA",
+            Object::String(format!("/Helv {font_size:.2} Tf 0 g").into_bytes()),
+        );
+        let mut ap_ref_dict = Dictionary::new();
+        ap_ref_dict.insert("N", Object::Reference(ObjRef::new(ap_num, 0)));
+        annot_dict.insert("AP", Object::Dictionary(ap_ref_dict));
+        self.pending
+            .insert(annot_num, Object::Dictionary(annot_dict));
+
+        self.append_to_annots(page_ref, ObjRef::new(annot_num, 0))?;
+        Ok(())
+    }
+
+    /// Références (dans l'ordre de `/Annots`) des annotations de la page
+    /// `page_index` — résout `/Annots` qu'il soit inline ou indirect, comme
+    /// `append_to_annots`.
+    fn page_annotation_refs(&self, page_index: usize) -> Result<Vec<ObjRef>, String> {
+        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
+        let page_ref = page
+            .object_ref
+            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_obj = self.current(page_ref.num)?;
+        let page_dict = page_obj
+            .as_dict()
+            .ok_or_else(|| "page object is not a dictionary".to_string())?;
+
+        let annots = match page_dict.get("Annots") {
+            Some(Object::Reference(r)) => self.current(r.num)?,
+            Some(other) => other.clone(),
+            None => return Ok(Vec::new()),
+        };
+        Ok(annots
+            .as_array()
+            .map(|items| items.iter().filter_map(|o| o.as_reference()).collect())
+            .unwrap_or_default())
+    }
+
+    /// Retire l'annotation d'indice `annot_index` (dans l'ordre de
+    /// `/Annots`) de la page `page_index` — l'objet annotation et son
+    /// apparence restent alloués, orphelins (voir la doc de module sur le
+    /// garbage collection), seule la référence dans `/Annots` disparaît.
+    pub fn remove_annotation(
+        &mut self,
+        page_index: usize,
+        annot_index: usize,
+    ) -> Result<(), String> {
+        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
+        let page_ref = page
+            .object_ref
+            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let refs = self.page_annotation_refs(page_index)?;
+        if annot_index >= refs.len() {
+            return Err(format!(
+                "annotation index {annot_index} out of bounds (0..{})",
+                refs.len()
+            ));
+        }
+
+        let page_obj = self.current(page_ref.num)?;
+        let page_dict = page_obj
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "page object is not a dictionary".to_string())?;
+
+        let mut new_refs = refs;
+        new_refs.remove(annot_index);
+        let new_array = Object::Array(new_refs.into_iter().map(Object::Reference).collect());
+
+        match page_dict.get("Annots").cloned() {
+            Some(Object::Reference(annots_ref)) => {
+                let before = self.current(annots_ref.num)?;
+                self.commit(EditOp {
+                    modified: vec![(annots_ref.num, before, new_array)],
+                });
+            }
+            _ => {
+                let before_page = Object::Dictionary(page_dict.clone());
+                let mut updated = page_dict;
+                updated.insert("Annots", new_array);
+                self.commit(EditOp {
+                    modified: vec![(page_ref.num, before_page, Object::Dictionary(updated))],
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Trouve le champ `/AcroForm/Fields` de nom `/T` == `field_name`
     /// (correspondance directe, un seul niveau — voir la doc de module) et
     /// renvoie sa référence d'objet.
@@ -1423,6 +1653,159 @@ mod tests {
         });
         let image = decoded_image.expect("expected the inserted image to actually decode");
         assert_eq!((image.width, image.height), (64, 48));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Sprint 17+, 6a : une annotation `/FreeText` ajoutée doit persister
+    /// et produire de vrais glyphes au rendu après réouverture — pas juste
+    /// une entrée `/Contents` inerte.
+    #[test]
+    fn add_free_text_annotation_persists_and_renders_after_reopen() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_free_text_annotation(
+                0,
+                [50.0, 50.0, 250.0, 80.0],
+                "Nouvelle note",
+                14.0,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let out_path = write_fixture(b"free-text-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+        let display =
+            pdf_core::interp::Interpreter::run_page_with_annotations(&reopened, &page, &content)
+                .unwrap();
+
+        let glyph_count = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, pdf_core::display::DisplayItem::Glyph { .. }))
+            .count();
+        // Le contenu de base ("Page 1 - Hello, PDF Manager!") produit déjà
+        // des glyphes : on vérifie juste qu'il y en a *plus* qu'avant,
+        // preuve que l'annotation a bien ajouté du texte réel.
+        let base_display =
+            pdf_core::interp::Interpreter::run_page(&reopened, page.resources.clone(), &content)
+                .unwrap();
+        let base_glyph_count = base_display
+            .items
+            .iter()
+            .filter(|i| matches!(i, pdf_core::display::DisplayItem::Glyph { .. }))
+            .count();
+        assert!(
+            glyph_count > base_glyph_count,
+            "expected the FreeText annotation to add glyphs on top of the base page content"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Sprint 17+, 6b : remplacer une région de texte par superposition ne
+    /// doit ni modifier ni supprimer le flux de contenu d'origine (le texte
+    /// "caché" reste extractible — seulement recouvert visuellement), et
+    /// doit produire un rectangle de fond plein **et** le nouveau texte au
+    /// rendu final.
+    #[test]
+    fn replace_text_with_overlay_covers_without_deleting_original_content() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .replace_text_with_overlay(
+                0,
+                [72.0, 715.0, 400.0, 735.0],
+                "Texte remplacé",
+                18.0,
+                (0.0, 0.0, 0.0),
+                (1.0, 1.0, 1.0),
+            )
+            .unwrap();
+
+        let out_path = write_fixture(b"overlay-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+
+        // Le flux de contenu original doit rester intact : le texte "caché"
+        // est toujours là, seulement recouvert au rendu.
+        let original_text = pdf_text::extract_text(
+            &pdf_core::interp::Interpreter::run_page(&reopened, page.resources.clone(), &content)
+                .unwrap(),
+        );
+        assert!(
+            original_text.contains("Page 1"),
+            "original content stream should be untouched, got {original_text:?}"
+        );
+
+        // Le rendu final (avec annotations) doit montrer un rectangle blanc
+        // plein (le cache) et le nouveau texte.
+        let display =
+            pdf_core::interp::Interpreter::run_page_with_annotations(&reopened, &page, &content)
+                .unwrap();
+        let has_white_cover = display.items.iter().any(|item| {
+            matches!(
+                item,
+                pdf_core::display::DisplayItem::Path {
+                    fill_color: pdf_core::display::Color::Rgb(r, g, b),
+                    ..
+                } if *r > 0.99 && *g > 0.99 && *b > 0.99
+            )
+        });
+        assert!(has_white_cover, "expected an opaque white cover rectangle");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// L'annotation retirée ne doit plus apparaître dans `/Annots` après
+    /// réouverture, et le compte de références doit diminuer d'exactement 1.
+    #[test]
+    fn remove_annotation_deletes_the_reference_and_persists() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_highlight_annotation(0, [100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0), vec![])
+            .unwrap();
+        session
+            .add_free_text_annotation(0, [50.0, 50.0, 250.0, 80.0], "Note", 14.0, (0.0, 0.0, 0.0))
+            .unwrap();
+        assert_eq!(session.page_annotation_refs(0).unwrap().len(), 2);
+
+        session.remove_annotation(0, 0).unwrap();
+        assert_eq!(session.page_annotation_refs(0).unwrap().len(), 1);
+
+        let out_path = write_fixture(b"remove-annot-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annots = page
+            .dict
+            .get("Annots")
+            .and_then(|o| o.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(annots, 1);
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();

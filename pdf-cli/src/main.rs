@@ -22,6 +22,13 @@ fn print_usage() {
     eprintln!("       pdf-cli merge <base.pdf> <other.pdf> <out.pdf>");
     eprintln!("       pdf-cli split <in.pdf> <out.pdf> <page_index> [page_index...]");
     eprintln!("       pdf-cli optimize <in.pdf> <out.pdf>");
+    eprintln!(
+        "       pdf-cli add-text <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1> <font_size> <text>"
+    );
+    eprintln!(
+        "       pdf-cli replace-text <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1> <font_size> <text>"
+    );
+    eprintln!("       pdf-cli remove-annotation <in.pdf> <out.pdf> <page_index> <annot_index>");
 }
 
 fn main() -> ExitCode {
@@ -57,6 +64,9 @@ fn main() -> ExitCode {
             .get(2)
             .zip(args.get(3))
             .map(|(input, out)| run_optimize(input, out).map_err(pdf_error)),
+        Some("add-text") => run_add_text_args(&args),
+        Some("replace-text") => run_replace_text_args(&args),
+        Some("remove-annotation") => run_remove_annotation_args(&args),
         _ => None,
     };
 
@@ -265,6 +275,93 @@ fn run_optimize(input: &str, out: &str) -> Result<(), String> {
     fs::write(out, optimized).map_err(|e| e.to_string())?;
     println!("Optimized {input}, saved to {out}");
     Ok(())
+}
+
+/// Sprint 17+ (6a) : ajoute une annotation `/FreeText` (nouveau texte,
+/// noir sur fond transparent) et sauvegarde incrémentalement.
+fn run_add_text_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let (input, out, page_index, rect, font_size, text) = parse_text_op_args(args)?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.add_free_text_annotation(
+                page_index,
+                rect,
+                &text,
+                font_size,
+                (0.0, 0.0, 0.0),
+            )?;
+            session.save_as(out)?;
+            println!("Added free text on page {page_index} of {input}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+/// Sprint 17+ (6b) : recouvre `rect` d'un fond blanc puis redessine `text`
+/// par-dessus (masquer l'ancien + redessiner, pas une édition chirurgicale
+/// du flux d'origine — voir sprint.md).
+fn run_replace_text_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let (input, out, page_index, rect, font_size, text) = parse_text_op_args(args)?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.replace_text_with_overlay(
+                page_index,
+                rect,
+                &text,
+                font_size,
+                (0.0, 0.0, 0.0),
+                (1.0, 1.0, 1.0),
+            )?;
+            session.save_as(out)?;
+            println!("Replaced text region on page {page_index} of {input}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+/// Arguments communs à `add-text`/`replace-text`.
+type TextOpArgs<'a> = (&'a str, &'a str, usize, [f64; 4], f64, String);
+
+/// Analyse `<in> <out> <page_index> <x0> <y0> <x1> <y1> <font_size>
+/// <text...>` (le texte peut contenir des espaces, donc pris comme le reste
+/// des arguments joints).
+fn parse_text_op_args(args: &[String]) -> Option<TextOpArgs<'_>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let page_index: usize = args.get(4)?.parse().ok()?;
+    let x0: f64 = args.get(5)?.parse().ok()?;
+    let y0: f64 = args.get(6)?.parse().ok()?;
+    let x1: f64 = args.get(7)?.parse().ok()?;
+    let y1: f64 = args.get(8)?.parse().ok()?;
+    let font_size: f64 = args.get(9)?.parse().ok()?;
+    if args.len() <= 10 {
+        return None;
+    }
+    let text = args[10..].join(" ");
+    Some((input, out, page_index, [x0, y0, x1, y1], font_size, text))
+}
+
+fn run_remove_annotation_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let page_index: usize = args.get(4)?.parse().ok()?;
+    let annot_index: usize = args.get(5)?.parse().ok()?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.remove_annotation(page_index, annot_index)?;
+            session.save_as(out)?;
+            println!(
+                "Removed annotation {annot_index} from page {page_index} of {input}, saved to {out}"
+            );
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
 }
 
 fn read_document(path: &str) -> pdf_core::Result<Document> {

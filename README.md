@@ -34,7 +34,7 @@ Workspace Cargo multi-crates :
 | `pdf-app` | État de session (ouverture, navigation, rendu, recherche, cache) partagé entre `pdf-ui` et les futurs fronts | Fonctionnel |
 | `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`, `text`) | Fonctionnel |
 | `pdf-ui` | Viewer (`egui`/`eframe`) avec chrome natif macOS : menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre ; navigation, zoom, recherche, miniatures, signets, défilement continu, sélection de texte | Fonctionnel, packagé en `.app`/`.dmg` (voir STATUS.md) |
-| `pdf-edit` | Annotations (`/Highlight`), remplissage de champs AcroForm, journal `EditOp` + undo/redo, sauvegarde incrémentale, manipulation de pages (insérer/supprimer/déplacer/pivoter, fusion/découpage de documents, insertion d'image, export optimisé) | Fonctionnel au niveau moteur (pas encore d'interface `pdf-ui`) |
+| `pdf-edit` | Annotations (`/Highlight`, `/FreeText`), remplissage de champs AcroForm, ajout/remplacement de texte (superposition), journal `EditOp` + undo/redo, sauvegarde incrémentale, manipulation de pages (insérer/supprimer/déplacer/pivoter, fusion/découpage de documents, insertion d'image, export optimisé) | Fonctionnel au niveau moteur (pas encore d'interface `pdf-ui`) |
 
 ## Essayer
 
@@ -64,6 +64,10 @@ cargo run --bin pdf-cli -- fill-form in.pdf out.pdf nom_du_champ "valeur"
 cargo run --bin pdf-cli -- delete-page in.pdf out.pdf 2
 cargo run --bin pdf-cli -- merge base.pdf autre.pdf out.pdf
 cargo run --bin pdf-cli -- split in.pdf out.pdf 0 2 4
+
+# Ajouter du texte / remplacer un texte existant par superposition
+cargo run --bin pdf-cli -- add-text in.pdf out.pdf 0 50 50 250 80 14 Nouvelle note
+cargo run --bin pdf-cli -- replace-text in.pdf out.pdf 0 72 715 400 735 18 Titre remplace
 
 # Ouvrir le prototype de viewer graphique
 cargo run --bin pdf-ui -- chemin/vers/fichier.pdf
@@ -104,6 +108,6 @@ Pour régénérer volontairement les images de référence après un changement 
 
 Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer, chrome natif & packaging) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu, sélection de texte **et** chrome natif macOS (menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre), packagé en `.app`/`.dmg`.
 
-Phases 4 et 5 (annotations & formulaires, manipulation de pages) ont un socle moteur fonctionnel : `pdf-edit` sait ajouter une annotation `/Highlight`, remplir un champ de formulaire texte (avec régénération de l'apparence visible au rendu), proposer un vrai historique undo/redo, insérer/supprimer/déplacer/pivoter des pages, fusionner ou découper des documents (copie récursive de l'objet-graphe avec renumérotation), insérer une image JPEG comme page, et exporter une version optimisée (garbage collection par reconstruction) — le tout persisté par sauvegarde incrémentale (`pdf-core::writer` + `Document::save_incremental`) et vérifié bout en bout (sauvegarde, réouverture, rendu réel). Il manque encore l'interface `pdf-ui` pour déclencher ces opérations sans passer par `pdf-cli`/l'API Rust directement — voir [sprint.md](./sprint.md) Sprints 13-14 et 15-16.
+Phases 4, 5 et 6a/6b (annotations & formulaires, manipulation de pages, édition de texte) ont un socle moteur fonctionnel : `pdf-edit` sait ajouter une annotation `/Highlight` ou `/FreeText`, remplir un champ de formulaire texte (avec régénération de l'apparence visible au rendu), ajouter du nouveau texte ou remplacer un texte existant par superposition (masquer l'ancien + redessiner, sans jamais toucher le flux de contenu original), proposer un vrai historique undo/redo, insérer/supprimer/déplacer/pivoter des pages, fusionner ou découper des documents (copie récursive de l'objet-graphe avec renumérotation), insérer une image JPEG comme page, et exporter une version optimisée (garbage collection par reconstruction) — le tout persisté par sauvegarde incrémentale (`pdf-core::writer` + `Document::save_incremental`) et vérifié bout en bout (sauvegarde, réouverture, rendu réel). L'édition chirurgicale du flux de contenu existant (6c) est volontairement hors périmètre, traitée comme un projet de recherche séparé. Il manque encore l'interface `pdf-ui` pour déclencher ces opérations sans passer par `pdf-cli`/l'API Rust directement — voir [sprint.md](./sprint.md) Sprints 13-14, 15-16 et 17+.
 
 Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.

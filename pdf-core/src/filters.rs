@@ -74,6 +74,28 @@ fn dct_decode(data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| PdfError::DecodeError(format!("DCTDecode: {e}")))
 }
 
+/// Largeur/hauteur/nombre de composantes d'un JPEG brut, sans passer par un
+/// `Stream`/`Document` — utilisé par `pdf-edit` (Sprint 15-16) pour
+/// construire le dictionnaire `/Width`/`/Height`/`/ColorSpace` correct d'une
+/// image insérée telle quelle (`/Filter /DCTDecode`, octets JPEG non
+/// modifiés), sans avoir à décoder l'image pixel par pixel juste pour
+/// connaître sa taille.
+pub fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32, u8)> {
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new(zune_jpeg::zune_core::bytestream::ZCursor::new(data));
+    decoder
+        .decode_headers()
+        .map_err(|e| PdfError::DecodeError(format!("DCTDecode: {e}")))?;
+    let info = decoder.info().ok_or_else(|| {
+        PdfError::DecodeError("DCTDecode: no image info after decoding headers".into())
+    })?;
+    let components = decoder
+        .output_colorspace()
+        .map(|cs| cs.num_components() as u8)
+        .unwrap_or(3);
+    Ok((info.width as u32, info.height as u32, components))
+}
+
 fn ascii_hex_decode(data: &[u8]) -> Result<Vec<u8>> {
     let mut digits = Vec::new();
     for &b in data {

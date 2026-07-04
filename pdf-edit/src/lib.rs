@@ -46,6 +46,16 @@ struct EditOp {
     modified: Vec<(u32, Object, Object)>,
 }
 
+/// État de l'arbre de pages une fois "aplati" (Sprint 15-16) — voir
+/// `EditSession::ensure_flat_page_tree`. `order` est la source de vérité
+/// pour l'ordre des pages une fois ce mode déclenché : les opérations de
+/// manipulation de pages (insertion/suppression/déplacement) le lisent et
+/// l'écrivent directement, sans reparcourir `Document::pages()`.
+struct PageTreeState {
+    pages_node_ref: ObjRef,
+    order: Vec<ObjRef>,
+}
+
 pub struct EditSession {
     doc: Document,
     /// Objets nouveaux ou mis à jour, pas encore écrits sur disque —
@@ -55,6 +65,7 @@ pub struct EditSession {
     next_num: u32,
     undo_stack: Vec<EditOp>,
     redo_stack: Vec<EditOp>,
+    page_tree: Option<PageTreeState>,
 }
 
 impl EditSession {
@@ -68,6 +79,7 @@ impl EditSession {
             next_num,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            page_tree: None,
         })
     }
 
@@ -110,6 +122,7 @@ impl EditSession {
             self.pending.insert(*num, before.clone());
         }
         self.redo_stack.push(op);
+        self.refresh_page_tree_order();
         true
     }
 
@@ -121,7 +134,34 @@ impl EditSession {
             self.pending.insert(*num, after.clone());
         }
         self.undo_stack.push(op);
+        self.refresh_page_tree_order();
         true
+    }
+
+    /// Recale `page_tree.order` (cache pratique de l'ordre des pages, tenu
+    /// à jour par les opérations de manipulation de page) sur `/Kids` tel
+    /// qu'il vient d'être restauré dans `pending` par `undo`/`redo` — sans
+    /// ça, `page_tree.order` resterait périmé après un `undo`/`redo` qui
+    /// touche l'ordre des pages, puisque `undo`/`redo` ne connaissent que
+    /// des paires (numéro d'objet, valeur), pas la sémantique "ordre de
+    /// pages" propre à `page_tree`.
+    fn refresh_page_tree_order(&mut self) {
+        let Some(state) = &self.page_tree else {
+            return;
+        };
+        let pages_node_num = state.pages_node_ref.num;
+        let Ok(obj) = self.current(pages_node_num) else {
+            return;
+        };
+        let Some(kids) = obj
+            .as_dict()
+            .and_then(|d| d.get("Kids"))
+            .and_then(|o| o.as_array())
+        else {
+            return;
+        };
+        let order: Vec<ObjRef> = kids.iter().filter_map(|o| o.as_reference()).collect();
+        self.page_tree.as_mut().unwrap().order = order;
     }
 
     fn commit(&mut self, op: EditOp) {
@@ -388,6 +428,416 @@ impl EditSession {
         Ok(())
     }
 
+    /// Matérialise l'arbre `/Pages` courant en une seule liste plate (un
+    /// unique nœud `/Pages` listant directement toutes les pages en
+    /// `/Kids`), en "cuisant" en dur sur chaque page les attributs qu'elle
+    /// héritait éventuellement d'un ancêtre (`/MediaBox`, `/Rotate`,
+    /// `/Resources`) — Sprint 15-16 : les opérations de manipulation de
+    /// pages (insertion/suppression/déplacement) ont besoin d'un point
+    /// unique où modifier l'ordre, quelle que soit la forme (potentiellement
+    /// arborescente, avec plusieurs niveaux de `/Pages` intermédiaires) de
+    /// l'arbre d'origine — une pratique courante des bibliothèques
+    /// d'édition PDF plutôt qu'une manipulation chirurgicale de l'arbre
+    /// existant, qui serait bien plus complexe pour un bénéfice minime.
+    ///
+    /// Ne fait rien au-delà du premier appel (`page_tree` déjà renseigné) :
+    /// retourne la liste des modifications de **cette** invocation
+    /// seulement (vide si l'arbre était déjà aplati), pour que l'appelant
+    /// (la première opération de manipulation de page de la session) les
+    /// inclue dans son propre `EditOp` — un `undo` de cette première
+    /// opération doit aussi annuler l'aplatissement, pas seulement son
+    /// propre effet.
+    fn ensure_flat_page_tree(&mut self) -> Result<Vec<(u32, Object, Object)>, String> {
+        if self.page_tree.is_some() {
+            return Ok(Vec::new());
+        }
+
+        let pages = self.doc.pages().map_err(|e| e.to_string())?;
+        let pages_node_num = self.alloc_num();
+        let pages_node_ref = ObjRef::new(pages_node_num, 0);
+
+        let mut order = Vec::with_capacity(pages.len());
+        let mut modified = Vec::with_capacity(pages.len() + 1);
+
+        for page in &pages {
+            let page_ref = page.object_ref.ok_or_else(|| {
+                "page tree contains an inline page dictionary (not supported for page manipulation)"
+                    .to_string()
+            })?;
+            let before = self.current(page_ref.num)?;
+            let mut dict = before
+                .as_dict()
+                .cloned()
+                .ok_or_else(|| "page object is not a dictionary".to_string())?;
+            dict.insert("Type", Object::Name("Page".to_string()));
+            dict.insert("Parent", Object::Reference(pages_node_ref));
+            dict.insert(
+                "MediaBox",
+                Object::Array(page.media_box.iter().map(|&n| Object::Real(n)).collect()),
+            );
+            dict.insert("Rotate", Object::Integer(page.rotate as i64));
+            dict.insert("Resources", Object::Dictionary(page.resources.clone()));
+            let after = Object::Dictionary(dict);
+            modified.push((page_ref.num, before, after));
+            order.push(page_ref);
+        }
+
+        let root_ref = self
+            .doc
+            .trailer()
+            .get("Root")
+            .and_then(|o| o.as_reference())
+            .ok_or_else(|| "trailer /Root is not an indirect reference".to_string())?;
+        let before_root = self.current(root_ref.num)?;
+        let mut root_dict = before_root
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "/Root is not a dictionary".to_string())?;
+        root_dict.insert("Pages", Object::Reference(pages_node_ref));
+        let after_root = Object::Dictionary(root_dict);
+        modified.push((root_ref.num, before_root, after_root));
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.insert("Type", Object::Name("Pages".to_string()));
+        pages_dict.insert(
+            "Kids",
+            Object::Array(order.iter().map(|&r| Object::Reference(r)).collect()),
+        );
+        pages_dict.insert("Count", Object::Integer(order.len() as i64));
+        // Objet flambant neuf : jamais annulé par un `undo` (voir la doc de
+        // module) — seules les entrées de `modified` ci-dessus (objets déjà
+        // existants modifiés) portent la sémantique undo/redo.
+        self.pending
+            .insert(pages_node_num, Object::Dictionary(pages_dict));
+
+        self.page_tree = Some(PageTreeState {
+            pages_node_ref,
+            order,
+        });
+        Ok(modified)
+    }
+
+    /// Réécrit `/Kids`/`/Count` du nœud `/Pages` aplati pour refléter
+    /// `new_order`, et pousse cette modification dans `modified` — partagé
+    /// par toutes les opérations de manipulation de page ci-dessous.
+    fn update_page_order(
+        &mut self,
+        new_order: Vec<ObjRef>,
+        modified: &mut Vec<(u32, Object, Object)>,
+    ) -> Result<(), String> {
+        let pages_node_ref = self.page_tree.as_ref().unwrap().pages_node_ref;
+        let before = self.current(pages_node_ref.num)?;
+        let mut dict = before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "flat pages node is not a dictionary".to_string())?;
+        dict.insert(
+            "Kids",
+            Object::Array(new_order.iter().map(|&r| Object::Reference(r)).collect()),
+        );
+        dict.insert("Count", Object::Integer(new_order.len() as i64));
+        modified.push((pages_node_ref.num, before, Object::Dictionary(dict)));
+        self.page_tree.as_mut().unwrap().order = new_order;
+        Ok(())
+    }
+
+    /// Nombre de pages courant (après d'éventuelles manipulations en
+    /// attente dans cette session, avant qu'elles ne soient sauvegardées).
+    pub fn page_count(&self) -> Result<usize, String> {
+        match &self.page_tree {
+            Some(state) => Ok(state.order.len()),
+            None => self.doc.page_count().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Insère une page blanche (contenu vide, `/Resources` vide) à l'indice
+    /// `at_index` (borné à `[0, page_count]`, donc `page_count` insère à la
+    /// fin).
+    pub fn insert_blank_page(
+        &mut self,
+        at_index: usize,
+        media_box: [f64; 4],
+    ) -> Result<(), String> {
+        let mut modified = self.ensure_flat_page_tree()?;
+        let pages_node_ref = self.page_tree.as_ref().unwrap().pages_node_ref;
+
+        let content_num = self.alloc_num();
+        self.pending.insert(
+            content_num,
+            Object::Stream(Stream {
+                dict: Dictionary::new(),
+                raw_data: Vec::new(),
+            }),
+        );
+
+        let page_num = self.alloc_num();
+        let page_ref = ObjRef::new(page_num, 0);
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Type", Object::Name("Page".to_string()));
+        page_dict.insert("Parent", Object::Reference(pages_node_ref));
+        page_dict.insert(
+            "MediaBox",
+            Object::Array(media_box.iter().map(|&n| Object::Real(n)).collect()),
+        );
+        page_dict.insert("Resources", Object::Dictionary(Dictionary::new()));
+        page_dict.insert("Contents", Object::Reference(ObjRef::new(content_num, 0)));
+        self.pending.insert(page_num, Object::Dictionary(page_dict));
+
+        let mut new_order = self.page_tree.as_ref().unwrap().order.clone();
+        let at_index = at_index.min(new_order.len());
+        new_order.insert(at_index, page_ref);
+        self.update_page_order(new_order, &mut modified)?;
+
+        self.commit(EditOp { modified });
+        Ok(())
+    }
+
+    /// Insère une nouvelle page à `at_index` dont le seul contenu est
+    /// `jpeg_bytes` dessiné en plein cadre (Sprint 15-16, "insertion
+    /// d'images") — les octets JPEG sont intégrés **tels quels**
+    /// (`/Filter /DCTDecode`), sans redécoder/recompresser : `/Width`,
+    /// `/Height` et `/ColorSpace` sont lus depuis les en-têtes JPEG
+    /// (`pdf_core::filters::jpeg_dimensions`) sans décoder les pixels.
+    /// `/MediaBox` de la nouvelle page correspond aux dimensions de l'image
+    /// en points (1 pixel = 1 point, le choix le plus simple qui reste
+    /// correct — pas de résolution DPI à interpréter). **Formats non
+    /// gérés :** PNG et autres (nécessiteraient soit une réencodage en
+    /// JPEG, soit le support d'échantillons bruts `FlateDecode`, hors
+    /// périmètre de cette passe).
+    pub fn insert_image_page(&mut self, at_index: usize, jpeg_bytes: &[u8]) -> Result<(), String> {
+        let (width, height, components) =
+            pdf_core::filters::jpeg_dimensions(jpeg_bytes).map_err(|e| e.to_string())?;
+        let color_space = match components {
+            1 => "DeviceGray",
+            4 => "DeviceCMYK",
+            _ => "DeviceRGB",
+        };
+
+        let mut modified = self.ensure_flat_page_tree()?;
+        let pages_node_ref = self.page_tree.as_ref().unwrap().pages_node_ref;
+
+        let image_num = self.alloc_num();
+        let mut image_dict = Dictionary::new();
+        image_dict.insert("Type", Object::Name("XObject".to_string()));
+        image_dict.insert("Subtype", Object::Name("Image".to_string()));
+        image_dict.insert("Width", Object::Integer(width as i64));
+        image_dict.insert("Height", Object::Integer(height as i64));
+        image_dict.insert("ColorSpace", Object::Name(color_space.to_string()));
+        image_dict.insert("BitsPerComponent", Object::Integer(8));
+        image_dict.insert("Filter", Object::Name("DCTDecode".to_string()));
+        self.pending.insert(
+            image_num,
+            Object::Stream(Stream {
+                dict: image_dict,
+                raw_data: jpeg_bytes.to_vec(),
+            }),
+        );
+
+        let content_num = self.alloc_num();
+        let content = format!("q {width} 0 0 {height} 0 0 cm /Im0 Do Q");
+        self.pending.insert(
+            content_num,
+            Object::Stream(Stream {
+                dict: Dictionary::new(),
+                raw_data: content.into_bytes(),
+            }),
+        );
+
+        let mut xobject_res = Dictionary::new();
+        xobject_res.insert("Im0", Object::Reference(ObjRef::new(image_num, 0)));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobject_res));
+
+        let page_num = self.alloc_num();
+        let page_ref = ObjRef::new(page_num, 0);
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Type", Object::Name("Page".to_string()));
+        page_dict.insert("Parent", Object::Reference(pages_node_ref));
+        page_dict.insert(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(width as i64),
+                Object::Integer(height as i64),
+            ]),
+        );
+        page_dict.insert("Resources", Object::Dictionary(resources));
+        page_dict.insert("Contents", Object::Reference(ObjRef::new(content_num, 0)));
+        self.pending.insert(page_num, Object::Dictionary(page_dict));
+
+        let mut new_order = self.page_tree.as_ref().unwrap().order.clone();
+        let at_index = at_index.min(new_order.len());
+        new_order.insert(at_index, page_ref);
+        self.update_page_order(new_order, &mut modified)?;
+
+        self.commit(EditOp { modified });
+        Ok(())
+    }
+
+    /// Supprime la page `index` (juste retirée de `/Kids` — l'objet page
+    /// lui-même et son contenu restent alloués, orphelins, voir la doc de
+    /// module sur le garbage collection).
+    pub fn delete_page(&mut self, index: usize) -> Result<(), String> {
+        let mut modified = self.ensure_flat_page_tree()?;
+        let mut new_order = self.page_tree.as_ref().unwrap().order.clone();
+        if index >= new_order.len() {
+            return Err(format!(
+                "page index {index} out of bounds (0..{})",
+                new_order.len()
+            ));
+        }
+        new_order.remove(index);
+        self.update_page_order(new_order, &mut modified)?;
+        self.commit(EditOp { modified });
+        Ok(())
+    }
+
+    /// Déplace la page `from` à la position `to` (les autres pages se
+    /// décalent en conséquence, comme `Vec::insert` après un `remove`).
+    pub fn move_page(&mut self, from: usize, to: usize) -> Result<(), String> {
+        let mut modified = self.ensure_flat_page_tree()?;
+        let mut new_order = self.page_tree.as_ref().unwrap().order.clone();
+        if from >= new_order.len() || to >= new_order.len() {
+            return Err(format!("page index out of bounds (0..{})", new_order.len()));
+        }
+        let page_ref = new_order.remove(from);
+        new_order.insert(to, page_ref);
+        self.update_page_order(new_order, &mut modified)?;
+        self.commit(EditOp { modified });
+        Ok(())
+    }
+
+    /// Ajoute `delta` degrés (multiple de 90 attendu, mais pas vérifié) à
+    /// `/Rotate` de la page `index`, normalisé dans `[0, 360)`.
+    pub fn rotate_page(&mut self, index: usize, delta: i32) -> Result<(), String> {
+        let mut modified = self.ensure_flat_page_tree()?;
+        let page_ref = *self
+            .page_tree
+            .as_ref()
+            .unwrap()
+            .order
+            .get(index)
+            .ok_or_else(|| format!("page index {index} out of bounds"))?;
+        let before = self.current(page_ref.num)?;
+        let mut dict = before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "page object is not a dictionary".to_string())?;
+        let current_rotate = dict.get("Rotate").and_then(|o| o.as_int()).unwrap_or(0);
+        let new_rotate = (current_rotate + delta as i64).rem_euclid(360);
+        dict.insert("Rotate", Object::Integer(new_rotate));
+        modified.push((page_ref.num, before, Object::Dictionary(dict)));
+        self.commit(EditOp { modified });
+        Ok(())
+    }
+
+    /// Copie les pages `source_indices` de `source` (document distinct,
+    /// potentiellement produit par un tout autre outil) dans cette session,
+    /// insérées à `at_index` — Sprint 15-16, "fusion de documents". Copie
+    /// **tout** ce que chaque page référence transitivement (ressources,
+    /// polices, images, annotations...), renuméroté pour ne jamais entrer
+    /// en collision avec les numéros déjà utilisés dans cette session (voir
+    /// `copy_object_recursive`).
+    pub fn insert_pages_from(
+        &mut self,
+        source: &Document,
+        source_indices: &[usize],
+        at_index: usize,
+    ) -> Result<(), String> {
+        let mut modified = self.ensure_flat_page_tree()?;
+        let pages_node_ref = self.page_tree.as_ref().unwrap().pages_node_ref;
+        let source_pages = source.pages().map_err(|e| e.to_string())?;
+
+        let mut copy_map = std::collections::HashMap::new();
+        let mut new_refs = Vec::with_capacity(source_indices.len());
+        for &src_index in source_indices {
+            let src_page = source_pages
+                .get(src_index)
+                .ok_or_else(|| format!("source page index {src_index} out of bounds"))?;
+            let new_ref = self.copy_page(source, src_page, pages_node_ref, &mut copy_map)?;
+            new_refs.push(new_ref);
+        }
+
+        let mut new_order = self.page_tree.as_ref().unwrap().order.clone();
+        let at_index = at_index.min(new_order.len());
+        for (offset, r) in new_refs.into_iter().enumerate() {
+            new_order.insert(at_index + offset, r);
+        }
+        self.update_page_order(new_order, &mut modified)?;
+        self.commit(EditOp { modified });
+        Ok(())
+    }
+
+    /// Concatène la totalité de `source` à la fin du document courant —
+    /// cas d'usage le plus courant de `insert_pages_from`.
+    pub fn merge_document(&mut self, source: &Document) -> Result<(), String> {
+        let count = source.page_count().map_err(|e| e.to_string())?;
+        let indices: Vec<usize> = (0..count).collect();
+        let at_index = self.page_count()?;
+        self.insert_pages_from(source, &indices, at_index)
+    }
+
+    /// Copie une page de `source` (dictionnaire + tout ce qu'il référence
+    /// transitivement) dans `self.pending`, avec ses attributs hérités
+    /// (`/MediaBox`/`/Rotate`/`/Resources`) cuits en dur comme le fait
+    /// `ensure_flat_page_tree` pour les pages déjà présentes.
+    fn copy_page(
+        &mut self,
+        source: &Document,
+        src_page: &pdf_core::page::Page,
+        pages_node_ref: ObjRef,
+        copy_map: &mut std::collections::HashMap<u32, u32>,
+    ) -> Result<ObjRef, String> {
+        let src_ref = src_page.object_ref.ok_or_else(|| {
+            "source page has no indirect object reference (inline in /Kids, not supported)"
+                .to_string()
+        })?;
+        let new_num = *copy_map.entry(src_ref.num).or_insert_with(|| {
+            let n = self.next_num;
+            self.next_num += 1;
+            n
+        });
+
+        let raw_page = source.resolve(src_ref).map_err(|e| e.to_string())?;
+        let copied = copy_object_recursive(
+            source,
+            &raw_page,
+            &mut self.pending,
+            &mut self.next_num,
+            copy_map,
+        )?;
+        let mut dict = copied
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "copied page is not a dictionary".to_string())?;
+
+        dict.insert("Type", Object::Name("Page".to_string()));
+        dict.insert("Parent", Object::Reference(pages_node_ref));
+        dict.insert(
+            "MediaBox",
+            Object::Array(
+                src_page
+                    .media_box
+                    .iter()
+                    .map(|&n| Object::Real(n))
+                    .collect(),
+            ),
+        );
+        dict.insert("Rotate", Object::Integer(src_page.rotate as i64));
+        let copied_resources = copy_object_recursive(
+            source,
+            &Object::Dictionary(src_page.resources.clone()),
+            &mut self.pending,
+            &mut self.next_num,
+            copy_map,
+        )?;
+        dict.insert("Resources", copied_resources);
+
+        self.pending.insert(new_num, Object::Dictionary(dict));
+        Ok(ObjRef::new(new_num, 0))
+    }
+
     /// Sauvegarde incrémentale (Sprint 13-14, `Document::save_incremental`)
     /// vers `path` : ajoute tous les objets en attente au fichier original,
     /// sans jamais le modifier en place.
@@ -430,6 +880,181 @@ fn escape_pdf_literal(text: &str) -> String {
         }
     }
     out
+}
+
+/// Copie récursivement `obj` (potentiellement lui-même une référence, ou
+/// contenant des références imbriquées à n'importe quelle profondeur) de
+/// `source` vers `pending`, en renumérotant tout objet indirect rencontré
+/// via un compteur partagé `next_num` — Sprint 15-16, cœur de la fusion de
+/// documents (`EditSession::insert_pages_from`) et du découpage
+/// (`extract_pages`).
+///
+/// `copy_map` (ancien numéro dans `source` -> nouveau numéro) sert deux
+/// rôles à la fois : ne copier qu'une seule fois un objet partagé
+/// référencé plusieurs fois (ex. une police utilisée par toutes les pages),
+/// et casser les cycles (le nouveau numéro est réservé **avant** de
+/// résoudre/copier récursivement l'objet référencé, donc une référence
+/// arrière retrouve un numéro déjà attribué plutôt que de boucler à
+/// l'infini).
+fn copy_object_recursive(
+    source: &Document,
+    obj: &Object,
+    pending: &mut std::collections::BTreeMap<u32, Object>,
+    next_num: &mut u32,
+    copy_map: &mut std::collections::HashMap<u32, u32>,
+) -> Result<Object, String> {
+    match obj {
+        Object::Reference(r) => {
+            if let Some(&new_num) = copy_map.get(&r.num) {
+                return Ok(Object::Reference(ObjRef::new(new_num, 0)));
+            }
+            let new_num = *next_num;
+            *next_num += 1;
+            copy_map.insert(r.num, new_num);
+
+            let resolved = source.resolve(*r).map_err(|e| e.to_string())?;
+            let copied = copy_object_recursive(source, &resolved, pending, next_num, copy_map)?;
+            pending.insert(new_num, copied);
+            Ok(Object::Reference(ObjRef::new(new_num, 0)))
+        }
+        Object::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(copy_object_recursive(
+                    source, item, pending, next_num, copy_map,
+                )?);
+            }
+            Ok(Object::Array(out))
+        }
+        Object::Dictionary(dict) => {
+            let mut out = Dictionary::new();
+            for (k, v) in dict.iter() {
+                out.insert(
+                    k.clone(),
+                    copy_object_recursive(source, v, pending, next_num, copy_map)?,
+                );
+            }
+            Ok(Object::Dictionary(out))
+        }
+        Object::Stream(stream) => {
+            let mut out_dict = Dictionary::new();
+            for (k, v) in stream.dict.iter() {
+                out_dict.insert(
+                    k.clone(),
+                    copy_object_recursive(source, v, pending, next_num, copy_map)?,
+                );
+            }
+            // Les octets bruts ne sont jamais redécodés/recompressés : le
+            // `/Filter` copié ci-dessus (une simple valeur `/Name`/`Array`,
+            // sans référence à réécrire) reste cohérent avec eux tels quels.
+            Ok(Object::Stream(Stream {
+                dict: out_dict,
+                raw_data: stream.raw_data.clone(),
+            }))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+/// Découpage de document (Sprint 15-16, "split") : construit un PDF
+/// autonome (`pdf_core::writer::write_standalone`) ne contenant que les
+/// pages `indices` de `source` et tout ce qu'elles référencent
+/// transitivement — puisque rien d'autre n'est copié, ce fichier ne
+/// contient par construction aucun objet inatteignable : un sous-produit
+/// naturel de garbage collection, pas une passe séparée.
+pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, String> {
+    let mut pending: std::collections::BTreeMap<u32, Object> = std::collections::BTreeMap::new();
+    let mut next_num: u32 = 1;
+    let mut copy_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
+    let pages_node_num = next_num;
+    next_num += 1;
+    let pages_node_ref = ObjRef::new(pages_node_num, 0);
+
+    let source_pages = source.pages().map_err(|e| e.to_string())?;
+    let mut kids = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let src_page = source_pages
+            .get(idx)
+            .ok_or_else(|| format!("page index {idx} out of bounds"))?;
+        let src_ref = src_page
+            .object_ref
+            .ok_or_else(|| "source page has no indirect object reference".to_string())?;
+        let new_num = *copy_map.entry(src_ref.num).or_insert_with(|| {
+            let n = next_num;
+            next_num += 1;
+            n
+        });
+
+        let raw = source.resolve(src_ref).map_err(|e| e.to_string())?;
+        let copied =
+            copy_object_recursive(source, &raw, &mut pending, &mut next_num, &mut copy_map)?;
+        let mut dict = copied
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "copied page is not a dictionary".to_string())?;
+        dict.insert("Type", Object::Name("Page".to_string()));
+        dict.insert("Parent", Object::Reference(pages_node_ref));
+        dict.insert(
+            "MediaBox",
+            Object::Array(
+                src_page
+                    .media_box
+                    .iter()
+                    .map(|&n| Object::Real(n))
+                    .collect(),
+            ),
+        );
+        dict.insert("Rotate", Object::Integer(src_page.rotate as i64));
+        let copied_resources = copy_object_recursive(
+            source,
+            &Object::Dictionary(src_page.resources.clone()),
+            &mut pending,
+            &mut next_num,
+            &mut copy_map,
+        )?;
+        dict.insert("Resources", copied_resources);
+
+        pending.insert(new_num, Object::Dictionary(dict));
+        kids.push(Object::Reference(ObjRef::new(new_num, 0)));
+    }
+
+    let mut pages_dict = Dictionary::new();
+    pages_dict.insert("Type", Object::Name("Pages".to_string()));
+    let kids_len = kids.len();
+    pages_dict.insert("Kids", Object::Array(kids));
+    pages_dict.insert("Count", Object::Integer(kids_len as i64));
+    pending.insert(pages_node_num, Object::Dictionary(pages_dict));
+
+    let root_num = next_num;
+    let mut root_dict = Dictionary::new();
+    root_dict.insert("Type", Object::Name("Catalog".to_string()));
+    root_dict.insert("Pages", Object::Reference(pages_node_ref));
+    pending.insert(root_num, Object::Dictionary(root_dict));
+
+    let objects: Vec<(ObjRef, Object)> = pending
+        .into_iter()
+        .map(|(n, o)| (ObjRef::new(n, 0), o))
+        .collect();
+    Ok(pdf_core::writer::write_standalone(
+        &objects,
+        ObjRef::new(root_num, 0),
+    ))
+}
+
+/// "Export / optimisation" (Sprint 15-16) : réécrit `source` en entier via
+/// `extract_pages` (toutes les pages, dans l'ordre) plutôt que de la
+/// modifier en place — une sauvegarde incrémentale ne peut qu'ajouter, donc
+/// ne peut jamais "faire le ménage" ; reconstruire le fichier à partir des
+/// seuls objets atteignables depuis les pages en fait un vrai garbage
+/// collector, au prix d'une réécriture complète plutôt qu'un simple ajout.
+/// **Non fait :** linéarisation (réordonnancement des objets pour
+/// l'affichage progressif/streaming) — hors périmètre de cette passe, un
+/// chantier à part entière.
+pub fn export_optimized(source: &Document) -> Result<Vec<u8>, String> {
+    let count = source.page_count().map_err(|e| e.to_string())?;
+    let indices: Vec<usize> = (0..count).collect();
+    extract_pages(source, &indices)
 }
 
 #[cfg(test)]
@@ -592,6 +1217,212 @@ mod tests {
             glyph_count >= "Ada Lovelace".len(),
             "expected at least one glyph per character of the filled value, got {glyph_count}"
         );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Texte de chaque page d'un document rouvert, dans l'ordre — sert à
+    /// vérifier l'ordre/le contenu des pages après manipulation, plus
+    /// simple à lire dans un message d'échec qu'une comparaison de
+    /// références d'objets.
+    fn page_texts(doc: &pdf_core::Document) -> Vec<String> {
+        (0..doc.page_count().unwrap())
+            .map(|i| {
+                let page = doc.page(i).unwrap();
+                let content = doc.page_content(&page).unwrap();
+                pdf_text::extract_text(
+                    &pdf_core::interp::Interpreter::run_page(doc, page.resources.clone(), &content)
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn insert_delete_move_rotate_survive_save_and_reopen() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = EditSession::open(&path).unwrap();
+        assert_eq!(session.page_count().unwrap(), 5);
+
+        // Insère une page blanche en tête, supprime l'ancienne page 3
+        // (index 3 après l'insertion, donc "Page 3" d'origine), déplace la
+        // dernière page en seconde position, pivote la nouvelle page 0.
+        session
+            .insert_blank_page(0, [0.0, 0.0, 400.0, 400.0])
+            .unwrap();
+        session.delete_page(3).unwrap();
+        let last = session.page_count().unwrap() - 1;
+        session.move_page(last, 1).unwrap();
+        session.rotate_page(0, 90).unwrap();
+
+        let out_path = write_fixture(b"page-manip-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 5);
+        assert_eq!(reopened.page(0).unwrap().rotate, 90);
+
+        let texts = page_texts(&reopened);
+        // Ordre attendu : [blank, Page 5, Page 1, Page 2, Page 4] — Page 3
+        // supprimée, Page 5 (dernière, indice 4 après insertion) déplacée
+        // en position 1.
+        assert!(
+            texts[0].is_empty(),
+            "expected the inserted page to be blank, got {:?}",
+            texts[0]
+        );
+        assert!(texts[1].contains("Page 5"), "got {:?}", texts);
+        assert!(texts[2].contains("Page 1"), "got {:?}", texts);
+        assert!(texts[3].contains("Page 2"), "got {:?}", texts);
+        assert!(texts[4].contains("Page 4"), "got {:?}", texts);
+        assert!(
+            !texts.iter().any(|t| t.contains("Page 3")),
+            "Page 3 should have been deleted, got {:?}",
+            texts
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    #[test]
+    fn undo_restores_page_order_after_delete() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = EditSession::open(&path).unwrap();
+
+        session.delete_page(1).unwrap();
+        assert_eq!(session.page_tree.as_ref().unwrap().order.len(), 4);
+        assert!(session.undo());
+        assert_eq!(session.page_tree.as_ref().unwrap().order.len(), 5);
+        assert!(!session.can_undo());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Fusion de documents : les pages d'un second fichier réel doivent
+    /// apparaître, dans l'ordre, à la suite du premier — avec leur
+    /// contenu **et** leurs polices intégrées réellement copiés (pas
+    /// juste des références qui pointeraient dans le vide).
+    #[test]
+    fn merge_document_appends_real_pages_with_their_resources() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let other_bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/embedded_truetype_font.pdf").to_vec();
+        let other = pdf_core::Document::open(other_bytes).unwrap();
+
+        let mut session = EditSession::open(&path).unwrap();
+        session.merge_document(&other).unwrap();
+        assert_eq!(session.page_count().unwrap(), 6);
+
+        let out_path = write_fixture(b"merge-doc-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 6);
+        let last_page = reopened.page(5).unwrap();
+        let content = reopened.page_content(&last_page).unwrap();
+        let display = pdf_core::interp::Interpreter::run_page(
+            &reopened,
+            last_page.resources.clone(),
+            &content,
+        )
+        .unwrap();
+        let has_real_outline = display.items.iter().any(|item| {
+            matches!(
+                item,
+                pdf_core::display::DisplayItem::Glyph { outline: Some(o), .. } if !o.is_empty()
+            )
+        });
+        assert!(
+            has_real_outline,
+            "expected the merged page's embedded TrueType font to still resolve real glyph outlines"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Découpage : extraire un sous-ensemble de pages doit produire un
+    /// fichier autonome, réouvrable indépendamment, avec le bon nombre de
+    /// pages et le bon contenu — sans dépendre du fichier source.
+    #[test]
+    fn extract_pages_produces_a_standalone_reopenable_subset() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let doc = pdf_core::Document::open(bytes).unwrap();
+
+        let extracted = extract_pages(&doc, &[1, 3]).unwrap();
+        let reopened = pdf_core::Document::open(extracted).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 2);
+
+        let texts = page_texts(&reopened);
+        assert!(texts[0].contains("Page 2"), "got {:?}", texts);
+        assert!(texts[1].contains("Page 4"), "got {:?}", texts);
+    }
+
+    /// `export_optimized` doit produire un fichier autonome avec toutes les
+    /// pages, dans l'ordre, sans corruption — la "compaction" attendue par
+    /// le critère de sortie du Sprint 15-16.
+    #[test]
+    fn export_optimized_preserves_all_pages_in_order() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let doc = pdf_core::Document::open(bytes).unwrap();
+
+        let optimized = export_optimized(&doc).unwrap();
+        let reopened = pdf_core::Document::open(optimized).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 5);
+        let texts = page_texts(&reopened);
+        for (i, text) in texts.iter().enumerate() {
+            assert!(
+                text.contains(&format!("Page {}", i + 1)),
+                "expected page {i} to still say 'Page {}', got {:?}",
+                i + 1,
+                text
+            );
+        }
+    }
+
+    /// Insérer une image JPEG comme page doit produire une page dont la
+    /// taille correspond aux dimensions réelles de l'image et dont le
+    /// rendu produit effectivement un pixel décodé (pas juste une image
+    /// "positionnée mais non décodée", voir `pdf-core::image`).
+    #[test]
+    fn insert_image_page_persists_and_renders_after_reopen() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let jpeg_bytes = include_bytes!("../../pdf-core/tests/fixtures/sample_image.jpg");
+
+        let mut session = EditSession::open(&path).unwrap();
+        session.insert_image_page(0, jpeg_bytes).unwrap();
+        assert_eq!(session.page_count().unwrap(), 6);
+
+        let out_path = write_fixture(b"insert-image-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        assert_eq!(page.media_box, [0.0, 0.0, 64.0, 48.0]);
+
+        let content = reopened.page_content(&page).unwrap();
+        let display =
+            pdf_core::interp::Interpreter::run_page(&reopened, page.resources.clone(), &content)
+                .unwrap();
+        let decoded_image = display.items.iter().find_map(|item| match item {
+            pdf_core::display::DisplayItem::Image { pixels, .. } => pixels.as_ref(),
+            _ => None,
+        });
+        let image = decoded_image.expect("expected the inserted image to actually decode");
+        assert_eq!((image.width, image.height), (64, 48));
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();

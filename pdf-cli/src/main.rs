@@ -14,6 +14,14 @@ fn print_usage() {
         "       pdf-cli highlight <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1> [r] [g] [b]"
     );
     eprintln!("       pdf-cli fill-form <in.pdf> <out.pdf> <field_name> <value>");
+    eprintln!("       pdf-cli insert-blank-page <in.pdf> <out.pdf> <at_index> <width> <height>");
+    eprintln!("       pdf-cli insert-image-page <in.pdf> <out.pdf> <at_index> <image.jpg>");
+    eprintln!("       pdf-cli delete-page <in.pdf> <out.pdf> <page_index>");
+    eprintln!("       pdf-cli move-page <in.pdf> <out.pdf> <from_index> <to_index>");
+    eprintln!("       pdf-cli rotate-page <in.pdf> <out.pdf> <page_index> <degrees>");
+    eprintln!("       pdf-cli merge <base.pdf> <other.pdf> <out.pdf>");
+    eprintln!("       pdf-cli split <in.pdf> <out.pdf> <page_index> [page_index...]");
+    eprintln!("       pdf-cli optimize <in.pdf> <out.pdf>");
 }
 
 fn main() -> ExitCode {
@@ -38,6 +46,17 @@ fn main() -> ExitCode {
                 .zip(args.get(5))
                 .map(|(field, value)| run_fill_form(input, out, field, value).map_err(pdf_error))
         }),
+        Some("insert-blank-page") => run_insert_blank_page_args(&args),
+        Some("insert-image-page") => run_insert_image_page_args(&args),
+        Some("delete-page") => run_delete_page_args(&args),
+        Some("move-page") => run_move_page_args(&args),
+        Some("rotate-page") => run_rotate_page_args(&args),
+        Some("merge") => run_merge_args(&args),
+        Some("split") => run_split_args(&args),
+        Some("optimize") => args
+            .get(2)
+            .zip(args.get(3))
+            .map(|(input, out)| run_optimize(input, out).map_err(pdf_error)),
         _ => None,
     };
 
@@ -103,6 +122,148 @@ fn run_fill_form(input: &str, out: &str, field_name: &str, value: &str) -> Resul
     session.set_form_field_value(field_name, value)?;
     session.save_as(out)?;
     println!("Set field '{field_name}' = {value:?} in {input}, saved to {out}");
+    Ok(())
+}
+
+/// Sprint 15-16 : manipulation de pages (`pdf-edit`), toutes suivant le
+/// même schéma — ouvrir en `EditSession`, appliquer une opération, sauver
+/// incrémentalement — preuve en ligne de commande sur un vrai fichier.
+fn run_insert_blank_page_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let at_index: usize = args.get(4)?.parse().ok()?;
+    let width: f64 = args.get(5)?.parse().ok()?;
+    let height: f64 = args.get(6)?.parse().ok()?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.insert_blank_page(at_index, [0.0, 0.0, width, height])?;
+            session.save_as(out)?;
+            println!("Inserted blank page at index {at_index} of {input}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+fn run_insert_image_page_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let at_index: usize = args.get(4)?.parse().ok()?;
+    let image_path = args.get(5)?;
+    Some(
+        (|| -> Result<(), String> {
+            let jpeg_bytes = fs::read(image_path).map_err(|e| e.to_string())?;
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.insert_image_page(at_index, &jpeg_bytes)?;
+            session.save_as(out)?;
+            println!("Inserted image page at index {at_index} of {input}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+fn run_delete_page_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let index: usize = args.get(4)?.parse().ok()?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.delete_page(index)?;
+            session.save_as(out)?;
+            println!("Deleted page {index} of {input}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+fn run_move_page_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let from: usize = args.get(4)?.parse().ok()?;
+    let to: usize = args.get(5)?.parse().ok()?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.move_page(from, to)?;
+            session.save_as(out)?;
+            println!("Moved page {from} -> {to} in {input}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+fn run_rotate_page_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let index: usize = args.get(4)?.parse().ok()?;
+    let degrees: i32 = args.get(5)?.parse().ok()?;
+    Some(
+        (|| -> Result<(), String> {
+            let mut session = pdf_edit::EditSession::open(input)?;
+            session.rotate_page(index, degrees)?;
+            session.save_as(out)?;
+            println!("Rotated page {index} of {input} by {degrees} degrees, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+fn run_merge_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let base = args.get(2)?;
+    let other = args.get(3)?;
+    let out = args.get(4)?;
+    Some(
+        (|| -> Result<(), String> {
+            let other_bytes = fs::read(other).map_err(|e| e.to_string())?;
+            let other_doc = Document::open(other_bytes).map_err(|e| e.to_string())?;
+            let mut session = pdf_edit::EditSession::open(base)?;
+            session.merge_document(&other_doc)?;
+            session.save_as(out)?;
+            println!("Merged {other} into {base}, saved to {out}");
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+fn run_split_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let indices: Vec<usize> = args[4..].iter().filter_map(|s| s.parse().ok()).collect();
+    if indices.is_empty() {
+        return None;
+    }
+    Some(
+        (|| -> Result<(), String> {
+            let bytes = fs::read(input).map_err(|e| e.to_string())?;
+            let doc = Document::open(bytes).map_err(|e| e.to_string())?;
+            let extracted = pdf_edit::extract_pages(&doc, &indices)?;
+            fs::write(out, extracted).map_err(|e| e.to_string())?;
+            println!(
+                "Extracted {} page(s) from {input}, saved to {out}",
+                indices.len()
+            );
+            Ok(())
+        })()
+        .map_err(pdf_error),
+    )
+}
+
+/// "Export / optimisation" (Sprint 15-16) : réécrit le document en entier
+/// via `pdf_edit::export_optimized` — un vrai garbage collector par
+/// reconstruction plutôt qu'une simple sauvegarde incrémentale, voir sa doc.
+fn run_optimize(input: &str, out: &str) -> Result<(), String> {
+    let bytes = fs::read(input).map_err(|e| e.to_string())?;
+    let doc = Document::open(bytes).map_err(|e| e.to_string())?;
+    let optimized = pdf_edit::export_optimized(&doc)?;
+    fs::write(out, optimized).map_err(|e| e.to_string())?;
+    println!("Optimized {input}, saved to {out}");
     Ok(())
 }
 

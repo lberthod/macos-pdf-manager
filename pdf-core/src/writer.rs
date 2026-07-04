@@ -114,6 +114,54 @@ pub fn write_indirect_object(num: u32, gen: u16, obj: &Object, out: &mut Vec<u8>
     out.extend_from_slice(b"\nendobj\n");
 }
 
+/// Construit un PDF **complet et autonome** à partir de zéro (pas un ajout
+/// incrémental à un fichier existant, voir `document::save_incremental`
+/// pour ça) — Sprint 15-16 : sert au découpage de document
+/// (`pdf-edit::extract_pages`), où le fichier de sortie ne doit contenir
+/// que les objets effectivement copiés.
+///
+/// `objects` doit couvrir une numérotation dense `1..=max` sans trou (c'est
+/// le cas naturel quand les numéros viennent d'un compteur incrémenté à
+/// chaque allocation, comme le fait `pdf-edit`) : tout numéro absent de
+/// `1..=max` est écrit comme une entrée libre (`f`) dans la xref plutôt que
+/// de faire échouer l'écriture, par robustesse.
+pub fn write_standalone(
+    objects: &[(crate::object::ObjRef, Object)],
+    root: crate::object::ObjRef,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+
+    let mut sorted: Vec<&(crate::object::ObjRef, Object)> = objects.iter().collect();
+    sorted.sort_by_key(|(r, _)| r.num);
+
+    let mut offset_by_num = std::collections::BTreeMap::new();
+    for (r, obj) in &sorted {
+        offset_by_num.insert(r.num, out.len());
+        write_indirect_object(r.num, r.gen, obj, &mut out);
+    }
+
+    let max_num = sorted.last().map(|(r, _)| r.num).unwrap_or(0);
+    let xref_offset = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_num + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for n in 1..=max_num {
+        match offset_by_num.get(&n) {
+            Some(&off) => out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+
+    let mut trailer = Dictionary::new();
+    trailer.insert("Size", Object::Integer(max_num as i64 + 1));
+    trailer.insert("Root", Object::Reference(root));
+    out.extend_from_slice(b"trailer\n");
+    write_object(&Object::Dictionary(trailer), &mut out);
+    out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +230,35 @@ mod tests {
         let mut out = Vec::new();
         write_indirect_object(3, 0, &Object::Integer(42), &mut out);
         assert_eq!(String::from_utf8(out).unwrap(), "3 0 obj\n42\nendobj\n");
+    }
+
+    /// `write_standalone` doit produire un PDF réouvrable de bout en bout
+    /// par `Document::open` (pas juste des octets qui "ressemblent" à du
+    /// PDF) — y compris quand la numérotation a un trou (ici l'objet 2 est
+    /// absent), qui doit devenir une entrée libre plutôt que de casser la
+    /// xref.
+    #[test]
+    fn write_standalone_produces_a_document_reopenable_by_document_open() {
+        let mut catalog = Dictionary::new();
+        catalog.insert("Type", Object::Name("Catalog".to_string()));
+        catalog.insert("Pages", Object::Reference(ObjRef::new(3, 0)));
+
+        let mut pages = Dictionary::new();
+        pages.insert("Type", Object::Name("Pages".to_string()));
+        pages.insert("Kids", Object::Array(vec![]));
+        pages.insert("Count", Object::Integer(0));
+
+        let objects = vec![
+            (ObjRef::new(1, 0), Object::Dictionary(catalog)),
+            (ObjRef::new(3, 0), Object::Dictionary(pages)),
+        ];
+        let bytes = write_standalone(&objects, ObjRef::new(1, 0));
+
+        let doc = crate::document::Document::open(bytes).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 0);
+        assert_eq!(
+            doc.root().unwrap().get("Type").unwrap().as_name(),
+            Some("Catalog")
+        );
     }
 }

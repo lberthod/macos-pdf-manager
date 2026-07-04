@@ -130,9 +130,28 @@ pub enum DisplayItem {
         advance_is_estimated: bool,
         outline: Option<Vec<PathSegment>>,
     },
-    /// XObject image : seule sa position est connue à ce stade (le
-    /// décodage des pixels — JPEG/Flate/CCITT — est prévu Sprint 7-8).
-    Image { resource: String, transform: Matrix },
+    /// XObject image. `pixels` est `None` si le décodage a échoué ou si le
+    /// format n'est pas supporté (`CCITTFaxDecode`, `JBIG2Decode`,
+    /// `JPXDecode`, espaces colorimétriques indexés/Separation, profondeurs
+    /// autres que 8 bits/composante — voir `image.rs`).
+    Image {
+        resource: String,
+        transform: Matrix,
+        pixels: Option<DecodedImage>,
+    },
+}
+
+/// Image bitmap déjà décodée en RGBA8, prête à dessiner — voir `image.rs`.
+/// L'unité image PDF ([0,1]×[0,1]) correspond à ce bitmap ; c'est `transform`
+/// (sur `DisplayItem::Image`) qui la positionne dans l'espace de la page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedImage {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` octets, RGBA8 ligne par ligne depuis le haut de
+    /// l'image (convention raster standard). Alpha toujours 255 : pas de
+    /// support `/SMask` (canal de transparence) pour l'instant.
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

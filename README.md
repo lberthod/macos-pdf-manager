@@ -15,7 +15,7 @@
 
 Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu → rendu CPU en PNG, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType **intégrées** comme polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier...).
 
-Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, l'UI graphique, le décodage des images (JPEG...), les polices composites CJK. Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
+Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, l'UI graphique, les polices composites CJK, les images CCITT/JBIG2/JPX (le JPEG fonctionne). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
 
 ## Structure du projet
 
@@ -58,8 +58,8 @@ Fixtures de test disponibles dans [pdf-core/tests/fixtures/](./pdf-core/tests/fi
 ## Choix techniques clés
 
 - **Rust natif**, workspace Cargo.
-- Codecs génériques implémentés : `flate2` (Flate), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison (pas de crate dédiée nécessaire). Contours de glyphes via `ttf-parser` (TrueType uniquement pour l'instant). Rendu CPU via `tiny-skia`. Le moteur « maison » se concentre sur la logique PDF (structure, contenu, rendu sémantique).
-- Codecs pas encore implémentés : JPEG (`DCTDecode`), CCITT, JBIG2, JPX.
+- Codecs génériques implémentés : `flate2` (Flate), `zune-jpeg` (DCTDecode/JPEG), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison. Contours de glyphes via `ttf-parser` (TrueType uniquement pour l'instant). Rendu CPU via `tiny-skia` (chemins, glyphes, images). Le moteur « maison » se concentre sur la logique PDF (structure, contenu, rendu sémantique).
+- Codecs pas encore implémentés : CCITT, JBIG2, JPX.
 - UI : pas encore commencée (prototype `egui` prévu, puis chrome natif macOS via `objc2`/`cacao`).
 - Packaging : `cargo-bundle` + signature/notarisation Apple pour le `.dmg` — pas encore fait.
 

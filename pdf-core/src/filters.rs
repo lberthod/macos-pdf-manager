@@ -1,10 +1,11 @@
 //! Filtres de décodage de flux — architecture.md §4.3.
 //!
 //! Implémentés : `FlateDecode`, `ASCIIHexDecode`, `ASCII85Decode`, `LZWDecode`,
-//! plus les prédicteurs PNG/TIFF appliqués en aval (nécessaires pour décoder
-//! la plupart des cross-reference streams et object streams, PDF 1.5+).
-//! Restent à faire : `CCITTFaxDecode`, `JBIG2Decode`, `JPXDecode` (images,
-//! priorité basse — voir sprint.md).
+//! `DCTDecode` (JPEG, via `zune-jpeg`), plus les prédicteurs PNG/TIFF
+//! appliqués en aval (nécessaires pour décoder la plupart des
+//! cross-reference streams et object streams, PDF 1.5+).
+//! Restent à faire : `CCITTFaxDecode`, `JBIG2Decode`, `JPXDecode` — voir
+//! sprint.md.
 
 use crate::error::{PdfError, Result};
 use crate::object::{Dictionary, Object, Stream};
@@ -42,6 +43,7 @@ pub fn decode_stream(stream: &Stream) -> Result<Vec<u8>> {
             "ASCIIHexDecode" | "AHx" => ascii_hex_decode(&data)?,
             "ASCII85Decode" | "A85" => ascii85_decode(&data)?,
             "LZWDecode" | "LZW" => lzw_decode(&data)?,
+            "DCTDecode" | "DCT" => dct_decode(&data)?,
             other => return Err(PdfError::UnsupportedFilter(other.to_string())),
         };
         if let Some(parms) = decode_parms_at(&stream.dict, index) {
@@ -58,6 +60,18 @@ fn flate_decode(data: &[u8]) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .map_err(|e| PdfError::DecodeError(format!("FlateDecode: {e}")))?;
     Ok(out)
+}
+
+/// Décode un flux JPEG (`DCTDecode`) via `zune-jpeg`. Le résultat est une
+/// suite d'échantillons entrelacés dont le nombre de composantes par pixel
+/// dépend du JPEG source (1 = niveaux de gris, 3 = RGB, 4 = CMYK) — c'est
+/// `image.rs` qui les interprète en s'appuyant sur `/ColorSpace`.
+fn dct_decode(data: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new(zune_jpeg::zune_core::bytestream::ZCursor::new(data));
+    decoder
+        .decode()
+        .map_err(|e| PdfError::DecodeError(format!("DCTDecode: {e}")))
 }
 
 fn ascii_hex_decode(data: &[u8]) -> Result<Vec<u8>> {

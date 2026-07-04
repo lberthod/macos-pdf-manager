@@ -14,6 +14,7 @@ pub mod encoding;
 pub mod error;
 pub mod filters;
 pub mod font;
+pub mod image;
 pub mod interp;
 pub mod lexer;
 pub mod object;

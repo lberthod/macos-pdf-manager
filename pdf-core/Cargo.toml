@@ -8,5 +8,6 @@ license.workspace = true
 flate2 = "1"
 thiserror = "1"
 ttf-parser = "0.24"
+zune-jpeg = "0.5"
 
 [dev-dependencies]

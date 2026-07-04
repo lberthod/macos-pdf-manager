@@ -437,9 +437,14 @@ impl<'a> Interpreter<'a> {
 
         match stream.dict.get("Subtype").and_then(|o| o.as_name()) {
             Some("Image") => {
+                // Une image non supportée (CCITT, JBIG2, espace colorimétrique
+                // indexé...) ne doit pas faire échouer tout le reste de la
+                // page : on dégrade en `pixels: None` (voir image.rs).
+                let pixels = crate::image::decode_image(self.doc, stream).ok();
                 self.display.items.push(DisplayItem::Image {
                     resource: name.clone(),
                     transform: self.gs.ctm,
+                    pixels,
                 });
             }
             Some("Form") => {
@@ -682,5 +687,26 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn real_fixture_decodes_embedded_jpeg_image() {
+        let bytes = include_bytes!("../tests/fixtures/image_jpeg.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        let image = display
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image { pixels, .. } => pixels.as_ref(),
+                _ => None,
+            })
+            .expect("expected a decoded image in the DisplayList");
+        assert_eq!(image.width, 120);
+        assert_eq!(image.height, 80);
+        assert_eq!(image.rgba.len(), 120 * 80 * 4);
     }
 }

@@ -5,21 +5,22 @@
 //!
 //! Limitations connues à ce stade :
 //! - Les glyphes ne sont dessinés que lorsque `DisplayItem::Glyph::outline`
-//!   est renseigné, c'est-à-dire uniquement pour les polices TrueType
-//!   **intégrées** (`/FontFile2`, voir `pdf-core::font`) dont le glyphe a
-//!   été résolu. Les polices standard non intégrées (cas le plus courant,
-//!   Helvetica etc.) et les polices CFF/Type1 intégrées n'ont pas encore de
-//!   contour disponible ; leurs glyphes restent invisibles (aucune forme
-//!   de repli approximatif n'est dessinée, pour ne pas donner une fausse
-//!   impression de fidélité).
-//! - Les images ne sont pas décodées ni dessinées.
+//!   est renseigné (police TrueType intégrée résolue, ou substitution
+//!   système — voir `pdf-core::font`). Les polices CFF/Type1 intégrées
+//!   n'ont pas encore de contour disponible.
+//! - Les images ne sont dessinées que lorsque `DisplayItem::Image::pixels`
+//!   est renseigné (voir `pdf-core::image` pour les formats supportés :
+//!   `DCTDecode`/JPEG et échantillons bruts 8 bits DeviceGray/RGB/CMYK ;
+//!   pas de CCITT/JBIG2/JPX, pas de canal alpha `/SMask`).
 //! - Le clip (`sets_clip`) n'est pas appliqué.
 //! - Espaces colorimétriques : conversion CMYK -> RGB naïve (sans profil ICC).
 
-use pdf_core::display::{Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
+use pdf_core::display::{
+    Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+};
 use tiny_skia::{
-    Color as SkiaColor, FillRule as SkiaFillRule, Paint, Path, PathBuilder, Pixmap, Stroke,
-    Transform,
+    Color as SkiaColor, FillRule as SkiaFillRule, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
+    PixmapRef, Stroke, Transform,
 };
 
 /// Rasterise une page entière en se basant sur son `MediaBox`
@@ -98,12 +99,61 @@ fn render_to_pixmap(
                 Transform::identity(),
                 None,
             );
+        } else if let DisplayItem::Image {
+            pixels: Some(image),
+            transform,
+            ..
+        } = item
+        {
+            draw_image(&mut pixmap, image, transform, origin_x, origin_y_top);
         }
-        // DisplayItem::Glyph sans contour (police non intégrée) et
-        // DisplayItem::Image : non rendus, voir limitations en tête de module.
+        // DisplayItem::Glyph sans contour et DisplayItem::Image sans pixels
+        // décodés : non rendus, voir limitations en tête de module.
     }
 
     Some(pixmap)
+}
+
+/// Dessine une image déjà décodée en RGBA8. `transform` positionne le carré
+/// unité `[0,1]×[0,1]` (espace image PDF, ISO 32000-1 §8.9.5) dans l'espace
+/// de la page ; on compose avec la mise à l'échelle pixel->unité (et le flip
+/// vertical propre aux données image, dont la première ligne correspond au
+/// *haut* de l'image) puis le flip page->pixmap commun au reste du pipeline.
+fn draw_image(
+    pixmap: &mut Pixmap,
+    image: &DecodedImage,
+    transform: &Matrix,
+    origin_x: f64,
+    origin_y_top: f64,
+) {
+    if image.width == 0 || image.height == 0 {
+        return;
+    }
+    let Some(src) = PixmapRef::from_bytes(&image.rgba, image.width, image.height) else {
+        return;
+    };
+
+    let pixel_to_unit_square = Matrix::new(
+        1.0 / image.width as f64,
+        0.0,
+        0.0,
+        -1.0 / image.height as f64,
+        0.0,
+        1.0,
+    );
+    let page_flip = Matrix::new(1.0, 0.0, 0.0, -1.0, -origin_x, origin_y_top);
+    let total = pixel_to_unit_square.then(transform).then(&page_flip);
+
+    let skia_transform = Transform::from_row(
+        total.a as f32,
+        total.b as f32,
+        total.c as f32,
+        total.d as f32,
+        total.e as f32,
+        total.f as f32,
+    );
+
+    pixmap.draw_pixmap(0, 0, src, &PixmapPaint::default(), skia_transform, None);
 }
 
 fn build_path(segments: &[PathSegment], origin_x: f64, origin_y_top: f64) -> Option<Path> {
@@ -273,6 +323,46 @@ mod tests {
             &png[0..8],
             &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']
         );
+    }
+
+    /// Vérifie l'orientation et le positionnement d'une image décodée : la
+    /// moitié gauche est rouge, la droite bleue ; l'image occupe le carré
+    /// unité `[0,1]²` mis à l'échelle en `[0,100]²` (page 100×100), donc le
+    /// pixel (25,50) de la page doit être rouge et (75,50) bleu — et
+    /// l'inversion Y (données image vs. page PDF) ne doit pas les échanger.
+    #[test]
+    fn draws_decoded_image_at_correct_position() {
+        let width = 10u32;
+        let height = 10u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _y in 0..height {
+            for x in 0..width {
+                if x < width / 2 {
+                    rgba.extend_from_slice(&[255, 0, 0, 255]); // rouge à gauche
+                } else {
+                    rgba.extend_from_slice(&[0, 0, 255, 255]); // bleu à droite
+                }
+            }
+        }
+        let image = DecodedImage {
+            width,
+            height,
+            rgba,
+        };
+
+        let display = DisplayList {
+            items: vec![DisplayItem::Image {
+                resource: "Im0".into(),
+                transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
+                pixels: Some(image),
+            }],
+        };
+        let pixmap = render_page(&display, [0.0, 0.0, 100.0, 100.0]).unwrap();
+
+        let left = pixmap.pixel(25, 50).unwrap();
+        assert_eq!((left.red(), left.green(), left.blue()), (255, 0, 0));
+        let right = pixmap.pixel(75, 50).unwrap();
+        assert_eq!((right.red(), right.green(), right.blue()), (0, 0, 255));
     }
 
     /// Bout en bout sur un vrai PDF avec police TrueType intégrée (Monaco) :

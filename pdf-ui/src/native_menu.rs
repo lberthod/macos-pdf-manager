@@ -14,13 +14,15 @@
 //!   les méthodes poussent une [`MenuCommand`] dans un canal MPSC lu à
 //!   chaque frame par `ViewerApp::update` (voir `main.rs`).
 //!
-//! **Non fait** (voir sprint.md) : `⌘Z`/`⌘⇧Z` (Undo/Redo) — `pdf-edit` est
-//! toujours un stub sans `EditOp` (prévu Sprint 13-14) ; les câbler
-//! maintenant produirait des raccourcis qui ne font rien, ce qui serait
-//! trompeur plutôt qu'une vraie fonctionnalité. Quick Look : nécessiterait
-//! une extension d'application séparée (`.qlgenerator`/`appex`, bundle et
-//! cible de build distincts d'Xcode), hors périmètre d'un simple binaire
-//! `cargo`.
+//! `⌘Z`/`⌘⇧Z` (Undo/Redo) et `⌘S` (Enregistrer) sont câblés depuis que
+//! `pdf-edit::EditSession` existe réellement (Sprints 13-17) — voir
+//! `MenuCommand::Undo`/`Redo`/`Save`. `⌘S` fait maintenant un vrai
+//! "Enregistrer" (écrit dans le fichier ouvert) ; "Exporter une copie…" est
+//! resté, déplacé sur `⇧⌘S`.
+//!
+//! **Non fait** (voir sprint.md) : Quick Look — nécessiterait une extension
+//! d'application séparée (`.qlgenerator`/`appex`, bundle et cible de build
+//! distincts d'Xcode), hors périmètre d'un simple binaire `cargo`.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -43,6 +45,9 @@ pub enum MenuCommand {
     OpenDocument,
     ExportCopyAs,
     ToggleDarkMode,
+    Save,
+    Undo,
+    Redo,
 }
 
 struct MenuTargetIvars {
@@ -71,6 +76,21 @@ define_class!(
         #[unsafe(method(toggleDarkMode:))]
         fn toggle_dark_mode(&self, _sender: Option<&AnyObject>) {
             let _ = self.ivars().sender.send(MenuCommand::ToggleDarkMode);
+        }
+
+        #[unsafe(method(saveDocument:))]
+        fn save_document(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().sender.send(MenuCommand::Save);
+        }
+
+        #[unsafe(method(undoEdit:))]
+        fn undo_edit(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().sender.send(MenuCommand::Undo);
+        }
+
+        #[unsafe(method(redoEdit:))]
+        fn redo_edit(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().sender.send(MenuCommand::Redo);
         }
     }
 );
@@ -106,6 +126,7 @@ impl NativeMenu {
 
         main_menu.addItem(&app_menu_item(mtm));
         main_menu.addItem(&file_menu_item(mtm, target_obj));
+        main_menu.addItem(&edit_menu_item(mtm, target_obj));
         main_menu.addItem(&view_menu_item(mtm, target_obj));
         main_menu.addItem(&window_menu_item(mtm));
 
@@ -178,13 +199,24 @@ fn file_menu_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuI
         "o",
         Some(target),
     ));
+    submenu.addItem(&NSMenuItem::separatorItem(mtm));
     submenu.addItem(&item_with_action(
+        mtm,
+        "Enregistrer",
+        sel!(saveDocument:),
+        "s",
+        Some(target),
+    ));
+    let export_copy = item_with_action(
         mtm,
         "Exporter une copie…",
         sel!(exportCopyAs:),
         "s",
         Some(target),
-    ));
+    );
+    export_copy
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    submenu.addItem(&export_copy);
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
     // `performClose:` : implémenté par `NSWindow` lui-même, cible `None`.
     submenu.addItem(&item_with_action(
@@ -196,6 +228,24 @@ fn file_menu_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuI
     ));
     let item = NSMenuItem::new(mtm);
     item.setTitle(ns_string!("Fichier"));
+    item.setSubmenu(Some(&submenu));
+    item
+}
+
+fn edit_menu_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuItem> {
+    let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Édition"));
+    submenu.addItem(&item_with_action(
+        mtm,
+        "Annuler",
+        sel!(undoEdit:),
+        "z",
+        Some(target),
+    ));
+    let redo = item_with_action(mtm, "Rétablir", sel!(redoEdit:), "z", Some(target));
+    redo.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    submenu.addItem(&redo);
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(ns_string!("Édition"));
     item.setSubmenu(Some(&submenu));
     item
 }

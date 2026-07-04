@@ -1072,16 +1072,23 @@ impl EditSession {
     /// vers `path` : ajoute tous les objets en attente au fichier original,
     /// sans jamais le modifier en place.
     pub fn save_as(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        std::fs::write(path, self.to_bytes()?).map_err(|e| e.to_string())
+    }
+
+    /// Comme `save_as`, mais renvoie les octets plutôt que de les écrire sur
+    /// disque — utilisé par `pdf-app::Session` (viewer) pour obtenir un
+    /// aperçu à jour des modifications en attente : les rouvrir dans un
+    /// `Document` en lecture pour le rendu, sans passer par un fichier
+    /// temporaire ni toucher au fichier réellement ouvert par l'utilisateur.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let objects: Vec<(ObjRef, Object)> = self
             .pending
             .iter()
             .map(|(&num, obj)| (ObjRef::new(num, 0), obj.clone()))
             .collect();
-        let bytes = self
-            .doc
+        self.doc
             .save_incremental(&objects)
-            .map_err(|e| e.to_string())?;
-        std::fs::write(path, bytes).map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())
     }
 }
 

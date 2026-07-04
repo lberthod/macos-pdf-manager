@@ -215,11 +215,11 @@ impl ViewerApp {
         }
     }
 
-    /// "Fichier > Exporter une copie…" : copie le fichier actuellement
-    /// ouvert vers un nouvel emplacement choisi via `NSSavePanel` (`rfd`).
-    /// Il n'y a pas de sauvegarde "en place" à proprement parler tant que
-    /// `pdf-edit` (édition, undo/redo) n'existe pas — voir `native_menu.rs`
-    /// pour pourquoi `⌘Z`/`⌘⇧Z` ne sont volontairement pas câblés encore.
+    /// "Fichier > Exporter une copie…" (`⇧⌘S`) : copie le fichier
+    /// actuellement ouvert **sur disque** vers un nouvel emplacement choisi
+    /// via `NSSavePanel` (`rfd`) — une copie brute du fichier d'origine, pas
+    /// des modifications en attente dans la session d'édition (utiliser
+    /// "Enregistrer", `⌘S`, pour celles-ci — voir `save_in_place`).
     fn export_copy_as(&mut self) {
         let Some(session) = &self.session else {
             self.error = Some("Aucun document ouvert à exporter.".to_string());
@@ -239,6 +239,86 @@ impl ViewerApp {
                 self.error = Some(format!("Échec de l'export : {e}"));
             }
         }
+    }
+
+    /// "Fichier > Enregistrer" (`⌘S`, Sprints 13-17) : écrit les
+    /// modifications en attente (annotations, formulaires, pages...) dans le
+    /// fichier réellement ouvert, par sauvegarde incrémentale
+    /// (`pdf_app::Session::save_edits_in_place`).
+    fn save_in_place(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if let Err(e) = session.save_edits_in_place() {
+            self.error = Some(format!("Échec de l'enregistrement : {e}"));
+        }
+    }
+
+    /// Défait la dernière opération d'édition et invalide tout ce qui
+    /// dépend du contenu de la page (texture affichée, miniatures,
+    /// surlignage de recherche).
+    fn undo_edit(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.undo_edit() {
+            Ok(true) => self.invalidate_after_edit(),
+            Ok(false) => {}
+            Err(e) => self.error = Some(format!("Impossible d'annuler : {e}")),
+        }
+    }
+
+    fn redo_edit(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.redo_edit() {
+            Ok(true) => self.invalidate_after_edit(),
+            Ok(false) => {}
+            Err(e) => self.error = Some(format!("Impossible de rétablir : {e}")),
+        }
+    }
+
+    /// Surligne la sélection de texte courante (`self.selection_rects`) —
+    /// un seul rectangle `/Highlight` couvrant leur boîte englobante plutôt
+    /// qu'un par ligne, plus simple et suffisant pour une sélection sur une
+    /// seule page (voir la limitation connue : pas de sélection en mode
+    /// défilement continu).
+    fn highlight_selection(&mut self) {
+        if self.selection_rects.is_empty() {
+            return;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for rect in &self.selection_rects {
+            x0 = x0.min(rect.x0);
+            y0 = y0.min(rect.y0);
+            x1 = x1.max(rect.x1);
+            y1 = y1.max(rect.y1);
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.add_highlight_on_current_page([x0, y0, x1, y1], (1.0, 1.0, 0.0)) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de surligner : {e}")),
+        }
+    }
+
+    /// À appeler après toute opération d'édition qui modifie la page
+    /// affichée : force la re-rasterisation (le cache de `pdf-app` a déjà
+    /// été invalidé côté `Session`, mais `pdf-ui` garde ses propres caches
+    /// de texture/miniatures indépendants) et le recalcul du surlignage de
+    /// recherche (la position des caractères peut changer si une page a été
+    /// insérée/supprimée avant la page courante).
+    fn invalidate_after_edit(&mut self) {
+        self.texture_state = None;
+        self.thumbnails.clear();
+        self.page_textures.clear();
+        self.highlight_state = None;
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.selection_rects.clear();
+        self.selection_text.clear();
     }
 
     /// Lance une recherche plein document et saute directement à la première
@@ -611,6 +691,9 @@ impl eframe::App for ViewerApp {
                             });
                         }
                     }
+                    MenuCommand::Save => self.save_in_place(),
+                    MenuCommand::Undo => self.undo_edit(),
+                    MenuCommand::Redo => self.redo_edit(),
                 }
             }
         }
@@ -687,6 +770,27 @@ impl eframe::App for ViewerApp {
                     ui.separator();
                     if ui.button("📋 Copier").clicked() {
                         ui.output_mut(|o| o.copied_text = self.selection_text.clone());
+                    }
+                    if ui.button("🖍 Surligner").clicked() {
+                        self.highlight_selection();
+                    }
+                }
+
+                if let Some(session) = &self.session {
+                    ui.separator();
+                    let (can_undo, can_redo) = (session.can_undo_edit(), session.can_redo_edit());
+                    ui.add_enabled_ui(can_undo, |ui| {
+                        if ui.button("↶ Annuler").clicked() {
+                            self.undo_edit();
+                        }
+                    });
+                    ui.add_enabled_ui(can_redo, |ui| {
+                        if ui.button("↷ Rétablir").clicked() {
+                            self.redo_edit();
+                        }
+                    });
+                    if ui.button("💾 Enregistrer").clicked() {
+                        self.save_in_place();
                     }
                 }
 

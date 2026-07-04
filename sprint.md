@@ -160,7 +160,20 @@ Découpage en sprints à partir de la roadmap par phases décrite dans [architec
 - **Interface `pdf-ui`** pour ajouter/déplacer/éditer une zone de texte ou une superposition à la souris : seule l'API `pdf-edit`/`pdf-cli` (`add-text`/`replace-text`/`remove-annotation`) existe.
 - **Édition en place** d'une annotation `/FreeText` déjà créée (changer son texte sans la recréer) : `remove_annotation` + un nouvel `add_free_text_annotation` couvre le même besoin en pratique (retirer puis réajouter), mais ce n'est pas une édition "in place" au sens strict.
 
-**Critère de sortie :** 6a/6b livrés et testés avant d'engager du temps sur 6c ; 6c traité comme un projet de recherche séparé, budgété à part. **Statut réel : atteint pour le socle moteur** (6a et 6b tous deux livrés et testés bout en bout, avec sauvegarde incrémentale/réouverture/rendu réel) — 6c non engagé, conformément au critère. Comme aux Sprints 13-16, il manque l'interface `pdf-ui` pour un usage sans `pdf-cli`/l'API Rust directement.
+**Critère de sortie :** 6a/6b livrés et testés avant d'engager du temps sur 6c ; 6c traité comme un projet de recherche séparé, budgété à part. **Statut réel : atteint pour le socle moteur** (6a et 6b tous deux livrés et testés bout en bout, avec sauvegarde incrémentale/réouverture/rendu réel) — 6c non engagé, conformément au critère. Voir la note ci-dessous : une partie du fossé "pas d'interface `pdf-ui`" signalé aux Sprints 13-16 a depuis été comblée.
+
+---
+
+## Note de suivi — premier câblage `pdf-ui` de l'édition (hors sprint dédié)
+
+Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais rien n'est cliquable") a été partiellement comblé, en avance d'un sprint UX dédié : `pdf-app::Session` porte désormais une `pdf_edit::EditSession` interne (`add_highlight_on_current_page`/`undo_edit`/`redo_edit`/`save_edits_in_place`), qui régénère immédiatement le `Document` de lecture depuis les octets en attente (`refresh_after_edit`) — l'édition est donc visible dans le rendu **avant** toute sauvegarde, pas seulement après réouverture du fichier. Côté `pdf-ui` :
+- **Surligner la sélection** : le bouton "🖍 Surligner" (à côté de "📋 Copier", déjà présent depuis le Sprint 9-10) surligne la boîte englobante de la sélection de texte courante.
+- **Annuler/Rétablir** : boutons de la barre d'outils **et** vrais raccourcis natifs `⌘Z`/`⌘⇧Z` (menu "Édition", nouveau — voir `native_menu.rs`), désactivés quand il n'y a rien à annuler/rétablir.
+- **Enregistrer** : bouton "💾 Enregistrer" **et** `⌘S` fait maintenant un vrai "Enregistrer" (écrit dans le fichier ouvert par sauvegarde incrémentale) — "Exporter une copie…" (Sprint 11-12) est resté, déplacé sur `⇧⌘S`.
+
+**Non fait** (le gros du travail UX reste devant nous, cette note ne clôt aucun des trois sprints ci-dessus) :
+- Pas d'outil pour **ajouter** une annotation `/FreeText`, remplir un champ de formulaire, ou manipuler des pages (insérer/supprimer/déplacer/pivoter/fusionner) depuis `pdf-ui` — seuls le surlignage de sélection et l'undo/redo/save sont câblés, parce qu'ils réutilisaient une interaction déjà existante (la sélection de texte) plutôt que d'en demander une nouvelle.
+- Pas de retour visuel "modifications non enregistrées" (titre de fenêtre, indicateur).
 
 ---
 

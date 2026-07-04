@@ -1,11 +1,14 @@
 //! État de session applicative : document ouvert, page courante, rendu
 //! agnostique du backend de rasterisation — orchestration entre `pdf-core`
 //! (parsing/interprétation) et `pdf-render` (rasterisation), pour que le
-//! futur chrome natif macOS (Sprint 11-12) et `pdf-ui` n'aient plus à parler
+//! chrome natif macOS (Sprint 11-12) et `pdf-ui` n'aient plus à parler
 //! directement à ces deux crates (voir sprint.md, STATUS.md §5).
 //!
-//! Ne porte pas encore d'historique d'édition (`EditOp`/undo-redo — voir
-//! sprint.md Sprint 13-14) : uniquement l'état de *lecture* pour l'instant.
+//! Porte aussi l'édition (Sprints 13-17, `pdf-edit::EditSession`) : chaque
+//! opération d'édition régénère immédiatement le `Document` de lecture
+//! depuis les octets en attente (`refresh_after_edit`), pour que le rendu
+//! reflète l'édition avant toute sauvegarde sur disque — voir
+//! `add_highlight_on_current_page`/`undo_edit`/`save_edits_in_place`.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -89,6 +92,15 @@ pub struct Session {
     /// l'essaie en premier et ne se rabat sur `pdf-render` que s'il échoue
     /// (pas d'adaptateur `wgpu` compatible) — voir `pdf_render_gpu::GpuRenderer`.
     gpu: Option<pdf_render_gpu::GpuRenderer>,
+    /// Session d'édition (Sprints 13-17, `pdf-edit`) : annotations,
+    /// formulaires, pages, undo/redo, sauvegarde incrémentale. Ouverte sur
+    /// le même fichier que `doc`, mais un objet `Document` distinct (lecture
+    /// seule, jamais modifié directement) — après chaque édition, `doc` est
+    /// entièrement rouvert depuis `edit.to_bytes()` (voir
+    /// `refresh_after_edit`) pour que le rendu reflète immédiatement les
+    /// modifications en attente, sans jamais toucher au fichier sur disque
+    /// tant que l'utilisateur ne sauvegarde pas explicitement.
+    edit: pdf_edit::EditSession,
 }
 
 impl Session {
@@ -98,6 +110,7 @@ impl Session {
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let doc = Document::open(bytes).map_err(|e| e.to_string())?;
         let page_count = doc.page_count().map_err(|e| e.to_string())?;
+        let edit = pdf_edit::EditSession::open(&path)?;
         Ok(Self {
             doc,
             path,
@@ -107,6 +120,7 @@ impl Session {
             render_cache: RefCell::new(Vec::new()),
             outline_cache: RefCell::new(None),
             gpu: None,
+            edit,
         })
     }
 
@@ -294,6 +308,100 @@ impl Session {
             .map(MatchRect::from)
             .collect();
         Ok((text, rects))
+    }
+
+    /// `true` si `undo`/`redo` a quelque chose à défaire/refaire — sert à
+    /// `pdf-ui` pour activer/désactiver les boutons et items de menu
+    /// correspondants sans dupliquer l'état de `pdf-edit`.
+    pub fn can_undo_edit(&self) -> bool {
+        self.edit.can_undo()
+    }
+
+    pub fn can_redo_edit(&self) -> bool {
+        self.edit.can_redo()
+    }
+
+    /// Ajoute une annotation `/Highlight` sur la page courante (voir
+    /// `pdf_edit::EditSession::add_highlight_annotation`) et rafraîchit
+    /// immédiatement le rendu pour qu'elle soit visible sans sauvegarder.
+    pub fn add_highlight_on_current_page(
+        &mut self,
+        rect: [f64; 4],
+        color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.edit
+            .add_highlight_annotation(self.page_index, rect, color, vec![])?;
+        self.refresh_after_edit()
+    }
+
+    /// Ajoute une annotation `/FreeText` (Sprint 17+, 6a) sur la page
+    /// courante et rafraîchit le rendu.
+    pub fn add_free_text_on_current_page(
+        &mut self,
+        rect: [f64; 4],
+        text: &str,
+        font_size: f64,
+        color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.edit
+            .add_free_text_annotation(self.page_index, rect, text, font_size, color)?;
+        self.refresh_after_edit()
+    }
+
+    /// Retire l'annotation d'indice `annot_index` de la page courante (voir
+    /// `pdf_edit::EditSession::remove_annotation`) et rafraîchit le rendu.
+    pub fn remove_annotation_on_current_page(&mut self, annot_index: usize) -> Result<(), String> {
+        self.edit.remove_annotation(self.page_index, annot_index)?;
+        self.refresh_after_edit()
+    }
+
+    /// Défait la dernière opération d'édition et rafraîchit le rendu.
+    /// Ne fait rien (renvoie `false`) s'il n'y a rien à défaire.
+    pub fn undo_edit(&mut self) -> Result<bool, String> {
+        if !self.edit.undo() {
+            return Ok(false);
+        }
+        self.refresh_after_edit()?;
+        Ok(true)
+    }
+
+    /// Refait la dernière opération défaite et rafraîchit le rendu.
+    pub fn redo_edit(&mut self) -> Result<bool, String> {
+        if !self.edit.redo() {
+            return Ok(false);
+        }
+        self.refresh_after_edit()?;
+        Ok(true)
+    }
+
+    /// Écrit les modifications en attente **dans le fichier actuellement
+    /// ouvert** (`self.path`) par sauvegarde incrémentale — un vrai
+    /// "Enregistrer" plutôt qu'un "Enregistrer sous" : le fichier d'origine
+    /// n'est jamais réécrit en place au sens strict (voir
+    /// `Document::save_incremental`), seulement complété, mais du point de
+    /// vue de l'utilisateur c'est bien la même session de fichier qui est
+    /// mise à jour.
+    pub fn save_edits_in_place(&self) -> Result<(), String> {
+        self.edit.save_as(&self.path)
+    }
+
+    /// Après toute opération d'édition : régénère les octets du document
+    /// (avec les modifications en attente) via `pdf_edit::EditSession::
+    /// to_bytes`, rouvre un `Document` en lecture depuis ces octets pour le
+    /// rendu/la navigation, et invalide tous les caches (rendu, texte, plan)
+    /// puisqu'ils peuvent référencer un contenu désormais périmé. Le
+    /// fichier sur disque n'est jamais touché ici — seul `save_edits_in_place`
+    /// écrit réellement.
+    fn refresh_after_edit(&mut self) -> Result<(), String> {
+        let bytes = self.edit.to_bytes()?;
+        let doc = Document::open(bytes).map_err(|e| e.to_string())?;
+        self.page_count = doc.page_count().map_err(|e| e.to_string())?;
+        self.page_index = self.page_index.min(self.page_count.saturating_sub(1));
+        self.doc = doc;
+        self.render_cache.borrow_mut().clear();
+        self.text_cache.replace(vec![None; self.page_count]);
+        self.outline_cache.borrow_mut().take();
+        Ok(())
     }
 
     /// Retourne le texte (avec positions) de `index`, en le calculant et le
@@ -622,6 +730,111 @@ mod tests {
             session.char_index_at_on_current_page(center).unwrap(),
             Some(0)
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Une annotation ajoutée doit être visible dans le rendu **immédiatement**
+    /// (avant toute sauvegarde) — c'est tout l'intérêt de `refresh_after_edit` :
+    /// sans lui, l'utilisateur ne verrait le résultat de son édition qu'après
+    /// avoir enregistré et rouvert le fichier.
+    #[test]
+    fn highlight_is_visible_in_render_before_any_save() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        let before = session.render_current_page(1.0).unwrap();
+        let before_pixel_index = (175 * before.width as usize + 150) * 4;
+        assert_eq!(
+            &before.rgba[before_pixel_index..before_pixel_index + 3],
+            &[255, 255, 255],
+            "expected a blank area before the highlight"
+        );
+
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+
+        let after = session.render_current_page(1.0).unwrap();
+        // (150, 175) en espace pixmap (haut-gauche) tombe dans le rectangle
+        // surligné [100,600]-[300,630] en espace page (bas-gauche) sur une
+        // page 612x792 : y_pixmap = 792 - y_page, donc y_page in [600,630]
+        // correspond à y_pixmap in [162,192].
+        let after_pixel_index = (175 * after.width as usize + 150) * 4;
+        assert_eq!(
+            &after.rgba[after_pixel_index..after_pixel_index + 3],
+            &[255, 255, 0],
+            "expected the yellow highlight to be visible right after adding it, before any save"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `undo`/`redo` doivent aussi rafraîchir le rendu immédiatement.
+    #[test]
+    fn undo_and_redo_refresh_the_render() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        assert!(!session.can_undo_edit());
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+        assert!(session.can_undo_edit());
+
+        let pixel_index = (175 * 612 + 150) * 4;
+        let with_highlight = session.render_current_page(1.0).unwrap();
+        assert_eq!(
+            &with_highlight.rgba[pixel_index..pixel_index + 3],
+            &[255, 255, 0]
+        );
+
+        assert!(session.undo_edit().unwrap());
+        let after_undo = session.render_current_page(1.0).unwrap();
+        assert_eq!(
+            &after_undo.rgba[pixel_index..pixel_index + 3],
+            &[255, 255, 255]
+        );
+        assert!(session.can_redo_edit());
+
+        assert!(session.redo_edit().unwrap());
+        let after_redo = session.render_current_page(1.0).unwrap();
+        assert_eq!(
+            &after_redo.rgba[pixel_index..pixel_index + 3],
+            &[255, 255, 0]
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `save_edits_in_place` doit écrire dans le fichier ouvert par la
+    /// session (pas un chemin séparé), et le résultat doit être rouvrable
+    /// avec l'annotation bien présente.
+    #[test]
+    fn save_edits_in_place_persists_to_the_original_path() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+        session.save_edits_in_place().unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annots = page
+            .dict
+            .get("Annots")
+            .and_then(|o| o.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(annots, 1);
 
         std::fs::remove_file(&path).ok();
     }

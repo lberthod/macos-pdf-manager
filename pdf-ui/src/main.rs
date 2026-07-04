@@ -11,7 +11,8 @@
 //! recherche texte (`Session::find_pages_containing`) qui saute
 //! d'occurrence en occurrence page par page **avec surlignage** des
 //! résultats sur la page affichée (`Session::find_matches_on_current_page`),
-//! panneau de miniatures cliquables pour naviguer directement à une page.
+//! panneau de miniatures cliquables et panneau de signets (`/Outlines`,
+//! `Session::outline`) pour naviguer directement à une page.
 //!
 //! Non géré (voir STATUS.md) : onglets/multi-documents, annotations,
 //! sélection de texte à la souris, scroll continu entre pages (une page à
@@ -62,6 +63,7 @@ struct ViewerApp {
     highlight_rects: Vec<pdf_app::MatchRect>,
     show_thumbnails: bool,
     thumbnails: HashMap<usize, egui::TextureHandle>,
+    show_outline: bool,
 }
 
 impl ViewerApp {
@@ -80,6 +82,7 @@ impl ViewerApp {
             highlight_rects: Vec::new(),
             show_thumbnails: false,
             thumbnails: HashMap::new(),
+            show_outline: false,
         };
         if let Some(p) = initial_path {
             app.open_path(PathBuf::from(p));
@@ -263,6 +266,51 @@ impl ViewerApp {
 
         clicked
     }
+
+    /// Dessine le panneau de signets (table des matières) et retourne
+    /// l'index de page cliqué, le cas échéant. `None` (pas seulement un
+    /// panneau vide) si le document n'a pas de `/Outlines` — l'appelant
+    /// n'affiche alors pas le panneau du tout.
+    fn show_outline_panel(&mut self, ctx: &egui::Context) -> Option<usize> {
+        let outline = self.session.as_ref()?.outline().ok()?;
+        if outline.is_empty() {
+            return None;
+        }
+
+        let mut clicked = None;
+        egui::SidePanel::left("outline")
+            .resizable(true)
+            .default_width(180.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    render_outline_items(ui, &outline, 0, &mut clicked);
+                });
+            });
+        clicked
+    }
+}
+
+/// Affiche récursivement une table des matières, avec une indentation par
+/// niveau de profondeur. Les entrées sans page résolue (voir
+/// `pdf_app::OutlineItem::page_index`, ex. destination nommée non gérée)
+/// restent affichées mais ne naviguent nulle part au clic.
+fn render_outline_items(
+    ui: &mut egui::Ui,
+    items: &[pdf_app::OutlineItem],
+    depth: usize,
+    clicked: &mut Option<usize>,
+) {
+    for item in items {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            if ui.selectable_label(false, &item.title).clicked() {
+                if let Some(page) = item.page_index {
+                    *clicked = Some(page);
+                }
+            }
+        });
+        render_outline_items(ui, &item.children, depth + 1, clicked);
+    }
 }
 
 impl eframe::App for ViewerApp {
@@ -289,6 +337,7 @@ impl eframe::App for ViewerApp {
 
                 ui.add_enabled_ui(has_doc, |ui| {
                     ui.toggle_value(&mut self.show_thumbnails, "🖼 Miniatures");
+                    ui.toggle_value(&mut self.show_outline, "📑 Signets");
                 });
 
                 ui.separator();
@@ -373,6 +422,14 @@ impl eframe::App for ViewerApp {
 
         if self.show_thumbnails {
             if let Some(clicked) = self.show_thumbnail_panel(ctx) {
+                if let Some(session) = &mut self.session {
+                    session.goto_page(clicked);
+                }
+            }
+        }
+
+        if self.show_outline {
+            if let Some(clicked) = self.show_outline_panel(ctx) {
                 if let Some(session) = &mut self.session {
                     session.goto_page(clicked);
                 }

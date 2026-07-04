@@ -6,7 +6,7 @@
 
 use crate::document::Document;
 use crate::error::{PdfError, Result};
-use crate::object::{Dictionary, Object};
+use crate::object::{Dictionary, ObjRef, Object};
 use std::collections::HashSet;
 
 /// Une page « feuille » de l'arbre, avec ses attributs déjà résolus
@@ -18,6 +18,11 @@ pub struct Page {
     pub media_box: [f64; 4],
     pub rotate: i32,
     pub resources: Dictionary,
+    /// Référence indirecte de l'objet page lui-même, quand `/Kids` la
+    /// désignait par référence (cas normal) plutôt que par un dictionnaire
+    /// direct inline. Sert à résoudre les destinations `/Outlines`/`/Dest`
+    /// (qui pointent vers l'objet page) en index de page — voir `outline.rs`.
+    pub object_ref: Option<ObjRef>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +78,7 @@ impl Document {
             return Ok(()); // nœud malformé : on l'ignore plutôt que d'échouer tout le document.
         };
         let dict = dict.clone();
+        let object_ref = node_obj.as_reference();
 
         let mut inherited = inherited.clone();
         if let Some(res) = dict.get("Resources") {
@@ -116,6 +122,7 @@ impl Document {
             media_box,
             rotate: inherited.rotate.unwrap_or(0) as i32,
             resources,
+            object_ref,
         });
         Ok(())
     }

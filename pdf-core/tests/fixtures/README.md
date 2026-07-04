@@ -11,8 +11,9 @@
 - `rotated_page.pdf` — page avec `/Rotate 90`, générée avec `reportlab` puis `pikepdf` (`pdf.pages[0].Rotate = 90`). Sert à tester l'application de la rotation au rendu (`pdf-render::render_page_rotated`) : a mis en évidence que `/Rotate` était parsé (`Page::rotate`) mais jamais appliqué avant ce fixture.
 - `acroform_textfield.pdf` — page avec un champ de formulaire texte simple (`reportlab.Canvas.acroForm.textfield`). Sert à vérifier que la présence d'un `/AcroForm` n'empêche pas l'ouverture ni l'extraction du texte de la page (le remplissage de formulaire lui-même n'est pas implémenté, voir `pdf-edit`).
 - `encrypted_rc4.pdf` — PDF chiffré RC4 40 bits (`pikepdf.Encryption(owner=..., user="", R=4)`), mot de passe utilisateur vide. Sert à vérifier que `Document::open` échoue avec une erreur claire (`PdfError::Encrypted`) plutôt qu'une erreur de bas niveau trompeuse (ex. `FlateDecode: corrupt deflate stream` sur un flux resté chiffré).
-- `cjk_text.pdf` — texte chinois simplifié (`你好，世界`) en police Songti **intégrée** (`/System/Library/Fonts/Supplemental/Songti.ttc`, choisie parce qu'elle a des contours TrueType `glyf` — la plupart des polices CJK système macOS sont CFF/OTF, non supportées par l'embarqueur TrueType de reportlab). Sert à vérifier que le pipeline ne panique pas sur du texte non latin : les glyphes se rendent correctement (contour résolu via le `cmap` de la police), mais aucun caractère n'est récupéré par `pdf-text` (l'encodage `/Encoding` WinAnsi/StandardEncoding ne couvre pas ces codes) — limite documentée dans STATUS.md.
+- `cjk_text.pdf` — texte chinois simplifié (`你好，世界`) en police Songti **intégrée** (`/System/Library/Fonts/Supplemental/Songti.ttc`, choisie parce qu'elle a des contours TrueType `glyf` — la plupart des polices CJK système macOS sont CFF/OTF, non supportées par l'embarqueur TrueType de reportlab). Le glyphe se rend correctement (contour résolu via le `cmap` de la police) **et** le texte est intégralement récupérable via le CMap `/ToUnicode` que reportlab embarque par défaut pour ce type de sous-ensemble (`font.rs::parse_to_unicode_cmap`) — sert de fixture de non-régression pour ce parseur.
 - `large_60_pages.pdf` — document de 60 pages (texte + rectangle par page, cross-reference stream + object streams), pour les tests de navigation/recherche/miniatures sur un document de taille non triviale.
+- `outline_test.pdf` — 4 pages, une table des matières plate ("Section 1".."Section 4", une par page), générée avec `reportlab.Canvas.bookmarkPage`/`addOutlineEntry`. Sert à tester la lecture de `/Outlines` (`pdf-core::outline`), en particulier la résolution des destinations directes (`/Dest` tableau `[page /Fit]`) en index de page.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -167,6 +168,18 @@ for i in range(60):
 c10.save()
 with Pdf.open(io.BytesIO(buf10.getvalue())) as pdf:
     pdf.save("large_60_pages.pdf", object_stream_mode=ObjectStreamMode.generate, static_id=True)
+
+# outline_test.pdf
+buf11 = io.BytesIO()
+c11 = canvas.Canvas(buf11, pagesize=letter)
+for i in range(4):
+    c11.bookmarkPage(f"page{i}")
+    c11.addOutlineEntry(f"Section {i+1}", f"page{i}", level=0)
+    c11.drawString(72, 720, f"Page {i+1} of outline test")
+    c11.showPage()
+c11.save()
+with Pdf.open(io.BytesIO(buf11.getvalue())) as pdf:
+    pdf.save("outline_test.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
 ```
 
-Ce corpus reste modeste (13 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9), mais couvre désormais au moins un représentant de chaque catégorie avancée citée par ce critère (rotation, formulaire, chiffrement, CJK, document de taille non triviale) — un PDF réellement scanné (image plein page sans couche texte) et un PDF/A restent à ajouter.
+Ce corpus reste modeste (14 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9), mais couvre désormais au moins un représentant de chaque catégorie avancée citée par ce critère (rotation, formulaire, chiffrement, CJK, document de taille non triviale, table des matières) — un PDF réellement scanné (image plein page sans couche texte) et un PDF/A restent à ajouter.

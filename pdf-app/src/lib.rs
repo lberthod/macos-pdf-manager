@@ -13,6 +13,11 @@ use std::rc::Rc;
 
 use pdf_core::Document;
 
+/// Ré-exporté tel quel (pas de conversion vers un type propre à `pdf-app`,
+/// contrairement à `MatchRect`) : `OutlineItem` ne porte aucune notion liée
+/// au backend de rendu, juste un titre/index de page/enfants.
+pub use pdf_core::OutlineItem;
+
 /// Nombre maximal de pages rastérisées gardées en mémoire (`render_cache`) :
 /// couvre à la fois la page courante et un jeu de miniatures sans borner la
 /// mémoire pour un document de plusieurs centaines de pages.
@@ -76,6 +81,9 @@ pub struct Session {
     /// vrai cache de tuiles GPU (voir sprint.md Sprint 9-10) : une page
     /// entière est mise en cache, pas des dalles.
     render_cache: RefCell<Vec<(RenderCacheKey, Rc<RenderedPage>)>>,
+    /// Table des matières, calculée au premier appel de `outline()` (`None`
+    /// = pas encore demandée) : ne change jamais pendant une session.
+    outline_cache: RefCell<Option<Rc<Vec<OutlineItem>>>>,
 }
 
 impl Session {
@@ -92,6 +100,7 @@ impl Session {
             page_index: 0,
             text_cache: RefCell::new(vec![None; page_count]),
             render_cache: RefCell::new(Vec::new()),
+            outline_cache: RefCell::new(None),
         })
     }
 
@@ -134,6 +143,18 @@ impl Session {
             .page(self.page_index)
             .map_err(|e| e.to_string())?
             .media_box)
+    }
+
+    /// Table des matières (`/Outlines`) du document, `[]` si absente. Mise
+    /// en cache après le premier appel (voir `pdf_core::outline` pour les
+    /// limitations : seules les destinations directes sont résolues).
+    pub fn outline(&self) -> Result<Rc<Vec<OutlineItem>>, String> {
+        if let Some(cached) = self.outline_cache.borrow().clone() {
+            return Ok(cached);
+        }
+        let outline = Rc::new(self.doc.outline().map_err(|e| e.to_string())?);
+        *self.outline_cache.borrow_mut() = Some(outline.clone());
+        Ok(outline)
     }
 
     /// Rastérise la page courante à l'échelle `scale`, `/Rotate` appliqué
@@ -442,6 +463,36 @@ mod tests {
 
         let media_box = session.current_page_media_box().unwrap();
         assert_eq!(media_box, [0.0, 0.0, 612.0, 792.0]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn outline_is_read_and_cached() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/outline_test.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = Session::open(&path).unwrap();
+
+        let outline = session.outline().unwrap();
+        assert_eq!(outline.len(), 4);
+        assert_eq!(outline[2].title, "Section 3");
+        assert_eq!(outline[2].page_index, Some(2));
+
+        // Deuxième appel : doit retomber sur le cache (même Rc).
+        let outline_again = session.outline().unwrap();
+        assert!(Rc::ptr_eq(&outline, &outline_again));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn outline_is_empty_for_a_document_without_one() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = Session::open(&path).unwrap();
+
+        assert!(session.outline().unwrap().is_empty());
 
         std::fs::remove_file(&path).ok();
     }

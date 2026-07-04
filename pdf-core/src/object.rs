@@ -111,4 +111,28 @@ impl Object {
     pub fn is_null(&self) -> bool {
         matches!(self, Object::Null)
     }
+
+    /// Décode une chaîne PDF "texte" (ISO 32000-1 §7.9.2.2 : PDFDocEncoding
+    /// ou UTF-16BE avec BOM `\xFE\xFF`) en `String`. Utilisé pour les titres
+    /// de signets (`/Outlines`), les métadonnées `/Info`, etc. — pas une
+    /// table PDFDocEncoding complète, seulement la détection du BOM UTF-16 ;
+    /// sans BOM, les octets sont interprétés en UTF-8 "lossy" (correct pour
+    /// l'ASCII, l'immense majorité des cas réels sans BOM).
+    pub fn as_text_string(&self) -> Option<String> {
+        let Object::String(bytes) = self else {
+            return None;
+        };
+        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+            let units: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            return Some(
+                char::decode_utf16(units)
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect(),
+            );
+        }
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
 }

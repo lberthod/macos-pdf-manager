@@ -1,6 +1,6 @@
 # État précis du projet
 
-**Dernière mise à jour :** 2026-07-04 (ajout de `type0_cid_truetype.pdf`, premier fixture réel `/Type0`/`CIDFontType2` du corpus — sous-ensemble TrueType Monaco via `fonttools subset`, validé visuellement — complétant le support `/Type0`/CID de `pdf-core` ajouté plus tôt le même jour, lui-même après la fermeture du Sprint 9-10 sur `pdf-render-gpu`)
+**Dernière mise à jour :** 2026-07-04 (ajout du harnais de comparaison pixel `pdf-render/tests/golden.rs` + `pdf-render-gpu/tests/cross_backend.rs`, corpus élargi de 15 à 25 fixtures dont un second fixture réel `/Type0` — `type0_cid_cff.pdf`, `/CIDFontType0` CFF CID-keyed, Hiragino Sans GB — et correction d'un bug réel de décodage JPEG CMYK trouvé en construisant ces fixtures, voir sprint.md Sprint 0/3-4/7-8 pour le détail)
 **But de ce document :** donner une image exacte et vérifiable de ce qui fonctionne, de ce qui est simulé (placeholder), et de ce qui n'existe pas encore — par opposition à [architecture.md](./architecture.md) (la cible) et [sprint.md](./sprint.md) (le plan). Chaque affirmation ci-dessous est vérifiable en lisant le fichier cité ou en lançant la commande indiquée.
 
 ---

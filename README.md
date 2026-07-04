@@ -17,7 +17,9 @@ Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble r
 
 Un premier **prototype de viewer graphique** (`pdf-ui`, `egui`/`eframe`) est fonctionnel : navigation, zoom, recherche texte avec surlignage, miniatures, panneau de signets, défilement continu, sélection de texte à la souris.
 
-Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, le chrome natif macOS (menus/raccourcis/packaging), Type1 historique (police pré-CFF), les images CCITT/JBIG2/JPX, le déchiffrement PDF (un PDF chiffré est détecté proprement mais jamais lu). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
+L'application a désormais un vrai **chrome natif macOS** : barre de menus système (`NSMenu` via `objc2`/`objc2-app-kit`, pas dessinée par `egui`), ouverture/export de fichier natifs, glisser-déposer, plein écran, mode sombre — packagée en `.app`/`.dmg` via `cargo-bundle`/`hdiutil`.
+
+Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, Quick Look, la signature/notarisation Apple réelle (identifiants Developer non disponibles dans cet environnement), Type1 historique (police pré-CFF), les images CCITT/JBIG2/JPX, le déchiffrement PDF (un PDF chiffré est détecté proprement mais jamais lu). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
 
 ## Structure du projet
 
@@ -31,7 +33,7 @@ Workspace Cargo multi-crates :
 | `pdf-text` | Extraction de texte avec position par caractère, recherche, sélection | Fonctionnel |
 | `pdf-app` | État de session (ouverture, navigation, rendu, recherche, cache) partagé entre `pdf-ui` et les futurs fronts | Fonctionnel |
 | `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`, `text`) | Fonctionnel |
-| `pdf-ui` | Prototype de viewer (`egui`/`eframe`) : ouverture, navigation, zoom, recherche, miniatures, signets, défilement continu, sélection de texte | Fonctionnel, minimal (pas de chrome natif macOS, voir STATUS.md) |
+| `pdf-ui` | Viewer (`egui`/`eframe`) avec chrome natif macOS : menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre ; navigation, zoom, recherche, miniatures, signets, défilement continu, sélection de texte | Fonctionnel, packagé en `.app`/`.dmg` (voir STATUS.md) |
 | `pdf-edit` | Opérations d'édition, journal, undo/redo | Stub vide (Sprint 13-14+) |
 
 ## Essayer
@@ -84,9 +86,9 @@ Pour régénérer volontairement les images de référence après un changement 
 - **Rust natif**, workspace Cargo.
 - Codecs génériques implémentés : `flate2` (Flate), `zune-jpeg` (DCTDecode/JPEG, RGB et CMYK), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison. Contours de glyphes via `ttf-parser` (TrueType et CFF/Type1C, polices simples et composites `/Type0`/CID). Rendu CPU via `tiny-skia`, rendu GPU via `wgpu`+`lyon` en parité fonctionnelle.
 - Codecs pas encore implémentés : CCITT, JBIG2, JPX. Police pas encore supportée : Type1 historique (`/FontFile`, pré-CFF).
-- UI : prototype `egui`/`eframe` fonctionnel ; chrome natif macOS (`objc2`) et packaging `.dmg` prévus Sprint 11-12.
-- Packaging : `cargo-bundle` + signature/notarisation Apple pour le `.dmg` — pas encore fait.
+- UI : prototype `egui`/`eframe` avec chrome natif macOS (`objc2`/`objc2-app-kit` : `NSMenu`, `NSApplication.appearance`).
+- Packaging : `cargo-bundle` produit un `.app` valide, empaqueté en `.dmg` via `hdiutil` — signature/notarisation Apple réelles pas encore faites (nécessitent un compte Apple Developer, non disponible dans cet environnement).
 
 ## Statut
 
-Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu et sélection de texte. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.
+Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer, chrome natif & packaging) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu, sélection de texte **et** chrome natif macOS (menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre), packagé en `.app`/`.dmg`. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.

@@ -15,3 +15,19 @@ eframe = { version = "0.29", features = ["wgpu"] }
 egui = "0.29"
 wgpu = "22"
 rfd = "0.15"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSWindow", "NSRunningApplication", "NSEvent", "NSAppearance"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString"] }
+
+# Sprint 11-12 (sprint.md) : métadonnées de bundle macOS pour `cargo bundle`
+# (crate `cargo-bundle`). Produit un `.app` (`cargo bundle --release -p
+# pdf-ui --format osx`), packagé ensuite en `.dmg` via `hdiutil` (voir
+# STATUS.md pour la commande complète et ses limites : pas de signature/
+# notarisation réelles sans un compte Apple Developer, non disponible dans
+# cet environnement de développement).
+[package.metadata.bundle]
+name = "PDF Manager"
+identifier = "com.lberthod.pdfmanager"
+short_description = "Visionneuse et éditeur PDF natif macOS (moteur maison)"
+category = "public.app-category.productivity"
+copyright = "Copyright 2026 Loïc Berthod"

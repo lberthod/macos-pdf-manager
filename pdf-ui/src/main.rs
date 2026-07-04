@@ -27,7 +27,10 @@
 //! continu : la hauteur de ligne est calculée une fois sur la page 0
 //! (documents à pages de tailles hétérogènes mal gérés).
 
+mod native_menu;
+
 use eframe::egui;
+use native_menu::{MenuCommand, NativeMenu};
 use pdf_app::Session;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -59,7 +62,15 @@ fn main() -> eframe::Result<()> {
             let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
                 pdf_render_gpu::GpuRenderer::from_shared(rs.device.clone(), rs.queue.clone())
             });
-            Ok(Box::new(ViewerApp::new(std::env::args().nth(1), gpu)))
+            // `MainThreadMarker::new()` ne renvoie `Some` que sur le thread
+            // principal : garanti ici, ce callback tournant avant que la
+            // boucle d'événements `winit`/AppKit ne démarre.
+            let native_menu = objc2::MainThreadMarker::new().map(NativeMenu::install);
+            Ok(Box::new(ViewerApp::new(
+                std::env::args().nth(1),
+                gpu,
+                native_menu,
+            )))
         }),
     )
 }
@@ -117,13 +128,23 @@ struct ViewerApp {
     /// `Session` ouverte (voir `open_path`) : `GpuRenderer` ne fait que
     /// partager des `Arc`, un clone est donc bon marché.
     gpu: Option<pdf_render_gpu::GpuRenderer>,
+    /// Barre de menus native macOS (Sprint 11-12, sprint.md) — `None` sur
+    /// les plateformes non macOS ou si l'installation a échoué, auquel cas
+    /// seuls la barre d'outils `egui` et le glisser-déposer restent
+    /// utilisables pour ouvrir un fichier.
+    native_menu: Option<NativeMenu>,
 }
 
 impl ViewerApp {
-    fn new(initial_path: Option<String>, gpu: Option<pdf_render_gpu::GpuRenderer>) -> Self {
+    fn new(
+        initial_path: Option<String>,
+        gpu: Option<pdf_render_gpu::GpuRenderer>,
+        native_menu: Option<NativeMenu>,
+    ) -> Self {
         let mut app = Self {
             session: None,
             gpu,
+            native_menu,
             zoom: 1.0,
             texture: None,
             texture_state: None,
@@ -182,6 +203,44 @@ impl ViewerApp {
             Err(e) => {
                 self.error = Some(format!("Impossible d'ouvrir le fichier : {e}"));
                 self.session = None;
+            }
+        }
+    }
+
+    /// Ouvre le sélecteur de fichier natif (`rfd`, `NSOpenPanel` sous le
+    /// capot) et charge le fichier choisi — partagé entre le bouton de la
+    /// barre d'outils et le menu natif "Fichier > Ouvrir…".
+    fn open_file_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .pick_file()
+        {
+            self.open_path(path);
+        }
+    }
+
+    /// "Fichier > Exporter une copie…" : copie le fichier actuellement
+    /// ouvert vers un nouvel emplacement choisi via `NSSavePanel` (`rfd`).
+    /// Il n'y a pas de sauvegarde "en place" à proprement parler tant que
+    /// `pdf-edit` (édition, undo/redo) n'existe pas — voir `native_menu.rs`
+    /// pour pourquoi `⌘Z`/`⌘⇧Z` ne sont volontairement pas câblés encore.
+    fn export_copy_as(&mut self) {
+        let Some(session) = &self.session else {
+            self.error = Some("Aucun document ouvert à exporter.".to_string());
+            return;
+        };
+        let source = session.path().to_path_buf();
+        let default_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "document.pdf".to_string());
+        if let Some(dest) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            if let Err(e) = std::fs::copy(&source, &dest) {
+                self.error = Some(format!("Échec de l'export : {e}"));
             }
         }
     }
@@ -526,15 +585,41 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Commandes émises par la barre de menus native depuis la dernière
+        // frame (voir `native_menu.rs`) — traitées ici plutôt que dans le
+        // callback Objective-C lui-même, pour ne coupler `MenuTarget` qu'à
+        // un canal MPSC plutôt qu'à l'état `egui`.
+        if let Some(menu) = &self.native_menu {
+            for cmd in menu.drain_commands() {
+                match cmd {
+                    MenuCommand::OpenDocument => self.open_file_dialog(),
+                    MenuCommand::ExportCopyAs => self.export_copy_as(),
+                    MenuCommand::ToggleDarkMode => {
+                        if let Some(mtm) = objc2::MainThreadMarker::new() {
+                            let dark = native_menu::toggle_dark_mode(mtm);
+                            ctx.set_visuals(if dark {
+                                egui::Visuals::dark()
+                            } else {
+                                egui::Visuals::light()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Glisser-déposer un fichier PDF sur la fenêtre (`egui` expose déjà
+        // les fichiers déposés via l'événement natif `NSWindow`/`winit` sans
+        // code Objective-C supplémentaire).
+        let dropped_path = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
+        if let Some(path) = dropped_path {
+            self.open_path(path);
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Ouvrir…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PDF", &["pdf"])
-                        .pick_file()
-                    {
-                        self.open_path(path);
-                    }
+                    self.open_file_dialog();
                 }
 
                 ui.separator();

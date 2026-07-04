@@ -9,8 +9,7 @@ name = "pdf-ui"
 path = "src/main.rs"
 
 [dependencies]
-pdf-core = { workspace = true }
-pdf-render = { workspace = true }
+pdf-app = { workspace = true }
 eframe = "0.29"
 egui = "0.29"
 rfd = "0.15"

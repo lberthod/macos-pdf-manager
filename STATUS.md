@@ -1,6 +1,6 @@
 # État précis du projet
 
-**Dernière mise à jour :** 2026-07-04 (canal alpha /SMask ajouté)
+**Dernière mise à jour :** 2026-07-04 (cache de rendu bitmap par page, surlignage des résultats de recherche, panneau miniatures — clôture du Sprint 9-10 sauf backend GPU et scroll continu)
 **But de ce document :** donner une image exacte et vérifiable de ce qui fonctionne, de ce qui est simulé (placeholder), et de ce qui n'existe pas encore — par opposition à [architecture.md](./architecture.md) (la cible) et [sprint.md](./sprint.md) (le plan). Chaque affirmation ci-dessous est vérifiable en lisant le fichier cité ou en lançant la commande indiquée.
 
 ---
@@ -59,7 +59,27 @@ cargo run --bin pdf-cli -- render pdf-core/tests/fixtures/image_smask.pdf /tmp/o
 ```
 produit un PNG où un carré rouge cramoisi **semi-transparent** (`/SMask`, alpha ~128/255) recouvre un rectangle bleu opaque : la zone de recouvrement est un vrai mélange (violet), pas un rouge plein ni un bleu plein — vérifié visuellement et par assertions de pixels.
 
-**Tests :** 63 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
+```bash
+cargo test --workspace -- clip
+```
+vérifie que le clip (`W`/`W*`) restreint réellement la zone peinte au rendu (`pdf-render`) et que les clips imbriqués s'intersectent puis se restaurent correctement à `Q` (`pdf-core`).
+
+```bash
+cargo test -p pdf-app
+```
+vérifie l'état de session (`pdf-app::Session`) : ouverture de fichier, comptage de pages, navigation avec bornes (`goto_page`/`next_page`/`prev_page` ne dépassent jamais `[0, page_count)`), rendu RGBA de la page courante.
+
+```bash
+cargo run --bin pdf-cli -- text pdf-core/tests/fixtures/multipage_classic_xref.pdf 2
+```
+affiche `Page 3 - Hello, PDF Manager!` — texte extrait par `pdf-text::extract_text` depuis la `DisplayList` de la page 2 (0-based), pas juste concaténé comme dans `render-info` (gère les sauts de ligne).
+
+```bash
+cargo test -p pdf-app -- repeated_renders_of_the_same_page_and_scale_reuse_the_cache
+```
+vérifie que `Session::render_page` réutilise le même `Rc<RenderedPage>` (identité de pointeur) pour deux appels avec le même `(page, échelle)`, mais pas pour une échelle différente.
+
+**Tests :** 84 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
 
 ---
 
@@ -71,23 +91,40 @@ produit un PNG où un carré rouge cramoisi **semi-transparent** (`/SMask`, alph
 | Récupération d'erreur | Reconstruction par balayage d'octets si xref corrompue/absente, avec repli sur recherche d'un `/Type /Catalog` | Testé sur un seul fichier corrompu artificiellement, pas sur un corpus de corruptions variées |
 | Filtres de flux | FlateDecode, ASCIIHex, ASCII85, LZWDecode, DCTDecode (JPEG, `zune-jpeg`), prédicteurs PNG (types 0-4) et TIFF | Pas de CCITTFaxDecode, JBIG2Decode, JPXDecode |
 | Arbre des pages | Parcours récursif `/Pages`→`/Kids`, héritage Resources/MediaBox/Rotate, garde anti-cycle | — |
-| Contenu | ~40 opérateurs : état graphique, chemins, texte, couleur, Form XObjects (récursif, garde de profondeur) | Clip (`W`/`W*`) signalé mais pas appliqué ; patterns/shadings ignorés ; contenu marqué ignoré |
+| Contenu | ~40 opérateurs : état graphique, chemins, texte, couleur, Form XObjects (récursif, garde de profondeur), **clip (`W`/`W*`) suivi et appliqué** (intersection des clips imbriqués, restauré par `Q`) | Patterns/shadings ignorés ; contenu marqué ignoré |
 | Police — largeurs | `/Widths`+`/FirstChar` ; repli sur table AFM Helvetica intégrée si absent | Les 13 autres polices standard (Times, Courier...) n'ont pas de table dédiée, retombent sur une largeur par défaut arbitraire (500/1000 em) |
 | Police — encodage | `WinAnsiEncoding`/`StandardEncoding` complets (256 codes) + `/Differences` via un sous-ensemble de l'Adobe Glyph List | `/ToUnicode` (CMap dédié, souvent plus précis) n'est pas lu ; `MacRomanEncoding` est approximé par WinAnsi au-delà de l'ASCII |
 | Police — contours | Polices **TrueType intégrées** (`/FontFile2`) et **CFF/Type1C intégrées** (`/FontFile3`, sous-types `Type1C` via `ttf_parser::cff::Table` brut, ou `OpenType` via `ttf_parser::Face`) ; repli cmap Macintosh par code brut si pas de cmap Unicode (TrueType) ou encodage CFF natif par code brut (CFF) ; **substitution système macOS** pour les polices standard non intégrées : Helvetica/Times/Courier/Symbol/ZapfDingbats + alias Arial, sélection de la face gras/italique dans les `.ttc`, cache global des fichiers | Type1 (`/FontFile`, format historique pré-CFF) : aucun contour. Substitution par lecture directe de `/System/Library/Fonts` (chemins macOS codés en dur, pas via l'API Core Text) — non portable en l'état |
-| Rendu | Chemins (fill/stroke/fill+stroke, nonzero/even-odd, courbes de Bézier), glyphes (intégrés **et** substitués), **images décodées avec canal alpha** (JPEG, échantillons bruts 8 bits, `/SMask`), prémultiplication automatique pour `tiny-skia`, conversion Gray/RGB/CMYK | Pas d'application du clip, pas de GPU |
+| Rendu | Chemins (fill/stroke/fill+stroke, nonzero/even-odd, courbes de Bézier), glyphes (intégrés **et** substitués), **images décodées avec canal alpha** (JPEG, échantillons bruts 8 bits, `/SMask`), prémultiplication automatique pour `tiny-skia`, conversion Gray/RGB/CMYK, **clip (`W`/`W*`) appliqué** à tous les types d'items (chemins, glyphes, images) via un masque `tiny_skia::Mask` mis en cache par chaîne de clip | Pas de GPU |
 | Images | `DCTDecode` (JPEG) via `zune-jpeg` ; interprétation `/ColorSpace` DeviceGray/RGB/CMYK et `ICCBased` (approximé par `/N`, sans le profil ICC) à 8 bits/composante ; **canal alpha via `/SMask`** (décodé récursivement, rééchantillonné au plus proche voisin si les dimensions diffèrent) ; dessinées à la bonne position/orientation/transparence dans `pdf-render` | Pas de CCITT/JBIG2/JPX, pas d'espaces `Indexed`/`Separation`/`Lab`, pas de 1/2/4/16 bits, pas de `/Mask` (masque de détourage, différent de `/SMask`) |
-| Interface graphique (`pdf-ui`) | Fenêtre `egui`/`eframe` fonctionnelle : ouverture de fichier (dialogue natif `rfd`), navigation page suivante/précédente, zoom par re-rasterisation (`pdf_render::render_page_scaled`). Vérifié visuellement par capture d'écran sur un fixture réel | Parle directement à `pdf-core`/`pdf-render`, contourne `pdf-app` (toujours un stub) ; pas de menus macOS natifs, pas de raccourcis clavier, pas de miniatures/recherche, pas de packaging `.app` |
+| Interface graphique (`pdf-ui`) | Fenêtre `egui`/`eframe` fonctionnelle : ouverture de fichier (dialogue natif `rfd`), navigation page suivante/précédente, zoom par re-rasterisation (boutons **et** molette+Ctrl/pincement trackpad via `egui::InputState::zoom_delta`), recherche texte plein document **avec surlignage jaune translucide** des occurrences sur la page affichée, **panneau de miniatures** cliquables (`egui::SidePanel`, une par page, rendues à petite échelle et mises en cache). Parle à `pdf-app::Session` (état de session : document, page courante, rendu RGBA, recherche) plutôt que directement à `pdf-core`/`pdf-render`. Vérifié visuellement par capture d'écran sur un fixture réel | Pas de menus macOS natifs, pas de raccourcis clavier, pas de sélection de texte à la souris, pas de panneau signets/plan, pas de scroll continu entre pages, pas de packaging `.app` |
+| Session applicative (`pdf-app`) | `Session::open`/`page_count`/`page_index`/`goto_page`/`next_page`/`prev_page`/`render_current_page`/`render_page`/`extract_current_page_text`/`find_pages_containing`/`find_matches_on_current_page`/`current_page_media_box` — ouverture de fichier, navigation avec bornes, rendu RGBA agnostique du backend (`RenderedPage`, `Rc`-partagé), extraction/recherche/surlignage de texte, **cache de rendu bitmap** (`render_cache`, FIFO 32 entrées, clé `(page, échelle)`) et **cache de texte** (`text_cache`) par page : une page déjà rastérisée ou déjà extraite n'est jamais recalculée pour les mêmes paramètres. Testé unitairement (10 tests, fixture réelle, dont un qui vérifie l'identité de pointeur du cache de rendu) | Pas d'historique undo/redo (`EditOp`, Sprint 13-14), pas de multi-documents/onglets, pas d'intégration avec `pdf-edit`, cache de rendu FIFO simple (pas de vraie éviction LRU) |
+| Extraction de texte (`pdf-text`) | `extract_text(&DisplayList) -> String` et `extract_page_text(&DisplayList) -> PageText` (texte + position par caractère) : concatène les glyphes résolus en Unicode dans l'ordre d'émission, insère un saut de ligne quand la ligne de base saute de plus de la moitié de la taille de police (`transform.d`/`transform.e`/`transform.f`). `PageText::find_matches` renvoie un rectangle englobant (fusionné) par occurrence de recherche, utilisé par `pdf-app`/`pdf-ui` pour le surlignage. Testé (8 tests, dont un sur fixture réel) | Pas de reconstruction par blocs/colonnes, largeur de glyphe approximée (`hauteur_police * 0.6`, pas la vraie largeur — `DisplayItem::Glyph` n'expose pas `/Widths` en sortie), repliement de casse caractère par caractère (pas correct pour les scripts non latins à casse multi-caractères), hérite des limites de résolution Unicode de `pdf-core::font` (pas de `/ToUnicode`, pas de polices composites) |
 | Polices composites | Détection de `/Type0` (`Font::is_composite()`) | Aucune gestion réelle : codes 2 octets, `/DescendantFonts`, `/W` CID — tout retombe sur le comportement placeholder (pas d'Unicode, largeur par défaut) |
+
+---
+
+## 2bis. Grille de conformité PDF (niveaux de compatibilité)
+
+Plutôt que de viser d'emblée un « rendu pixel-perfect de n'importe quel PDF », il est plus utile de suivre la progression par niveaux de complexité croissante. Cette grille reformule ce qui est déjà documenté en §1/§2 sous forme de suivi explicite.
+
+| Niveau | Fonctionnalités | Statut |
+|---|---|---|
+| **1 — de base** | DeviceGray/RGB/CMYK, chemins (fill/stroke, nonzero/even-odd, Bézier), TrueType/CFF intégrés, JPEG (DCTDecode) + FlateDecode/LZW, texte horizontal, transparence simple (`/SMask`), clip `W`/`W*` | ✅ Fait (voir §1, §2) |
+| **2 — intermédiaire** | Type0/CID + CMaps, Type1 historique (`/FontFile`), `/ToUnicode`, blend modes, Form XObjects avec groupes de transparence, `Indexed`/`Separation` | ❌ Pas fait |
+| **3 — avancé** | Type 3, ICCBased (profil réel, pas juste `/N`), DeviceN, shadings, patterns, groupes de transparence isolés, CCITT/JBIG2/JPX | ❌ Pas fait |
+
+Cette grille sert de repère pour prioriser : le projet est solidement niveau 1, et la prochaine valeur significative (polices composites, `/ToUnicode`) se situe en début de niveau 2.
 
 ---
 
 ## 3. Ce qui n'existe pas du tout
 
 - **Chrome natif macOS** (menus système, raccourcis, glisser-déposer, Quick Look, packaging `.app`/`.dmg`) : aucun. Le prototype `pdf-ui` (voir §2) est une fenêtre `egui`/`eframe` générique, pas une app macOS packagée.
-- **Logique applicative** (`pdf-app`) : stub vide. Pas d'état de session, pas de undo/redo.
+- **Logique applicative** (`pdf-app`) : porte désormais l'état de session (voir §2), mais toujours pas de undo/redo ni d'intégration avec `pdf-edit`.
 - **Édition** (`pdf-edit`) : stub vide. Aucune des opérations de la section 7 de architecture.md (pages, annotations, formulaires, texte) n'est implémentée.
-- **Extraction de texte structurée** (`pdf-text`) : stub vide (à ce stade, la résolution Unicode des glyphes vit directement dans `pdf-core`, pas encore dans une couche `pdf-text` dédiée à la reconstruction mots/lignes/blocs).
+- **Extraction de texte par blocs/colonnes** (façon `pdftotext -layout`) : `pdf-text` fait maintenant une reconstruction linéaire avec sauts de ligne heuristiques et des rectangles de position par caractère (voir §2), mais pas de détection de colonnes/tableaux.
+- **Panneau signets/plan** (`/Outlines`) : aucun. Le panneau miniatures existe (voir §2) mais pas de lecture de la table des matières du PDF.
 - **Décodage d'images** : CCITT, JBIG2, JPX — aucun (JPEG fait, voir §2).
 - **Chiffrement PDF** (`/Encrypt`), signatures numériques, PDF/A.
 - **Packaging macOS** : pas de `.app`, pas de `.dmg`, pas de signature/notarisation.
@@ -111,8 +148,15 @@ C'est **loin** du corpus « plusieurs centaines de PDF variés » visé par le c
 
 ## 5. Prochaines étapes logiques (par ordre de valeur/effort)
 
-1. **Corpus de test large** — condition pour véritablement clore la Phase 1/2 et détecter les régressions sur des cas réels variés.
-2. **`pdf-app`** — faire porter l'état de session (document ouvert, undo/redo) par la couche applicative plutôt que par `pdf-ui` directement, pour permettre ensuite le chrome natif macOS (`objc2`/`cacao`) sans dupliquer la logique.
-3. **Application du clip (`W`/`W*`)** — actuellement signalé dans la DisplayList (`sets_clip`) mais jamais appliqué au rendu.
+1. **Corpus de test large** — condition pour véritablement clore la Phase 1/2 et détecter les régressions sur des cas réels variés. Seul point de la liste bloqué (outillage Python indisponible dans cet environnement pour générer des PDF de test variés).
+2. ~~`pdf-app` porte l'état de session~~ — fait (voir §2) ; reste à y ajouter l'historique undo/redo quand `pdf-edit` sera implémenté (Sprint 13-14).
+3. ~~Application du clip (`W`/`W*`)~~ — fait (voir §1, §2).
+4. ~~Recherche texte (`pdf-text`) avec surlignage~~ — fait (voir §2) : reconstruction linéaire, recherche plein document, surlignage des occurrences sur la page affichée.
+5. ~~Cache du texte et du rendu bitmap par page~~ — fait (voir §2, `Session::text_cache`/`render_cache`).
+6. ~~Molette+pincement trackpad pour le zoom~~ — fait (voir §2, `egui::InputState::zoom_delta`).
+7. ~~Panneau miniatures~~ — fait (voir §2, `pdf-ui` `SidePanel`).
+8. **Sprint 9-10 restant** — back-end GPU `wgpu` (tessellation `lyon`, atlas de glyphes), scroll continu entre pages, panneau signets/plan (`/Outlines`), sélection de texte à la souris.
+
+**Note de découpage (pas une action immédiate) :** `pdf-core` regroupe aujourd'hui lexer, xref, document, interpréteur de contenu et polices. Si ce crate devient difficile à naviguer à mesure qu'il grossit, envisager de le scinder en `pdf-syntax` (lexer/parser/xref bas niveau, sans notion de Page/Font) et `pdf-document` (catalogue/pages/resources) — mais seulement à ce moment-là. Vu la taille actuelle du corpus (8 fixtures) et l'état stub de `pdf-edit`/`pdf-text` en tant que couches dédiées, un découpage préventif ajouterait de la friction sans bénéfice mesurable pour l'instant.
 
 Pour le contexte produit (pourquoi ce projet, contraintes, décisions à trancher), voir [architecture.md §1](./architecture.md#1-objectif-et-périmètre) et [§12](./architecture.md#12-points-à-trancher-avec-le-développeur-avant-le-démarrage).

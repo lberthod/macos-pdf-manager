@@ -9,6 +9,7 @@ fn print_usage() {
     eprintln!("usage: pdf-cli dump <file.pdf>");
     eprintln!("       pdf-cli render-info <file.pdf> [page_index]");
     eprintln!("       pdf-cli render <file.pdf> <out.png> [page_index]");
+    eprintln!("       pdf-cli text <file.pdf> [page_index]");
 }
 
 fn main() -> ExitCode {
@@ -22,6 +23,10 @@ fn main() -> ExitCode {
         Some("render") => args.get(2).zip(args.get(3)).map(|(path, out)| {
             let page_index: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             run_render(path, out, page_index)
+        }),
+        Some("text") => args.get(2).map(|path| {
+            let page_index: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            run_text(path, page_index)
         }),
         _ => None,
     };
@@ -158,5 +163,17 @@ fn run_render(path: &str, out_path: &str, page_index: usize) -> pdf_core::Result
         pixmap.width(),
         pixmap.height()
     );
+    Ok(())
+}
+
+/// Extrait le texte d'une page (Sprint 9-10 : préalable à la recherche
+/// texte) via `pdf-text::extract_text` sur la `DisplayList` interprétée.
+fn run_text(path: &str, page_index: usize) -> pdf_core::Result<()> {
+    let doc = read_document(path)?;
+    let page = doc.page(page_index)?;
+    let content = doc.page_content(&page)?;
+    let display = Interpreter::run_page(&doc, page.resources.clone(), &content)?;
+
+    println!("{}", pdf_text::extract_text(&display));
     Ok(())
 }

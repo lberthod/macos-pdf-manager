@@ -13,15 +13,19 @@
 //!   `DCTDecode`/JPEG et échantillons bruts 8 bits DeviceGray/RGB/CMYK,
 //!   canal alpha via `/SMask` prémultiplié ici avant rendu ; pas de
 //!   CCITT/JBIG2/JPX).
-//! - Le clip (`sets_clip`) n'est pas appliqué.
+//! - Le clip (`W`/`W*`, porté par `DisplayItem::*::clip`) est appliqué via un
+//!   masque `tiny_skia::Mask` rastérisé par intersection des clips imbriqués.
 //! - Espaces colorimétriques : conversion CMYK -> RGB naïve (sans profil ICC).
 
+use std::rc::Rc;
+
 use pdf_core::display::{
-    Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+    ClipStack, Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp,
+    PathSegment,
 };
 use tiny_skia::{
-    Color as SkiaColor, FillRule as SkiaFillRule, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
-    PixmapRef, Stroke, Transform,
+    Color as SkiaColor, FillRule as SkiaFillRule, Mask, Paint, Path, PathBuilder, Pixmap,
+    PixmapPaint, PixmapRef, Stroke, Transform,
 };
 
 /// Rasterise une page entière en se basant sur son `MediaBox`
@@ -57,6 +61,24 @@ fn render_to_pixmap(
     let mut pixmap = Pixmap::new(width, height)?;
     pixmap.fill(SkiaColor::WHITE);
 
+    // Les clips imbriqués sont partagés (Rc) entre de nombreux items
+    // consécutifs (tous les glyphes d'une ligne de texte, typiquement) ;
+    // on évite de rastériser un nouveau masque à chaque item en réutilisant
+    // celui du dernier `ClipStack` vu (comparé par pointeur).
+    let mut mask_cache: Option<(*const Vec<pdf_core::display::ClipPath>, Option<Mask>)> = None;
+    let mut mask_for = |clip: &Option<ClipStack>| -> Option<Mask> {
+        let clip = clip.as_ref()?;
+        let ptr = Rc::as_ptr(clip);
+        if let Some((cached_ptr, cached_mask)) = &mask_cache {
+            if *cached_ptr == ptr {
+                return cached_mask.clone();
+            }
+        }
+        let mask = build_clip_mask(clip, width, height, origin_x, origin_y_top, scale);
+        mask_cache = Some((ptr, mask.clone()));
+        mask
+    };
+
     for item in &display.items {
         if let DisplayItem::Path {
             segments,
@@ -65,12 +87,14 @@ fn render_to_pixmap(
             fill_color,
             stroke_color,
             line_width,
+            clip,
             ..
         } = item
         {
             let Some(path) = build_path(segments, origin_x, origin_y_top, scale) else {
                 continue;
             };
+            let mask = mask_for(clip);
 
             if matches!(paint, PaintOp::Fill | PaintOp::FillStroke) {
                 let mut paint_fill = Paint::default();
@@ -80,7 +104,13 @@ fn render_to_pixmap(
                     FillRule::NonZero => SkiaFillRule::Winding,
                     FillRule::EvenOdd => SkiaFillRule::EvenOdd,
                 };
-                pixmap.fill_path(&path, &paint_fill, rule, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &paint_fill,
+                    rule,
+                    Transform::identity(),
+                    mask.as_ref(),
+                );
             }
 
             if matches!(paint, PaintOp::Stroke | PaintOp::FillStroke) {
@@ -91,12 +121,19 @@ fn render_to_pixmap(
                     width: ((*line_width).max(0.1) * scale) as f32,
                     ..Default::default()
                 };
-                pixmap.stroke_path(&path, &paint_stroke, &stroke, Transform::identity(), None);
+                pixmap.stroke_path(
+                    &path,
+                    &paint_stroke,
+                    &stroke,
+                    Transform::identity(),
+                    mask.as_ref(),
+                );
             }
         } else if let DisplayItem::Glyph {
             outline: Some(segments),
             transform,
             color,
+            clip,
             ..
         } = item
         {
@@ -104,6 +141,7 @@ fn render_to_pixmap(
             else {
                 continue;
             };
+            let mask = mask_for(clip);
             let mut paint_fill = Paint::default();
             paint_fill.set_color(to_skia_color(*color));
             paint_fill.anti_alias = true;
@@ -112,21 +150,65 @@ fn render_to_pixmap(
                 &paint_fill,
                 SkiaFillRule::Winding,
                 Transform::identity(),
-                None,
+                mask.as_ref(),
             );
         } else if let DisplayItem::Image {
             pixels: Some(image),
             transform,
+            clip,
             ..
         } = item
         {
-            draw_image(&mut pixmap, image, transform, origin_x, origin_y_top, scale);
+            let mask = mask_for(clip);
+            draw_image(
+                &mut pixmap,
+                image,
+                transform,
+                origin_x,
+                origin_y_top,
+                scale,
+                mask.as_ref(),
+            );
         }
         // DisplayItem::Glyph sans contour et DisplayItem::Image sans pixels
         // décodés : non rendus, voir limitations en tête de module.
     }
 
     Some(pixmap)
+}
+
+/// Rastérise l'intersection d'une chaîne de clips imbriqués (`W`/`W*`) en un
+/// masque `tiny_skia` : le premier chemin initialise le masque, les suivants
+/// l'intersectent (`Mask::intersect_path`). `None` si aucun chemin de la
+/// chaîne ne se rastérise (chemin vide) — dégrade alors en "pas de clip"
+/// plutôt que de bloquer tout le rendu.
+fn build_clip_mask(
+    clip: &[pdf_core::display::ClipPath],
+    width: u32,
+    height: u32,
+    origin_x: f64,
+    origin_y_top: f64,
+    scale: f64,
+) -> Option<Mask> {
+    let mut mask: Option<Mask> = None;
+    for clip_path in clip {
+        let Some(path) = build_path(&clip_path.segments, origin_x, origin_y_top, scale) else {
+            continue;
+        };
+        let rule = match clip_path.fill_rule {
+            FillRule::NonZero => SkiaFillRule::Winding,
+            FillRule::EvenOdd => SkiaFillRule::EvenOdd,
+        };
+        match &mut mask {
+            None => {
+                let mut m = Mask::new(width, height)?;
+                m.fill_path(&path, rule, true, Transform::identity());
+                mask = Some(m);
+            }
+            Some(m) => m.intersect_path(&path, rule, true, Transform::identity()),
+        }
+    }
+    mask
 }
 
 /// Dessine une image déjà décodée en RGBA8. `transform` positionne le carré
@@ -141,6 +223,7 @@ fn draw_image(
     origin_x: f64,
     origin_y_top: f64,
     scale: f64,
+    mask: Option<&Mask>,
 ) {
     if image.width == 0 || image.height == 0 {
         return;
@@ -174,7 +257,7 @@ fn draw_image(
         total.f as f32,
     );
 
-    pixmap.draw_pixmap(0, 0, src, &PixmapPaint::default(), skia_transform, None);
+    pixmap.draw_pixmap(0, 0, src, &PixmapPaint::default(), skia_transform, mask);
 }
 
 /// Convertit du RGBA8 "straight" en prémultiplié (format attendu par
@@ -344,6 +427,7 @@ mod tests {
                 stroke_color: Color::default(),
                 line_width: 1.0,
                 sets_clip: false,
+                clip: None,
             }],
         }
     }
@@ -431,6 +515,7 @@ mod tests {
                 resource: "Im0".into(),
                 transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
                 pixels: Some(image),
+                clip: None,
             }],
         };
         let pixmap = render_page(&display, [0.0, 0.0, 100.0, 100.0]).unwrap();
@@ -439,6 +524,58 @@ mod tests {
         assert_eq!((left.red(), left.green(), left.blue()), (255, 0, 0));
         let right = pixmap.pixel(75, 50).unwrap();
         assert_eq!((right.red(), right.green(), right.blue()), (0, 0, 255));
+    }
+
+    /// Un rectangle noir couvrant toute la page, mais peint sous un clip
+    /// 10..50 (`W`/`W*`) : seule cette zone doit être noire, le reste doit
+    /// rester blanc — preuve que le masque de clip est réellement appliqué,
+    /// pas juste signalé.
+    #[test]
+    fn clip_restricts_painted_area_to_the_clip_path() {
+        use pdf_core::display::ClipPath;
+
+        let clip_rect = vec![
+            PathSegment::MoveTo((10.0, 10.0)),
+            PathSegment::LineTo((50.0, 10.0)),
+            PathSegment::LineTo((50.0, 50.0)),
+            PathSegment::LineTo((10.0, 50.0)),
+            PathSegment::ClosePath,
+        ];
+        let clip = Some(Rc::new(vec![ClipPath {
+            segments: clip_rect,
+            fill_rule: FillRule::NonZero,
+        }]));
+
+        let display = DisplayList {
+            items: vec![DisplayItem::Path {
+                segments: vec![
+                    PathSegment::MoveTo((0.0, 0.0)),
+                    PathSegment::LineTo((100.0, 0.0)),
+                    PathSegment::LineTo((100.0, 100.0)),
+                    PathSegment::LineTo((0.0, 100.0)),
+                    PathSegment::ClosePath,
+                ],
+                paint: PaintOp::Fill,
+                fill_rule: FillRule::NonZero,
+                fill_color: Color::Gray(0.0),
+                stroke_color: Color::default(),
+                line_width: 1.0,
+                sets_clip: false,
+                clip,
+            }],
+        };
+        let pixmap = render_page(&display, [0.0, 0.0, 100.0, 100.0]).unwrap();
+
+        // Centre de la zone de clip (10..50, 10..50) -> doit être peint noir.
+        let inside = pixmap.pixel(30, 100 - 30).unwrap();
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (0, 0, 0));
+
+        // Hors du clip -> doit être resté blanc malgré le rectangle plein page.
+        let outside = pixmap.pixel(80, 100 - 80).unwrap();
+        assert_eq!(
+            (outside.red(), outside.green(), outside.blue()),
+            (255, 255, 255)
+        );
     }
 
     #[test]
@@ -482,6 +619,7 @@ mod tests {
                 resource: "Im0".into(),
                 transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
                 pixels: Some(image),
+                clip: None,
             }],
         };
         let pixmap = render_page(&display, [0.0, 0.0, 100.0, 100.0]).unwrap();

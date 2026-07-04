@@ -3,6 +3,8 @@
 //! d'opérateurs PDF. Consommée par le futur rendu (`pdf-render`) et
 //! l'extraction de texte (`pdf-text`).
 
+use std::rc::Rc;
+
 /// Matrice de transformation affine PDF, convention vecteur-ligne :
 /// `[x' y' 1] = [x y 1] * [[a b 0][c d 0][e f 1]]`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,6 +96,21 @@ pub enum PathSegment {
     ClosePath,
 }
 
+/// Un chemin de clip (segments déjà en espace page, transformés par la CTM
+/// au moment de `W`/`W*`) accompagné de sa règle de remplissage. Une
+/// `DisplayItem` peut porter une chaîne de plusieurs `ClipPath` (clips
+/// imbriqués) : la zone effective est leur **intersection**.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipPath {
+    pub segments: Vec<PathSegment>,
+    pub fill_rule: FillRule,
+}
+
+/// Chaîne de clips actifs au moment où l'item a été émis (voir `ClipPath`) ;
+/// `Rc` pour partager la même chaîne entre les nombreux items peints sous le
+/// même état de clip sans la recopier.
+pub type ClipStack = Rc<Vec<ClipPath>>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayItem {
     Path {
@@ -104,9 +121,13 @@ pub enum DisplayItem {
         stroke_color: Color,
         line_width: f64,
         /// Le chemin délimite aussi la zone de clip courante (opérateur
-        /// `W`/`W*`) — l'application réelle du clip est laissée au rendu
-        /// (Sprint 7+, voir sprint.md).
+        /// `W`/`W*`) — n'affecte que les items *suivants* (voir `clip`),
+        /// pas ce chemin lui-même (sémantique PDF : le nouveau clip prend
+        /// effet après le prochain opérateur de peinture).
         sets_clip: bool,
+        /// Clip actif appliqué à cet item lui-même (hérité de l'état
+        /// graphique au moment de son émission ; `None` = pas de clip).
+        clip: Option<ClipStack>,
     },
     /// Un glyphe positionné. `code` est le code de caractère brut tel
     /// qu'il apparaît dans la chaîne du flux de contenu. `unicode` est
@@ -129,6 +150,7 @@ pub enum DisplayItem {
         color: Color,
         advance_is_estimated: bool,
         outline: Option<Vec<PathSegment>>,
+        clip: Option<ClipStack>,
     },
     /// XObject image. `pixels` est `None` si le décodage a échoué ou si le
     /// format n'est pas supporté (`CCITTFaxDecode`, `JBIG2Decode`,
@@ -138,6 +160,7 @@ pub enum DisplayItem {
         resource: String,
         transform: Matrix,
         pixels: Option<DecodedImage>,
+        clip: Option<ClipStack>,
     },
 }
 

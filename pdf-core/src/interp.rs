@@ -8,12 +8,19 @@
 //!   `font::Font` ; repli sur l'avance placeholder et `unicode: None`
 //!   (`DisplayItem::Glyph::advance_is_estimated` le signale).
 //! - `/ToUnicode` n'est pas lu (seul `/Encoding`+`/Differences` l'est).
-//! - Le clip (`W`/`W*`) est signalé (`sets_clip`) mais pas appliqué.
+//! - Le clip (`W`/`W*`) est suivi dans l'état graphique (intersection des
+//!   clips imbriqués, sauvegardé/restauré par `q`/`Q`) et propagé à chaque
+//!   `DisplayItem` émis ensuite ; son application effective au rendu se
+//!   trouve dans `pdf-render`.
 //! - Les patterns, shadings et le contenu marqué sont ignorés.
 //! - Les images XObject ne sont pas décodées (position seulement).
 
+use std::rc::Rc;
+
 use crate::content::{parse_content_stream, ContentInstruction};
-use crate::display::{Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
+use crate::display::{
+    ClipPath, ClipStack, Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+};
 use crate::document::Document;
 use crate::error::Result;
 use crate::font::Font;
@@ -34,6 +41,10 @@ struct GraphicsState {
     font: Option<String>,
     font_size: f64,
     text_rise: f64,
+    /// Chaîne de clips actifs (intersection) — `None` = pas de clip. Fait
+    /// partie de l'état graphique : sauvegardé/restauré par `q`/`Q` comme le
+    /// reste de `GraphicsState`.
+    clip: Option<ClipStack>,
 }
 
 impl Default for GraphicsState {
@@ -50,6 +61,7 @@ impl Default for GraphicsState {
             font: None,
             font_size: 0.0,
             text_rise: 0.0,
+            clip: None,
         }
     }
 }
@@ -68,7 +80,7 @@ pub struct Interpreter<'a> {
     current_path: Vec<PathSegment>,
     current_point: (f64, f64),
     subpath_start: (f64, f64),
-    pending_clip: bool,
+    pending_clip: Option<FillRule>,
     text_matrix: Matrix,
     text_line_matrix: Matrix,
     resources_stack: Vec<Dictionary>,
@@ -85,7 +97,7 @@ impl<'a> Interpreter<'a> {
             current_path: Vec::new(),
             current_point: (0.0, 0.0),
             subpath_start: (0.0, 0.0),
-            pending_clip: false,
+            pending_clip: None,
             text_matrix: Matrix::IDENTITY,
             text_line_matrix: Matrix::IDENTITY,
             resources_stack: vec![resources],
@@ -190,8 +202,11 @@ impl<'a> Interpreter<'a> {
                 self.subpath_start = (x, y);
             }
 
-            // Clip.
-            "W" | "W*" => self.pending_clip = true,
+            // Clip : la sémantique PDF (ISO 32000-1 §8.5.4) veut que le
+            // nouveau clip prenne effet seulement après le prochain
+            // opérateur de peinture (souvent `n`, qui ne peint rien).
+            "W" => self.pending_clip = Some(FillRule::NonZero),
+            "W*" => self.pending_clip = Some(FillRule::EvenOdd),
 
             // Peinture de chemin.
             "S" => self.paint_path(PaintOp::Stroke, FillRule::NonZero),
@@ -337,20 +352,35 @@ impl<'a> Interpreter<'a> {
     }
 
     fn paint_path(&mut self, paint: PaintOp, fill_rule: FillRule) {
-        let sets_clip = self.pending_clip;
+        let clip_rule = self.pending_clip;
+        let sets_clip = clip_rule.is_some();
         if (paint != PaintOp::None || sets_clip) && !self.current_path.is_empty() {
+            let segments = std::mem::take(&mut self.current_path);
+            // Le nouveau clip (s'il y en a un) doit intersecter les clips déjà
+            // actifs, mais ne s'applique qu'aux items *suivants* — celui-ci
+            // est donc peint avec le clip *avant* mise à jour.
+            let clip_before = self.gs.clip.clone();
+            if let Some(rule) = clip_rule {
+                let mut stack: Vec<ClipPath> = self.gs.clip.as_deref().cloned().unwrap_or_default();
+                stack.push(ClipPath {
+                    segments: segments.clone(),
+                    fill_rule: rule,
+                });
+                self.gs.clip = Some(Rc::new(stack));
+            }
             self.display.items.push(DisplayItem::Path {
-                segments: std::mem::take(&mut self.current_path),
+                segments,
                 paint,
                 fill_rule,
                 fill_color: self.gs.fill_color,
                 stroke_color: self.gs.stroke_color,
                 line_width: self.gs.line_width,
                 sets_clip,
+                clip: clip_before,
             });
         }
         self.current_path.clear();
-        self.pending_clip = false;
+        self.pending_clip = None;
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
@@ -394,6 +424,7 @@ impl<'a> Interpreter<'a> {
                 color: self.gs.fill_color,
                 advance_is_estimated,
                 outline,
+                clip: self.gs.clip.clone(),
             });
 
             let word_spacing = if code == b' ' {
@@ -445,6 +476,7 @@ impl<'a> Interpreter<'a> {
                     resource: name.clone(),
                     transform: self.gs.ctm,
                     pixels,
+                    clip: self.gs.clip.clone(),
                 });
             }
             Some("Form") => {
@@ -659,6 +691,93 @@ mod tests {
                 assert_eq!(*fill_color, Color::Rgb(1.0, 0.0, 0.0));
             }
             other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clip_operator_attaches_clip_only_to_subsequent_items() {
+        // `W n` fixe un clip 10..50 sans rien peindre ; le rectangle peint
+        // ensuite doit porter ce clip, pas l'inverse.
+        let content = "10 10 40 40 re W n 0 0 0 rg 0 0 100 100 re f";
+        let (doc, resources) = doc_with_page(content);
+        let display = Interpreter::run_page(&doc, resources, content.as_bytes()).unwrap();
+
+        // `W n` seul ne produit pas de path peint mais un `sets_clip`+paint=None.
+        let clip_setter = display
+            .items
+            .iter()
+            .find(|i| {
+                matches!(
+                    i,
+                    DisplayItem::Path {
+                        sets_clip: true,
+                        ..
+                    }
+                )
+            })
+            .expect("expected a clip-setting path");
+        if let DisplayItem::Path { clip, .. } = clip_setter {
+            assert!(
+                clip.is_none(),
+                "the clip-setting item itself has no clip yet"
+            );
+        }
+
+        let filled = display
+            .items
+            .iter()
+            .find(|i| {
+                matches!(
+                    i,
+                    DisplayItem::Path {
+                        paint: PaintOp::Fill,
+                        ..
+                    }
+                )
+            })
+            .expect("expected the filled rect");
+        if let DisplayItem::Path { clip, .. } = filled {
+            let clip = clip.as_ref().expect("filled rect should carry the clip");
+            assert_eq!(clip.len(), 1);
+            assert_eq!(clip[0].fill_rule, FillRule::NonZero);
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn nested_clips_intersect_and_restore_on_q() {
+        // Clip 0..50 imbriqué avec un clip 20..80 : le rectangle peint à
+        // l'intérieur des deux doit porter une chaîne de 2 clips ; après `Q`,
+        // le rectangle suivant ne doit plus porter que le premier clip.
+        let content = "0 0 50 50 re W n q 20 20 60 60 re W n 0 0 0 rg 0 0 100 100 re f Q 0 0 0 rg 0 0 1 1 re f";
+        let (doc, resources) = doc_with_page(content);
+        let display = Interpreter::run_page(&doc, resources, content.as_bytes()).unwrap();
+
+        let fills: Vec<&DisplayItem> = display
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    DisplayItem::Path {
+                        paint: PaintOp::Fill,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(fills.len(), 2);
+
+        if let DisplayItem::Path { clip, .. } = fills[0] {
+            assert_eq!(clip.as_ref().unwrap().len(), 2);
+        } else {
+            unreachable!();
+        }
+        if let DisplayItem::Path { clip, .. } = fills[1] {
+            assert_eq!(clip.as_ref().unwrap().len(), 1);
+        } else {
+            unreachable!();
         }
     }
 

@@ -4,5 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "pdf-ui"
+path = "src/main.rs"
+
 [dependencies]
-pdf-app = { workspace = true }
+pdf-core = { workspace = true }
+pdf-render = { workspace = true }
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"

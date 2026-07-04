@@ -25,12 +25,24 @@ use tiny_skia::{
 
 /// Rasterise une page entière en se basant sur son `MediaBox`
 /// (`[x0, y0, x1, y1]`, ISO 32000-1 §7.7.3.3) : la taille du pixmap suit la
-/// largeur/hauteur du MediaBox en points PDF (1 pixel = 1 point ; le zoom
-/// est laissé à l'appelant via un futur paramètre d'échelle, voir sprint.md).
+/// largeur/hauteur du MediaBox en points PDF (1 pixel = 1 point). Équivalent
+/// à `render_page_scaled(display, media_box, 1.0)`.
 pub fn render_page(display: &DisplayList, media_box: [f64; 4]) -> Option<Pixmap> {
-    let width = (media_box[2] - media_box[0]).round().max(1.0) as u32;
-    let height = (media_box[3] - media_box[1]).round().max(1.0) as u32;
-    render_to_pixmap(display, width, height, media_box[0], media_box[3])
+    render_page_scaled(display, media_box, 1.0)
+}
+
+/// Comme `render_page`, avec un facteur d'échelle (zoom) : `scale = 2.0`
+/// produit un pixmap deux fois plus grand, re-rasterisé à cette résolution
+/// (pas un agrandissement d'image a posteriori — plus net à l'écran).
+pub fn render_page_scaled(
+    display: &DisplayList,
+    media_box: [f64; 4],
+    scale: f64,
+) -> Option<Pixmap> {
+    let scale = scale.max(0.01);
+    let width = ((media_box[2] - media_box[0]) * scale).round().max(1.0) as u32;
+    let height = ((media_box[3] - media_box[1]) * scale).round().max(1.0) as u32;
+    render_to_pixmap(display, width, height, media_box[0], media_box[3], scale)
 }
 
 fn render_to_pixmap(
@@ -39,6 +51,7 @@ fn render_to_pixmap(
     height: u32,
     origin_x: f64,
     origin_y_top: f64,
+    scale: f64,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
     pixmap.fill(SkiaColor::WHITE);
@@ -54,7 +67,7 @@ fn render_to_pixmap(
             ..
         } = item
         {
-            let Some(path) = build_path(segments, origin_x, origin_y_top) else {
+            let Some(path) = build_path(segments, origin_x, origin_y_top, scale) else {
                 continue;
             };
 
@@ -74,7 +87,7 @@ fn render_to_pixmap(
                 paint_stroke.set_color(to_skia_color(*stroke_color));
                 paint_stroke.anti_alias = true;
                 let stroke = Stroke {
-                    width: (*line_width).max(0.1) as f32,
+                    width: ((*line_width).max(0.1) * scale) as f32,
                     ..Default::default()
                 };
                 pixmap.stroke_path(&path, &paint_stroke, &stroke, Transform::identity(), None);
@@ -86,7 +99,8 @@ fn render_to_pixmap(
             ..
         } = item
         {
-            let Some(path) = build_glyph_path(segments, transform, origin_x, origin_y_top) else {
+            let Some(path) = build_glyph_path(segments, transform, origin_x, origin_y_top, scale)
+            else {
                 continue;
             };
             let mut paint_fill = Paint::default();
@@ -105,7 +119,7 @@ fn render_to_pixmap(
             ..
         } = item
         {
-            draw_image(&mut pixmap, image, transform, origin_x, origin_y_top);
+            draw_image(&mut pixmap, image, transform, origin_x, origin_y_top, scale);
         }
         // DisplayItem::Glyph sans contour et DisplayItem::Image sans pixels
         // décodés : non rendus, voir limitations en tête de module.
@@ -125,6 +139,7 @@ fn draw_image(
     transform: &Matrix,
     origin_x: f64,
     origin_y_top: f64,
+    scale: f64,
 ) {
     if image.width == 0 || image.height == 0 {
         return;
@@ -141,7 +156,7 @@ fn draw_image(
         0.0,
         1.0,
     );
-    let page_flip = Matrix::new(1.0, 0.0, 0.0, -1.0, -origin_x, origin_y_top);
+    let page_flip = page_flip_matrix(origin_x, origin_y_top, scale);
     let total = pixel_to_unit_square.then(transform).then(&page_flip);
 
     let skia_transform = Transform::from_row(
@@ -156,10 +171,33 @@ fn draw_image(
     pixmap.draw_pixmap(0, 0, src, &PixmapPaint::default(), skia_transform, None);
 }
 
-fn build_path(segments: &[PathSegment], origin_x: f64, origin_y_top: f64) -> Option<Path> {
+/// Matrice PDF (page, origine bas-gauche) -> pixmap (origine haut-gauche),
+/// avec mise à l'échelle du zoom incluse.
+fn page_flip_matrix(origin_x: f64, origin_y_top: f64, scale: f64) -> Matrix {
+    Matrix::new(
+        scale,
+        0.0,
+        0.0,
+        -scale,
+        -origin_x * scale,
+        origin_y_top * scale,
+    )
+}
+
+fn build_path(
+    segments: &[PathSegment],
+    origin_x: f64,
+    origin_y_top: f64,
+    scale: f64,
+) -> Option<Path> {
     // Espace utilisateur PDF (origine bas-gauche, Y vers le haut) -> espace
-    // pixmap (origine haut-gauche, Y vers le bas).
-    let flip = |(x, y): (f64, f64)| ((x - origin_x) as f32, (origin_y_top - y) as f32);
+    // pixmap (origine haut-gauche, Y vers le bas), zoom inclus.
+    let flip = |(x, y): (f64, f64)| {
+        (
+            ((x - origin_x) * scale) as f32,
+            ((origin_y_top - y) * scale) as f32,
+        )
+    };
 
     let mut pb = PathBuilder::new();
     let mut has_segment = false;
@@ -199,10 +237,14 @@ fn build_glyph_path(
     transform: &Matrix,
     origin_x: f64,
     origin_y_top: f64,
+    scale: f64,
 ) -> Option<Path> {
     let map = |p: (f64, f64)| {
         let (px, py) = transform.apply(p.0, p.1);
-        ((px - origin_x) as f32, (origin_y_top - py) as f32)
+        (
+            ((px - origin_x) * scale) as f32,
+            ((origin_y_top - py) * scale) as f32,
+        )
     };
 
     let mut pb = PathBuilder::new();
@@ -303,6 +345,18 @@ mod tests {
             (outside.red(), outside.green(), outside.blue()),
             (255, 255, 255)
         );
+    }
+
+    #[test]
+    fn scaled_render_produces_larger_pixmap_with_same_content() {
+        let display = rect_display(Color::Rgb(1.0, 0.0, 0.0));
+        let pixmap = render_page_scaled(&display, [0.0, 0.0, 100.0, 100.0], 2.0).unwrap();
+        assert_eq!(pixmap.width(), 200);
+        assert_eq!(pixmap.height(), 200);
+        // Le centre du rectangle (device (50,50) à l'échelle 1) doit être à
+        // (100,100) à l'échelle 2.
+        let center = pixmap.pixel(100, 100).unwrap();
+        assert_eq!((center.red(), center.green(), center.blue()), (255, 0, 0));
     }
 
     #[test]

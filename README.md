@@ -24,12 +24,12 @@ Workspace Cargo multi-crates :
 | Crate | Rôle | État |
 |---|---|---|
 | `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices, filtres | Fonctionnel sur un sous-ensemble réel (voir STATUS.md) |
-| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels + glyphes (intégrés et substitués système) | Fonctionnel, partiel (pas d'images, pas de clip) |
+| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels, glyphes (intégrés et substitués système), images (JPEG + échantillons bruts) | Fonctionnel, partiel (pas de clip, pas d'alpha) |
 | `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`) | Fonctionnel |
+| `pdf-ui` | Prototype de viewer (`egui`/`eframe`) : ouverture, navigation, zoom | Fonctionnel, minimal (pas de chrome natif macOS, voir STATUS.md) |
 | `pdf-text` | Extraction / analyse / réécriture de la couche texte | Stub vide |
 | `pdf-edit` | Opérations d'édition, journal, undo/redo | Stub vide |
 | `pdf-app` | Logique applicative, état, contrôleur | Stub vide |
-| `pdf-ui` | Interface graphique macOS | Stub vide |
 
 ## Essayer
 
@@ -45,6 +45,9 @@ cargo run --bin pdf-cli -- render-info chemin/vers/fichier.pdf 0
 
 # Rasteriser une page en PNG
 cargo run --bin pdf-cli -- render chemin/vers/fichier.pdf sortie.png 0
+
+# Ouvrir le prototype de viewer graphique
+cargo run --bin pdf-ui -- chemin/vers/fichier.pdf
 ```
 
 Fixtures de test disponibles dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)).
@@ -65,4 +68,4 @@ Fixtures de test disponibles dans [pdf-core/tests/fixtures/](./pdf-core/tests/fi
 
 ## Statut
 
-Phases 0-1 (fondations + parsing du cœur) fonctionnellement complètes sur un corpus de test modeste (5 fixtures réels). Phase 2 (rendu) partiellement avancée : rendu vectoriel et rendu de texte (polices TrueType intégrées) tous deux validés visuellement de bout en bout. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.
+Phases 0-1 (fondations + parsing du cœur) fonctionnellement complètes sur un corpus de test modeste (6 fixtures réels). Phase 2 (rendu) bien avancée : rendu vectoriel, texte (intégré + substitué système) et images JPEG tous validés visuellement de bout en bout, avec un premier prototype de viewer graphique (`pdf-ui`) fonctionnel en avance de phase. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.

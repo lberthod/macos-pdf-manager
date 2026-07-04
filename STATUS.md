@@ -1,6 +1,6 @@
 # État précis du projet
 
-**Dernière mise à jour :** 2026-07-04 (substitution de police système ajoutée)
+**Dernière mise à jour :** 2026-07-04 (décodage JPEG + prototype UI egui ajoutés)
 **But de ce document :** donner une image exacte et vérifiable de ce qui fonctionne, de ce qui est simulé (placeholder), et de ce qui n'existe pas encore — par opposition à [architecture.md](./architecture.md) (la cible) et [sprint.md](./sprint.md) (le plan). Chaque affirmation ci-dessous est vérifiable en lisant le fichier cité ou en lançant la commande indiquée.
 
 ---
@@ -44,7 +44,12 @@ cargo run --bin pdf-cli -- render pdf-core/tests/fixtures/image_jpeg.pdf /tmp/ou
 ```
 produit un PNG où une photo JPEG intégrée (filtres chaînés `ASCII85Decode`+`DCTDecode`) est dessinée à la bonne position, taille et orientation.
 
-**Tests :** 53 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
+```bash
+cargo run --bin pdf-ui -- pdf-core/tests/fixtures/image_jpeg.pdf
+```
+ouvre une **vraie fenêtre native** (prototype `egui`/`eframe`) affichant la page rendue, avec navigation page suivante/précédente et zoom (re-rasterisation, pas un agrandissement d'image) — vérifié visuellement par capture d'écran.
+
+**Tests :** 54 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
 
 ---
 
@@ -62,13 +67,14 @@ produit un PNG où une photo JPEG intégrée (filtres chaînés `ASCII85Decode`+
 | Police — contours | Polices **TrueType intégrées** (`/FontFile2`) via `ttf-parser` (repli cmap Macintosh par code brut si pas de cmap Unicode) ; **substitution système macOS** pour les polices standard non intégrées : Helvetica/Times/Courier/Symbol/ZapfDingbats + alias Arial, sélection de la face gras/italique dans les `.ttc`, cache global des fichiers | CFF/Type1C (`/FontFile3`), Type1 (`/FontFile`) : aucun contour. Substitution par lecture directe de `/System/Library/Fonts` (chemins macOS codés en dur, pas via l'API Core Text) — non portable en l'état |
 | Rendu | Chemins (fill/stroke/fill+stroke, nonzero/even-odd, courbes de Bézier), glyphes (intégrés **et** substitués), **images décodées** (JPEG et échantillons bruts 8 bits), conversion Gray/RGB/CMYK | Pas d'application du clip, pas de GPU, pas de canal alpha (`/SMask`) sur les images |
 | Images | `DCTDecode` (JPEG) via `zune-jpeg` ; interprétation `/ColorSpace` DeviceGray/RGB/CMYK et `ICCBased` (approximé par `/N`, sans le profil ICC) à 8 bits/composante ; dessinées à la bonne position/orientation dans `pdf-render` | Pas de CCITT/JBIG2/JPX, pas d'espaces `Indexed`/`Separation`/`Lab`, pas de 1/2/4/16 bits, pas de `/SMask` ni `/Mask` |
+| Interface graphique (`pdf-ui`) | Fenêtre `egui`/`eframe` fonctionnelle : ouverture de fichier (dialogue natif `rfd`), navigation page suivante/précédente, zoom par re-rasterisation (`pdf_render::render_page_scaled`). Vérifié visuellement par capture d'écran sur un fixture réel | Parle directement à `pdf-core`/`pdf-render`, contourne `pdf-app` (toujours un stub) ; pas de menus macOS natifs, pas de raccourcis clavier, pas de miniatures/recherche, pas de packaging `.app` |
 | Polices composites | Détection de `/Type0` (`Font::is_composite()`) | Aucune gestion réelle : codes 2 octets, `/DescendantFonts`, `/W` CID — tout retombe sur le comportement placeholder (pas d'Unicode, largeur par défaut) |
 
 ---
 
 ## 3. Ce qui n'existe pas du tout
 
-- **Interface graphique** (`pdf-ui`) : fichier stub vide. Aucun prototype `egui`, aucun chrome natif macOS.
+- **Chrome natif macOS** (menus système, raccourcis, glisser-déposer, Quick Look, packaging `.app`/`.dmg`) : aucun. Le prototype `pdf-ui` (voir §2) est une fenêtre `egui`/`eframe` générique, pas une app macOS packagée.
 - **Logique applicative** (`pdf-app`) : stub vide. Pas d'état de session, pas de undo/redo.
 - **Édition** (`pdf-edit`) : stub vide. Aucune des opérations de la section 7 de architecture.md (pages, annotations, formulaires, texte) n'est implémentée.
 - **Extraction de texte structurée** (`pdf-text`) : stub vide (à ce stade, la résolution Unicode des glyphes vit directement dans `pdf-core`, pas encore dans une couche `pdf-text` dédiée à la reconstruction mots/lignes/blocs).
@@ -94,8 +100,8 @@ C'est **loin** du corpus « plusieurs centaines de PDF variés » visé par le c
 ## 5. Prochaines étapes logiques (par ordre de valeur/effort)
 
 1. **Corpus de test large** — condition pour véritablement clore la Phase 1/2 et détecter les régressions sur des cas réels variés.
-2. **Prototype UI (`egui`)** — premier pas vers une application utilisable, même minimale.
-3. **Contours CFF/Type1C (`/FontFile3`)** — deuxième format de police intégrée le plus courant après TrueType.
-4. **`/SMask` (canal alpha)** — nécessaire pour les images avec transparence, assez fréquentes (logos, captures d'écran).
+2. **Contours CFF/Type1C (`/FontFile3`)** — deuxième format de police intégrée le plus courant après TrueType.
+3. **`/SMask` (canal alpha)** — nécessaire pour les images avec transparence, assez fréquentes (logos, captures d'écran).
+4. **`pdf-app`** — faire porter l'état de session (document ouvert, undo/redo) par la couche applicative plutôt que par `pdf-ui` directement, pour permettre ensuite le chrome natif macOS (`objc2`/`cacao`) sans dupliquer la logique.
 
 Pour le contexte produit (pourquoi ce projet, contraintes, décisions à trancher), voir [architecture.md §1](./architecture.md#1-objectif-et-périmètre) et [§12](./architecture.md#12-points-à-trancher-avec-le-développeur-avant-le-démarrage).

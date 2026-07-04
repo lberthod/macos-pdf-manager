@@ -177,21 +177,30 @@ Un échec de décodage (format non supporté, dimensions incohérentes) ne fait 
 
 `render_page(&DisplayList, media_box)` rasterise via `tiny-skia` :
 
-- **Dimension** : 1 point PDF = 1 pixel (le zoom viendra plus tard), taille = MediaBox.
+- **Dimension** : `render_page` fait 1 point PDF = 1 pixel ; `render_page_scaled(display, media_box, scale)` re-rasterise à `scale` fois cette résolution (utilisé pour le zoom dans `pdf-ui` — pas un agrandissement d'image a posteriori, la page est réinterprétée à la résolution demandée).
 - **Inversion d'axe** : l'espace PDF a l'origine en **bas-gauche**, Y vers le haut ; le pixmap a l'origine en haut-gauche. Tous les points passent par `flip`.
 - **Chemins** : `fill_path`/`stroke_path` avec la règle de remplissage PDF correspondante (nonzero → Winding, even-odd → EvenOdd), anti-aliasing activé.
 - **Glyphes** : le contour em-normalisé est transformé par la matrice du glyphe (`transform.apply`) puis rempli. Pas de hinting, pas d'atlas — correct d'abord, rapide ensuite (le GPU/wgpu est prévu Phase 3).
 - **Images** : le bitmap RGBA8 décodé est composé de trois transformations enchaînées (`Matrix::then`) : pixel→carré unité (mise à l'échelle + inversion, la ligne 0 des données étant le *haut* de l'image), carré unité→espace page (`DisplayItem::Image::transform`, la CTM au moment du `Do`), puis page→pixmap (le même flip que les chemins). Le tout est converti en `tiny_skia::Transform` et passé à `draw_pixmap`.
 - **Couleurs** : Gray/RGB directs ; CMYK converti naïvement (`(1-c)(1-k)`...) sans profil ICC.
 
-## 12. Ce qu'il faut savoir avant de contribuer
+## 12. Interface graphique ([pdf-ui/src/main.rs](../pdf-ui/src/main.rs))
+
+Prototype `egui`/`eframe` — le pipeline `Document::open → page → page_content → Interpreter::run_page → pdf_render::render_page_scaled` tourne à chaque frame où la page ou le zoom courant a changé (`ViewerApp::ensure_texture`, qui compare `(page_index, zoom_quantifié)` à ce qui a produit la texture affichée pour éviter de re-rasteriser inutilement).
+
+Points d'implémentation notables :
+- **Conversion Pixmap → texture egui** : `tiny_skia::Pixmap::data()` est passé tel quel à `egui::ColorImage::from_rgba_unmultiplied`. Ça fonctionne sans conversion premultiplied/straight parce que `render_to_pixmap` peint toujours sur un fond blanc **opaque** : après compositing "over" sur un fond d'alpha 1, le résultat a toujours alpha=255 partout, donc premultiplied et straight coïncident.
+- **Raccourci assumé** : ce prototype parle directement à `pdf-core`/`pdf-render`, en court-circuitant `pdf-app` (toujours un stub). C'est exactement ce que suggère architecture.md §8.1 ("commencer le prototype en egui pour valider les flux") ; à corriger quand `pdf-app` portera l'état de session partagé entre plusieurs fenêtres/documents.
+- **Ouverture de fichier** : dialogue natif via `rfd` (pas de dépendance GTK sur macOS, juste AppKit sous le capot).
+
+## 13. Ce qu'il faut savoir avant de contribuer
 
 - **Chaque limitation est documentée là où elle vit** : en tête de module (`//!`) et dans [STATUS.md](../STATUS.md). Si vous levez une limitation, mettez à jour les deux.
 - **Le corpus de test** ([pdf-core/tests/fixtures/](../pdf-core/tests/fixtures/)) est généré par script (reportlab + pikepdf, recette dans son README) — ne modifiez pas les `.pdf` à la main, les tests d'intégration en dépendent octet par octet (`include_bytes!`).
 - **CI** : `cargo fmt --check`, `clippy -D warnings`, `cargo test` sur `macos-latest` ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Le test de substitution système suppose macOS.
 - **Convention d'erreur** : jamais de panique sur un fichier malformé ; on dégrade (objet ignoré, reconstruction, placeholder signalé) ou on retourne un `PdfError` précis avec l'offset.
 
-## 13. Carte des fichiers
+## 14. Carte des fichiers
 
 ```
 pdf-core/src/
@@ -212,4 +221,6 @@ pdf-render/src/
   lib.rs        rasterisation tiny-skia (chemins + glyphes + images) → PNG
 pdf-cli/src/
   main.rs       dump / render-info / render
+pdf-ui/src/
+  main.rs       prototype egui/eframe : ouverture, navigation, zoom
 ```

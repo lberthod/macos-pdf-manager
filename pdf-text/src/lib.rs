@@ -42,6 +42,67 @@ impl PageText {
         &self.text
     }
 
+    /// Nombre de caractères (`text().chars().count()`), pour borner les
+    /// plages passées à `text_in_range`/`rects_in_range`.
+    pub fn char_count(&self) -> usize {
+        self.rects.len()
+    }
+
+    /// Indice du caractère le plus proche de `point` (espace page PDF),
+    /// pour la sélection de texte à la souris : d'abord un caractère dont
+    /// le rectangle contient exactement `point`, sinon le plus proche par
+    /// distance au centre du rectangle. `None` si la page n'a aucun
+    /// caractère positionné (page vide ou entièrement non résolue).
+    pub fn char_index_at(&self, point: (f64, f64)) -> Option<usize> {
+        let (px, py) = point;
+        if let Some(index) = self
+            .rects
+            .iter()
+            .position(|r| r.is_some_and(|r| px >= r.x0 && px <= r.x1 && py >= r.y0 && py <= r.y1))
+        {
+            return Some(index);
+        }
+
+        self.rects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.map(|r| (i, r)))
+            .min_by(|(_, a), (_, b)| {
+                let dist = |r: &GlyphRect| {
+                    let cx = (r.x0 + r.x1) / 2.0;
+                    let cy = (r.y0 + r.y1) / 2.0;
+                    (px - cx).powi(2) + (py - cy).powi(2)
+                };
+                dist(a).total_cmp(&dist(b))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Sous-chaîne de `text()` correspondant à `range` (indices de
+    /// caractères, comme retournés par `char_index_at`).
+    pub fn text_in_range(&self, range: std::ops::Range<usize>) -> String {
+        self.text
+            .chars()
+            .skip(range.start)
+            .take(range.len())
+            .collect()
+    }
+
+    /// Rectangles (un par caractère positionné, non fusionnés — contrairement
+    /// à `find_matches` — pour rester corrects même si la plage traverse
+    /// plusieurs lignes) de `range`.
+    pub fn rects_in_range(&self, range: std::ops::Range<usize>) -> Vec<GlyphRect> {
+        let end = range.end.min(self.rects.len());
+        if range.start >= end {
+            return Vec::new();
+        }
+        self.rects[range.start..end]
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
     /// Rectangles englobants (un par occurrence, fusion des rectangles de
     /// chaque caractère de l'occurrence) de `query` dans le texte de la
     /// page, comparaison insensible à la casse. La casse est repliée
@@ -279,5 +340,56 @@ mod tests {
         assert_eq!(page_text.text(), "A\nB");
         let matches = page_text.find_matches("a\nb");
         assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn char_index_at_finds_exact_containing_char() {
+        let display = DisplayList {
+            items: vec![
+                glyph_at('H', 0.0, 700.0, 12.0),
+                glyph_at('i', 8.0, 700.0, 12.0),
+            ],
+        };
+        let page_text = extract_page_text(&display);
+        // Un point à l'intérieur du rectangle du 'i' (x0=8, largeur ~7.2, y0=700..709.6).
+        assert_eq!(page_text.char_index_at((9.0, 702.0)), Some(1));
+    }
+
+    #[test]
+    fn char_index_at_falls_back_to_nearest_when_no_exact_hit() {
+        let display = DisplayList {
+            items: vec![
+                glyph_at('H', 0.0, 700.0, 12.0),
+                glyph_at('i', 8.0, 700.0, 12.0),
+            ],
+        };
+        let page_text = extract_page_text(&display);
+        // Loin à droite : doit retomber sur le dernier caractère ('i').
+        assert_eq!(page_text.char_index_at((1000.0, 702.0)), Some(1));
+    }
+
+    #[test]
+    fn char_index_at_returns_none_for_a_page_with_no_positioned_char() {
+        let page_text = extract_page_text(&DisplayList::default());
+        assert_eq!(page_text.char_index_at((0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn text_and_rects_in_range_cover_a_selection() {
+        let display = DisplayList {
+            items: vec![
+                glyph_at('H', 0.0, 700.0, 12.0),
+                glyph_at('e', 8.0, 700.0, 12.0),
+                glyph_at('l', 16.0, 700.0, 12.0),
+                glyph_at('l', 24.0, 700.0, 12.0),
+                glyph_at('o', 32.0, 700.0, 12.0),
+            ],
+        };
+        let page_text = extract_page_text(&display);
+        assert_eq!(page_text.char_count(), 5);
+        assert_eq!(page_text.text_in_range(1..4), "ell");
+        assert_eq!(page_text.rects_in_range(1..4).len(), 3);
+        assert_eq!(page_text.text_in_range(10..20), "");
+        assert!(page_text.rects_in_range(10..20).is_empty());
     }
 }

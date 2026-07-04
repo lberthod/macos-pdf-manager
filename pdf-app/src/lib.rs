@@ -238,6 +238,34 @@ impl Session {
             .collect())
     }
 
+    /// Indice de caractère (page courante) le plus proche de `point` (espace
+    /// page PDF), pour la sélection de texte à la souris — voir
+    /// `pdf_text::PageText::char_index_at`.
+    pub fn char_index_at_on_current_page(
+        &self,
+        point: (f64, f64),
+    ) -> Result<Option<usize>, String> {
+        Ok(self.cached_page_text(self.page_index)?.char_index_at(point))
+    }
+
+    /// Texte et rectangles (espace page PDF, un par caractère, non fusionnés
+    /// contrairement à `find_matches_on_current_page`) de `range` sur la
+    /// page courante — utilisé pour surligner et copier une sélection de
+    /// texte à la souris.
+    pub fn selection_on_current_page(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<(String, Vec<MatchRect>), String> {
+        let page_text = self.cached_page_text(self.page_index)?;
+        let text = page_text.text_in_range(range.clone());
+        let rects = page_text
+            .rects_in_range(range)
+            .into_iter()
+            .map(MatchRect::from)
+            .collect();
+        Ok((text, rects))
+    }
+
     /// Retourne le texte (avec positions) de `index`, en le calculant et le
     /// mémorisant dans `text_cache` si c'est la première demande pour cette
     /// page.
@@ -495,6 +523,42 @@ mod tests {
         let session = Session::open(&path).unwrap();
 
         assert!(session.outline().unwrap().is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn selection_on_current_page_returns_the_requested_text_and_rects() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = Session::open(&path).unwrap();
+
+        // "Page 1 - Hello, PDF Manager!" -> "Hello" commence à l'indice 9.
+        let (text, rects) = session.selection_on_current_page(9..14).unwrap();
+        assert_eq!(text, "Hello");
+        assert_eq!(rects.len(), 5);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn char_index_at_on_current_page_hits_a_known_character() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = Session::open(&path).unwrap();
+
+        let (_, rects) = session.selection_on_current_page(0..1).unwrap();
+        let first_char_rect = rects[0];
+        let center = (
+            (first_char_rect.x0 + first_char_rect.x1) / 2.0,
+            (first_char_rect.y0 + first_char_rect.y1) / 2.0,
+        );
+        assert_eq!(
+            session.char_index_at_on_current_page(center).unwrap(),
+            Some(0)
+        );
 
         std::fs::remove_file(&path).ok();
     }

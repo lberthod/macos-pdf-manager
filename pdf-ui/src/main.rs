@@ -12,15 +12,20 @@
 //! d'occurrence en occurrence page par page **avec surlignage** des
 //! résultats sur la page affichée (`Session::find_matches_on_current_page`),
 //! panneau de miniatures cliquables et panneau de signets (`/Outlines`,
-//! `Session::outline`) pour naviguer directement à une page, et un mode
+//! `Session::outline`) pour naviguer directement à une page, un mode
 //! **défilement continu** (`egui::ScrollArea::show_rows`, virtualisé : seules
 //! les pages proches de la zone visible sont rastérisées) qui affiche
-//! toutes les pages empilées verticalement au lieu d'une à la fois.
+//! toutes les pages empilées verticalement au lieu d'une à la fois, et la
+//! **sélection de texte à la souris** (glisser sur la page en mode page
+//! unique, via `Session::char_index_at_on_current_page`/
+//! `selection_on_current_page`) avec copie dans le presse-papiers (bouton
+//! ou ⌘C).
 //!
 //! Non géré (voir STATUS.md) : onglets/multi-documents, annotations,
-//! sélection de texte à la souris, raccourcis clavier au-delà des boutons.
-//! Limitation du défilement continu : la hauteur de ligne est calculée une
-//! fois sur la page 0 (documents à pages de tailles hétérogènes mal gérés).
+//! raccourcis clavier au-delà des boutons/⌘C, sélection de texte en mode
+//! défilement continu (page unique seulement). Limitation du défilement
+//! continu : la hauteur de ligne est calculée une fois sur la page 0
+//! (documents à pages de tailles hétérogènes mal gérés).
 
 use eframe::egui;
 use pdf_app::Session;
@@ -33,6 +38,8 @@ const ZOOM_MAX: f32 = 4.0;
 const THUMBNAIL_SCALE: f64 = 0.15;
 /// Jaune translucide pour le surlignage des résultats de recherche.
 const HIGHLIGHT_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(90, 85, 10, 90);
+/// Bleu translucide pour la sélection de texte à la souris.
+const SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 60, 110, 90);
 
 fn main() -> eframe::Result<()> {
     eframe::run_native(
@@ -79,6 +86,16 @@ struct ViewerApp {
     /// consommé (mis à `None`) une fois appliqué pour ne pas entraver le
     /// défilement manuel de l'utilisateur ensuite.
     scroll_to_page: Option<usize>,
+    /// Page sur laquelle porte la sélection de texte courante — sert à
+    /// l'invalider si l'utilisateur change de page sans avoir relâché de
+    /// sélection (les indices de caractères n'ont de sens que par page).
+    selection_page: Option<usize>,
+    /// Indice de caractère où le glissement de sélection a commencé.
+    selection_anchor: Option<usize>,
+    /// Indice de caractère sous le pointeur pendant/après le glissement.
+    selection_cursor: Option<usize>,
+    selection_rects: Vec<pdf_app::MatchRect>,
+    selection_text: String,
 }
 
 impl ViewerApp {
@@ -102,6 +119,11 @@ impl ViewerApp {
             page_textures: HashMap::new(),
             page_textures_zoom_key: None,
             scroll_to_page: None,
+            selection_page: None,
+            selection_anchor: None,
+            selection_cursor: None,
+            selection_rects: Vec::new(),
+            selection_text: String::new(),
         };
         if let Some(p) = initial_path {
             app.open_path(PathBuf::from(p));
@@ -122,6 +144,11 @@ impl ViewerApp {
         self.page_textures.clear();
         self.page_textures_zoom_key = None;
         self.scroll_to_page = None;
+        self.selection_page = None;
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.selection_rects.clear();
+        self.selection_text.clear();
 
         match Session::open(path) {
             Ok(session) => self.session = Some(session),
@@ -290,6 +317,76 @@ impl ViewerApp {
             });
 
         clicked
+    }
+
+    /// Met à jour la sélection de texte à partir du glissement de souris sur
+    /// `response` (l'image de la page), et recalcule le texte/les
+    /// rectangles sélectionnés en conséquence. Invalide la sélection
+    /// précédente si la page affichée a changé entre-temps.
+    fn handle_text_selection(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) {
+        let Some(page_index) = self.session.as_ref().map(|s| s.page_index()) else {
+            return;
+        };
+        if self.selection_page != Some(page_index) {
+            self.selection_anchor = None;
+            self.selection_cursor = None;
+            self.selection_rects.clear();
+            self.selection_text.clear();
+            self.selection_page = Some(page_index);
+        }
+
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let point = screen_to_page(pos, response.rect, media_box, scale);
+                self.selection_anchor = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.char_index_at_on_current_page(point).ok().flatten());
+                self.selection_cursor = self.selection_anchor;
+            }
+        } else if response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let point = screen_to_page(pos, response.rect, media_box, scale);
+                self.selection_cursor = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.char_index_at_on_current_page(point).ok().flatten());
+            }
+        } else if response.clicked() {
+            // Simple clic (pas de glissement) : efface la sélection.
+            self.selection_anchor = None;
+            self.selection_cursor = None;
+        }
+
+        let range = match (self.selection_anchor, self.selection_cursor) {
+            (Some(a), Some(b)) if a != b => Some(a.min(b)..a.max(b) + 1),
+            _ => None,
+        };
+        match range {
+            Some(range) => match self
+                .session
+                .as_ref()
+                .map(|s| s.selection_on_current_page(range))
+            {
+                Some(Ok((text, rects))) => {
+                    self.selection_text = text;
+                    self.selection_rects = rects;
+                }
+                _ => {
+                    self.selection_text.clear();
+                    self.selection_rects.clear();
+                }
+            },
+            None => {
+                self.selection_text.clear();
+                self.selection_rects.clear();
+            }
+        }
     }
 
     /// Dessine le panneau de signets (table des matières) et retourne
@@ -467,6 +564,13 @@ impl eframe::App for ViewerApp {
                     }
                 });
 
+                if !self.selection_text.is_empty() {
+                    ui.separator();
+                    if ui.button("📋 Copier").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.selection_text.clone());
+                    }
+                }
+
                 if let Some(session) = &self.session {
                     ui.separator();
                     ui.label(
@@ -548,6 +652,15 @@ impl eframe::App for ViewerApp {
                 self.set_zoom(self.zoom * zoom_delta);
             }
 
+            // ⌘C/Ctrl+C : copie la sélection de texte courante, si non vide
+            // (egui traduit déjà le raccourci plateforme en `Event::Copy`).
+            if !self.selection_text.is_empty()
+                && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+            {
+                let text = self.selection_text.clone();
+                ctx.output_mut(|o| o.copied_text = text);
+            }
+
             if self.continuous_scroll {
                 self.show_continuous_scroll(ui, ctx);
                 return;
@@ -556,21 +669,42 @@ impl eframe::App for ViewerApp {
             self.ensure_texture(ctx);
             self.ensure_highlights();
 
-            if let Some(texture) = &self.texture {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    let response = ui.image(texture);
+            // Clonée (bon marché : `TextureHandle` est un handle partagé)
+            // pour ne pas garder de prêt sur `self.texture` pendant qu'on
+            // met à jour `self.selection_*` plus bas dans la même closure.
+            if let Some(texture) = self.texture.clone() {
+                let media_box = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.current_page_media_box().ok());
+                let scale = self.zoom as f64;
 
-                    if !self.highlight_rects.is_empty() {
-                        if let Some(session) = &self.session {
-                            if let Ok(media_box) = session.current_page_media_box() {
-                                draw_highlights(
-                                    ui,
-                                    &response,
-                                    &self.highlight_rects,
-                                    media_box,
-                                    self.zoom as f64,
-                                );
-                            }
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let response =
+                        ui.add(egui::Image::new(&texture).sense(egui::Sense::click_and_drag()));
+
+                    if let Some(media_box) = media_box {
+                        if !self.highlight_rects.is_empty() {
+                            draw_highlights(
+                                ui,
+                                &response,
+                                &self.highlight_rects,
+                                media_box,
+                                scale,
+                                HIGHLIGHT_COLOR,
+                            );
+                        }
+
+                        self.handle_text_selection(&response, media_box, scale);
+                        if !self.selection_rects.is_empty() {
+                            draw_highlights(
+                                ui,
+                                &response,
+                                &self.selection_rects,
+                                media_box,
+                                scale,
+                                SELECTION_COLOR,
+                            );
                         }
                     }
                 });
@@ -591,6 +725,7 @@ fn draw_highlights(
     rects: &[pdf_app::MatchRect],
     media_box: [f64; 4],
     scale: f64,
+    color: egui::Color32,
 ) {
     let origin_x = media_box[0];
     let origin_top = media_box[3];
@@ -604,6 +739,22 @@ fn draw_highlights(
             image_response.rect.min.x + ((rect.x1 - origin_x) * scale) as f32,
             image_response.rect.min.y + ((origin_top - rect.y0) * scale) as f32,
         );
-        painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, HIGHLIGHT_COLOR);
+        painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, color);
     }
+}
+
+/// Convertit une position écran (dans le repère de `image_rect`, le
+/// rectangle occupé par l'image de la page) en point d'espace page PDF —
+/// inverse de la transformation appliquée par `draw_highlights`.
+fn screen_to_page(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    media_box: [f64; 4],
+    scale: f64,
+) -> (f64, f64) {
+    let origin_x = media_box[0];
+    let origin_top = media_box[3];
+    let page_x = origin_x + (pos.x - image_rect.min.x) as f64 / scale;
+    let page_y = origin_top - (pos.y - image_rect.min.y) as f64 / scale;
+    (page_x, page_y)
 }

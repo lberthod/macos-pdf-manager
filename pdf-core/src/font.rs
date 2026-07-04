@@ -7,8 +7,16 @@
 //! - Polices composites (`/Type0`, CID, codes 2 octets) : non gérées, un
 //!   appelant doit détecter `Font::is_composite()` et garder son
 //!   comportement de repli.
-//! - `/ToUnicode` (CMap dédié, prioritaire sur l'encodage de base quand
-//!   présent) : non lu, seul `/Encoding` (+ `/Differences`) est utilisé.
+//! - `/ToUnicode` (CMap dédié, ISO 32000-1 §9.10.3) : lu et prioritaire sur
+//!   l'encodage de base (`base_encoding_by_name`/`/Differences`) quand
+//!   présent — voir `parse_to_unicode_cmap`. Gère `beginbfchar`/
+//!   `beginbfrange` (forme "base + décalage" et forme tableau explicite) ;
+//!   seuls les codes source tenant sur un octet (0..256) sont retenus,
+//!   cohérent avec le reste de ce module qui ne traite que les polices
+//!   simples. Les valeurs de destination multi-unités UTF-16 (paires de
+//!   substitution, plusieurs caractères) ne sont pas incrémentées dans une
+//!   plage `bfrange` : toute la plage reçoit alors la même valeur
+//!   (approximation rare en pratique).
 //! - Largeurs des polices standard non intégrées : seule Helvetica dispose
 //!   d'une table AFM complète (`HELVETICA_WIDTHS`) ; les 13 autres polices
 //!   standard retombent sur `DEFAULT_WIDTH`.
@@ -31,6 +39,7 @@ use crate::document::Document;
 use crate::encoding::{glyph_name_to_unicode, STANDARD_ENCODING, WIN_ANSI_ENCODING};
 use crate::error::Result;
 use crate::filters::decode_stream;
+use crate::lexer::{Lexer, Token};
 use crate::object::{Dictionary, Object};
 
 /// Avance de repli ultime (en millièmes d'em) quand ni `/Widths` ni la table
@@ -98,6 +107,22 @@ impl Font {
             if (0..256).contains(&code) {
                 if let Some(ch) = glyph_name_to_unicode(&name) {
                     encoding[code as usize] = Some(ch);
+                }
+            }
+        }
+
+        // `/ToUnicode` prime sur `/Encoding`+`/Differences` pour la
+        // résolution Unicode (ISO 32000-1 §9.10.3) : c'est la source
+        // explicitement destinée à l'extraction de texte, alors que
+        // `/Encoding` sert surtout à la sélection de glyphe.
+        if let Some(to_unicode_obj) = dict.get("ToUnicode") {
+            if let Ok(Object::Stream(stream)) = doc.get(to_unicode_obj) {
+                if let Ok(bytes) = decode_stream(&stream) {
+                    for (code, ch) in parse_to_unicode_cmap(&bytes).into_iter().enumerate() {
+                        if let Some(ch) = ch {
+                            encoding[code] = Some(ch);
+                        }
+                    }
                 }
             }
         }
@@ -405,6 +430,111 @@ fn number(obj: &Object) -> Option<f64> {
     }
 }
 
+/// Convertit un code source hexadécimal (`<...>`, 1 ou plusieurs octets) en
+/// entier, uniquement s'il tient dans `0..256` (seuls les codes 1 octet des
+/// polices simples nous intéressent ici).
+fn hex_to_code(bytes: &[u8]) -> Option<usize> {
+    let value = bytes.iter().fold(0u32, |acc, b| (acc << 8) | *b as u32);
+    (value < 256).then_some(value as usize)
+}
+
+/// Décode une valeur de destination `/ToUnicode` (UTF-16BE, éventuellement
+/// une paire de substitution) en son premier caractère.
+fn hex_to_char(bytes: &[u8]) -> Option<char> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    char::decode_utf16(units).next()?.ok()
+}
+
+/// Parse un CMap `/ToUnicode` (ISO 32000-1 §9.10.3) : blocs `beginbfchar`
+/// (mappings 1:1) et `beginbfrange` (plages contiguës, destination "base +
+/// décalage" ou tableau explicite). Le format est un sous-ensemble de la
+/// syntaxe PostScript ; les chaînes hexadécimales (`<...>`) et mots-clés se
+/// tokenisent comme de la syntaxe PDF standard, d'où la réutilisation du
+/// `Lexer` de `pdf-core` plutôt qu'un parseur dédié.
+fn parse_to_unicode_cmap(bytes: &[u8]) -> [Option<char>; 256] {
+    let mut map: [Option<char>; 256] = [None; 256];
+    let mut lexer = Lexer::new(bytes);
+
+    while let Ok(Some(token)) = lexer.next_token() {
+        match token {
+            Token::Keyword(kw) if kw == "beginbfchar" => {
+                while let Ok(Some(Token::HexString(src))) = lexer.next_token() {
+                    // `endbfchar` (ou fin de flux) : fin du bloc.
+                    let Ok(Some(Token::HexString(dst))) = lexer.next_token() else {
+                        break;
+                    };
+                    if let (Some(code), Some(ch)) = (hex_to_code(&src), hex_to_char(&dst)) {
+                        map[code] = Some(ch);
+                    }
+                }
+            }
+            Token::Keyword(kw) if kw == "beginbfrange" => {
+                while let Ok(Some(Token::HexString(lo))) = lexer.next_token() {
+                    // `endbfrange` (ou fin de flux) : fin du bloc.
+                    let Ok(Some(Token::HexString(hi))) = lexer.next_token() else {
+                        break;
+                    };
+                    let Ok(Some(dst_token)) = lexer.next_token() else {
+                        break;
+                    };
+                    let (Some(lo_code), Some(hi_code)) = (hex_to_code(&lo), hex_to_code(&hi))
+                    else {
+                        continue;
+                    };
+                    match dst_token {
+                        Token::HexString(base) => {
+                            let base_units: Vec<u16> = base
+                                .chunks_exact(2)
+                                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                                .collect();
+                            if let [unit] = base_units[..] {
+                                for (offset, slot) in
+                                    map.iter_mut().enumerate().take(hi_code + 1).skip(lo_code)
+                                {
+                                    let code_point =
+                                        (unit as u32).wrapping_add((offset - lo_code) as u32);
+                                    if let Some(ch) = char::from_u32(code_point) {
+                                        *slot = Some(ch);
+                                    }
+                                }
+                            } else if let Some(ch) =
+                                char::decode_utf16(base_units).next().and_then(|r| r.ok())
+                            {
+                                // Destination multi-unités : pas d'incrément
+                                // simple possible, toute la plage reçoit la
+                                // même valeur (voir limitation en tête de fichier).
+                                for slot in map.iter_mut().take(hi_code + 1).skip(lo_code) {
+                                    *slot = Some(ch);
+                                }
+                            }
+                        }
+                        Token::ArrayStart => {
+                            for slot in map.iter_mut().take(hi_code + 1).skip(lo_code) {
+                                match lexer.next_token() {
+                                    Ok(Some(Token::HexString(dst))) => {
+                                        if let Some(ch) = hex_to_char(&dst) {
+                                            *slot = Some(ch);
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            let _ = lexer.next_token(); // consomme le `]`.
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    map
+}
+
 fn base_encoding_by_name(name: &str) -> Option<[Option<char>; 256]> {
     match name {
         "WinAnsiEncoding" => Some(WIN_ANSI_ENCODING),
@@ -675,5 +805,86 @@ mod tests {
             .expect("expected a CFF outline for 'A' in the embedded STIX subset");
         assert!(!outline.is_empty());
         assert!(matches!(outline[0], PathSegment::MoveTo(_)));
+    }
+
+    #[test]
+    fn to_unicode_bfchar_overrides_base_encoding() {
+        let doc = dummy_doc();
+        let cmap = b"1 beginbfchar\n<41> <0042>\nendbfchar\n";
+        let to_unicode = Object::Stream(crate::object::Stream {
+            dict: Dictionary::new(),
+            raw_data: cmap.to_vec(),
+        });
+        let dict = font_dict(&[
+            ("Subtype", Object::Name("TrueType".into())),
+            ("Encoding", Object::Name("WinAnsiEncoding".into())),
+            ("ToUnicode", to_unicode),
+        ]);
+        let font = Font::load(&doc, &dict).unwrap();
+        // Sans /ToUnicode, code 0x41 ('A') résoudrait vers 'A' via WinAnsi ;
+        // le CMap le fait pointer vers 'B' à la place.
+        let (unicode, _) = font.decode_simple(0x41);
+        assert_eq!(unicode, Some('B'));
+    }
+
+    #[test]
+    fn to_unicode_bfrange_with_base_increments_across_the_range() {
+        let doc = dummy_doc();
+        let cmap = b"1 beginbfrange\n<01> <03> <0041>\nendbfrange\n";
+        let to_unicode = Object::Stream(crate::object::Stream {
+            dict: Dictionary::new(),
+            raw_data: cmap.to_vec(),
+        });
+        let dict = font_dict(&[
+            ("Subtype", Object::Name("TrueType".into())),
+            ("ToUnicode", to_unicode),
+        ]);
+        let font = Font::load(&doc, &dict).unwrap();
+        assert_eq!(font.decode_simple(0x01).0, Some('A'));
+        assert_eq!(font.decode_simple(0x02).0, Some('B'));
+        assert_eq!(font.decode_simple(0x03).0, Some('C'));
+    }
+
+    #[test]
+    fn to_unicode_bfrange_with_explicit_array() {
+        let doc = dummy_doc();
+        let cmap = b"1 beginbfrange\n<01> <02> [<0058> <0059>]\nendbfrange\n";
+        let to_unicode = Object::Stream(crate::object::Stream {
+            dict: Dictionary::new(),
+            raw_data: cmap.to_vec(),
+        });
+        let dict = font_dict(&[
+            ("Subtype", Object::Name("TrueType".into())),
+            ("ToUnicode", to_unicode),
+        ]);
+        let font = Font::load(&doc, &dict).unwrap();
+        assert_eq!(font.decode_simple(0x01).0, Some('X'));
+        assert_eq!(font.decode_simple(0x02).0, Some('Y'));
+    }
+
+    /// Bout en bout sur le fixture CJK réel : sans `/ToUnicode`, aucun
+    /// caractère n'était récupéré pour ce texte (voir STATUS.md, limitation
+    /// documentée avant l'ajout de ce parseur). Avec, le texte exact doit
+    /// être reconstruit.
+    #[test]
+    fn real_cjk_fixture_recovers_unicode_via_to_unicode_cmap() {
+        use crate::interp::Interpreter;
+        use crate::Document as CoreDocument;
+
+        let bytes = include_bytes!("../tests/fixtures/cjk_text.pdf").to_vec();
+        let doc = CoreDocument::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        let text: String = display
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::display::DisplayItem::Glyph { unicode, .. } => *unicode,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "你好，世界");
     }
 }

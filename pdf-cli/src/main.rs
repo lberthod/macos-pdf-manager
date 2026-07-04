@@ -118,7 +118,7 @@ fn run_render_info(path: &str, page_index: usize) -> pdf_core::Result<()> {
         })
         .collect();
     if !text.is_empty() {
-        println!("Recovered text (via /Encoding, no /ToUnicode yet): {text:?}");
+        println!("Recovered text (via /Encoding/Differences, /ToUnicode if present): {text:?}");
     }
     let estimated = display.items.iter().any(|item| {
         matches!(

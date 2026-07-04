@@ -13,9 +13,11 @@
 
 ## État actuel (voir [STATUS.md](./STATUS.md) pour le détail précis)
 
-Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu → rendu CPU en PNG, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType et CFF/Type1C **intégrées**, comme polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier...).
+Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu (chemins, texte, couleur, clip, Form XObjects) → rendu **CPU** (`tiny-skia`) **et GPU** (`wgpu`, en parité fonctionnelle) en PNG ou à l'écran, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType et CFF/Type1C **intégrées** (simples **et composites** `/Type0`/CID, `CIDFontType0` et `CIDFontType2`), polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier..., gras/italique), images JPEG (RGB et CMYK) avec canal alpha (`/SMask`).
 
-Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, l'UI graphique, les polices composites CJK, les images CCITT/JBIG2/JPX (le JPEG fonctionne). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
+Un premier **prototype de viewer graphique** (`pdf-ui`, `egui`/`eframe`) est fonctionnel : navigation, zoom, recherche texte avec surlignage, miniatures, panneau de signets, défilement continu, sélection de texte à la souris.
+
+Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, le chrome natif macOS (menus/raccourcis/packaging), Type1 historique (police pré-CFF), les images CCITT/JBIG2/JPX, le déchiffrement PDF (un PDF chiffré est détecté proprement mais jamais lu). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
 
 ## Structure du projet
 
@@ -23,13 +25,14 @@ Workspace Cargo multi-crates :
 
 | Crate | Rôle | État |
 |---|---|---|
-| `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices, filtres | Fonctionnel sur un sous-ensemble réel (voir STATUS.md) |
-| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels, glyphes (TrueType/CFF intégrés et substitués système), images (JPEG + échantillons bruts, canal alpha `/SMask`) | Fonctionnel, partiel (pas de clip) |
-| `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`) | Fonctionnel |
-| `pdf-ui` | Prototype de viewer (`egui`/`eframe`) : ouverture, navigation, zoom | Fonctionnel, minimal (pas de chrome natif macOS, voir STATUS.md) |
-| `pdf-text` | Extraction / analyse / réécriture de la couche texte | Stub vide |
-| `pdf-edit` | Opérations d'édition, journal, undo/redo | Stub vide |
-| `pdf-app` | Logique applicative, état, contrôleur | Stub vide |
+| `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices (simples et composites), filtres | Fonctionnel sur un sous-ensemble réel (voir STATUS.md) |
+| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels, glyphes (TrueType/CFF intégrés et substitués système), images (JPEG + échantillons bruts, canal alpha `/SMask`), clip, rotation | Fonctionnel, comparé pixel par pixel à un corpus de référence |
+| `pdf-render-gpu` | Rasterisation GPU (`wgpu` + `lyon`) : parité fonctionnelle avec `pdf-render`, branché dans `pdf-ui` avec repli automatique sur le CPU | Fonctionnel |
+| `pdf-text` | Extraction de texte avec position par caractère, recherche, sélection | Fonctionnel |
+| `pdf-app` | État de session (ouverture, navigation, rendu, recherche, cache) partagé entre `pdf-ui` et les futurs fronts | Fonctionnel |
+| `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`, `text`) | Fonctionnel |
+| `pdf-ui` | Prototype de viewer (`egui`/`eframe`) : ouverture, navigation, zoom, recherche, miniatures, signets, défilement continu, sélection de texte | Fonctionnel, minimal (pas de chrome natif macOS, voir STATUS.md) |
+| `pdf-edit` | Opérations d'édition, journal, undo/redo | Stub vide (Sprint 13-14+) |
 
 ## Essayer
 
@@ -46,26 +49,44 @@ cargo run --bin pdf-cli -- render-info chemin/vers/fichier.pdf 0
 # Rasteriser une page en PNG
 cargo run --bin pdf-cli -- render chemin/vers/fichier.pdf sortie.png 0
 
+# Extraire le texte d'une page
+cargo run --bin pdf-cli -- text chemin/vers/fichier.pdf 0
+
 # Ouvrir le prototype de viewer graphique
 cargo run --bin pdf-ui -- chemin/vers/fichier.pdf
 ```
 
-Fixtures de test disponibles dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)).
+Fixtures de test disponibles dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)) : 25 PDF réels et structurellement variés (rotation, chiffrement RC4/AES-256, CJK avec polices composites, formulaires, corruptions diverses, JPEG RGB/CMYK, PDF/A-like...).
+
+## Tests de rendu (comparaison pixel)
+
+En plus des tests unitaires classiques, deux suites comparent le rendu à une image de référence sous seuil de tolérance :
+
+```bash
+# Compare le rendu CPU (pdf-render) à une image de référence par fixture
+cargo test -p pdf-render --test golden
+
+# Compare le rendu CPU et le rendu GPU entre eux, sur les mêmes fixtures
+cargo test -p pdf-render-gpu --test cross_backend
+```
+
+Pour régénérer volontairement les images de référence après un changement de rendu voulu : `UPDATE_GOLDEN=1 cargo test -p pdf-render --test golden`.
 
 ## Documentation
 
 - [architecture.md](./architecture.md) — document d'architecture cible complet : principes, découpage en couches du moteur PDF, choix techniques, modèle de données, risques.
 - [sprint.md](./sprint.md) — plan de sprints dérivé de la roadmap par phases, coché sprint par sprint avec le statut réel de chaque item.
 - [STATUS.md](./STATUS.md) — état précis du projet à date : ce qui marche, ce qui est simulé/placeholder, ce qui manque, avec pointeurs vers le code.
+- [docs/EXPLICATION.md](./docs/EXPLICATION.md) — explication détaillée du fonctionnement interne du moteur, couche par couche.
 
 ## Choix techniques clés
 
 - **Rust natif**, workspace Cargo.
-- Codecs génériques implémentés : `flate2` (Flate), `zune-jpeg` (DCTDecode/JPEG), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison. Contours de glyphes via `ttf-parser` (TrueType uniquement pour l'instant). Rendu CPU via `tiny-skia` (chemins, glyphes, images). Le moteur « maison » se concentre sur la logique PDF (structure, contenu, rendu sémantique).
-- Codecs pas encore implémentés : CCITT, JBIG2, JPX.
-- UI : pas encore commencée (prototype `egui` prévu, puis chrome natif macOS via `objc2`/`cacao`).
+- Codecs génériques implémentés : `flate2` (Flate), `zune-jpeg` (DCTDecode/JPEG, RGB et CMYK), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison. Contours de glyphes via `ttf-parser` (TrueType et CFF/Type1C, polices simples et composites `/Type0`/CID). Rendu CPU via `tiny-skia`, rendu GPU via `wgpu`+`lyon` en parité fonctionnelle.
+- Codecs pas encore implémentés : CCITT, JBIG2, JPX. Police pas encore supportée : Type1 historique (`/FontFile`, pré-CFF).
+- UI : prototype `egui`/`eframe` fonctionnel ; chrome natif macOS (`objc2`) et packaging `.dmg` prévus Sprint 11-12.
 - Packaging : `cargo-bundle` + signature/notarisation Apple pour le `.dmg` — pas encore fait.
 
 ## Statut
 
-Phases 0-1 (fondations + parsing du cœur) fonctionnellement complètes sur un corpus de test modeste (6 fixtures réels). Phase 2 (rendu) bien avancée : rendu vectoriel, texte (intégré + substitué système) et images JPEG tous validés visuellement de bout en bout, avec un premier prototype de viewer graphique (`pdf-ui`) fonctionnel en avance de phase. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.
+Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu et sélection de texte. Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.

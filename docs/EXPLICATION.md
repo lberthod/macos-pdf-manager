@@ -161,7 +161,11 @@ C'est la couche qui transforme un **code de caractère brut** (un octet dans `(H
 
 Les contours sont émis en **espace em normalisé** (1.0 = taille de police) ; c'est le renderer qui applique `transform` (qui contient déjà taille × matrice texte × CTM).
 
-Ce qui n'est **pas** géré : polices composites `/Type0`/CID (codes 2 octets — CJK), `/ToUnicode`, Type1 historique (`/FontFile`, le format pré-CFF d'Adobe — rare aujourd'hui). Dans ces cas le pipeline dégrade proprement : glyphe sans contour (non dessiné), largeur placeholder signalée par `advance_is_estimated`.
+**`/ToUnicode`** (`parse_to_unicode_cmap`) est lu et prioritaire sur `/Encoding` quand présent : réutilise le `Lexer` de `pdf-core` pour tokeniser `beginbfchar`/`beginbfrange`, indispensable pour récupérer du texte CJK (les tables `WinAnsiEncoding`/`StandardEncoding` ne couvrent pas ces plages de code).
+
+**Polices composites (`/Type0`/CID)** sont gérées pour l'`/Encoding` `Identity-H`/`Identity-V` (code source 2 octets = CID directement, le cas de la quasi-totalité des `/Type0` réels) : `Font::decode_composite` découpe la chaîne en CIDs, `cid_metrics` résout Unicode (`/ToUnicode` grand format, `parse_to_unicode_cmap_wide`) et largeur (`/W`/`/DW`), et `cid_glyph_outline` résout le contour selon le sous-type du descendant — `/CIDFontType2` (TrueType) via `/CIDToGIDMap` puis `glyf` ; `/CIDFontType0` (CFF CID-keyed) via le charset interne de la table CFF elle-même (`ttf_parser::cff::Table::glyph_cid`, inversé une fois au chargement — `/CIDToGIDMap` ne s'applique pas à ce sous-type). `pdf-core::interp::show_text` détecte `Font::is_composite()` et itère par CID 2 octets plutôt que par octet.
+
+Ce qui n'est **toujours pas** géré : un `/Encoding` de police composite autre qu'Identity-H/V (CMap CJK prédéfini ou embarqué), et Type1 historique (`/FontFile`, le format pré-CFF d'Adobe — rare aujourd'hui, nécessiterait de décoder le chiffrement `eexec` et d'interpréter des charstrings différents de Type2/CFF). Dans ces cas le pipeline dégrade proprement : glyphe sans contour (non dessiné), largeur placeholder signalée par `advance_is_estimated`.
 
 ## 10. Images ([pdf-core/src/image.rs](../pdf-core/src/image.rs))
 
@@ -170,7 +174,9 @@ Une image XObject (`/Subtype /Image`) est décodée en deux temps, au moment de 
 1. **`filters::decode_stream`** décompresse le flux — pour `DCTDecode`, ça veut dire décoder le JPEG entier via `zune-jpeg`, qui renvoie des échantillons entrelacés (1 composante = niveaux de gris, 3 = RGB, 4 = CMYK selon le JPEG source).
 2. **`image::decode_image`** interprète ces octets à la lumière de `/ColorSpace` (`DeviceGray`/`DeviceRGB`/`DeviceCMYK`, `CalGray`/`CalRGB` traités pareil, `ICCBased` approximé par son nombre de composantes `/N` — le profil ICC lui-même n'est pas lu) et les convertit en RGBA8 (alpha toujours 255).
 
-Un échec de décodage (format non supporté, dimensions incohérentes) ne fait pas échouer toute la page : `do_xobject` capture l'erreur et pose `pixels: None`, que `pdf-render` traite comme « rien à dessiner ».
+Un échec de décodage (format non supporté, dimensions incohérentes) ne fait pas échouer toute la page : `do_xobject` capture l'erreur et pose `pixels: None`, que `pdf-render` traite comme « rien à dessiner » (voir le fixture `indexed_color_image.pdf`, qui exerce exactement cette dégradation gracieuse).
+
+**Piège rencontré en pratique (`cmyk_jpeg.pdf`)** : `zune-jpeg` convertit parfois un JPEG CMYK/YCCK en sortie RGB (3 composantes) plutôt que de préserver les 4 composantes déclarées par `/ColorSpace /DeviceCMYK` — la taille attendue calculée depuis le `/ColorSpace` ne correspondait alors plus à la taille réelle des octets décodés, et l'image échouait silencieusement. `decode_image` compare désormais la longueur réellement décodée à celle attendue par le `/ColorSpace` déclaré, et fait confiance à la disposition réelle des octets (3 composantes = RGB) quand les deux divergent.
 
 Le canal alpha (`/SMask`, masque de fondu en niveaux de gris) est géré : décodé récursivement comme une image `DeviceGray` à part entière, rééchantillonné au plus proche voisin si ses dimensions diffèrent de l'image principale, puis placé dans le canal alpha du RGBA8 straight (non prémultiplié) — c'est `pdf-render` qui prémultiplie avant de construire le pixmap `tiny-skia` (voir §11).
 
@@ -183,27 +189,48 @@ Le canal alpha (`/SMask`, masque de fondu en niveaux de gris) est géré : déco
 - **Dimension** : `render_page` fait 1 point PDF = 1 pixel ; `render_page_scaled(display, media_box, scale)` re-rasterise à `scale` fois cette résolution (utilisé pour le zoom dans `pdf-ui` — pas un agrandissement d'image a posteriori, la page est réinterprétée à la résolution demandée).
 - **Inversion d'axe** : l'espace PDF a l'origine en **bas-gauche**, Y vers le haut ; le pixmap a l'origine en haut-gauche. Tous les points passent par `flip`.
 - **Chemins** : `fill_path`/`stroke_path` avec la règle de remplissage PDF correspondante (nonzero → Winding, even-odd → EvenOdd), anti-aliasing activé.
-- **Glyphes** : le contour em-normalisé est transformé par la matrice du glyphe (`transform.apply`) puis rempli. Pas de hinting, pas d'atlas — correct d'abord, rapide ensuite (le GPU/wgpu est prévu Phase 3).
+- **Glyphes** : le contour em-normalisé est transformé par la matrice du glyphe (`transform.apply`) puis rempli. Pas de hinting, pas d'atlas côté CPU (voir `pdf-render-gpu` pour le cache de glyphes tessellés).
 - **Images** : le bitmap RGBA8 décodé est composé de trois transformations enchaînées (`Matrix::then`) : pixel→carré unité (mise à l'échelle + inversion, la ligne 0 des données étant le *haut* de l'image), carré unité→espace page (`DisplayItem::Image::transform`, la CTM au moment du `Do`), puis page→pixmap (le même flip que les chemins). Le tout est converti en `tiny_skia::Transform` et passé à `draw_pixmap`. Le RGBA fourni par `pdf-core` est **straight** (non prémultiplié) ; `premultiply_if_needed` le convertit avant `draw_pixmap` (`tiny-skia` attend du prémultiplié), sans copie dans le cas courant où l'image est entièrement opaque (pas de `/SMask`).
 - **Couleurs** : Gray/RGB directs ; CMYK converti naïvement (`(1-c)(1-k)`...) sans profil ICC.
+- **Clip (`W`/`W*`)** : appliqué via un masque `tiny_skia::Mask`, rastérisé par intersection des clips imbriqués (chaque `DisplayItem` porte sa propre `ClipStack`, construite par `interp.rs`) et mis en cache par chaîne de clip pour éviter de re-rastériser à chaque item (`build_clip_mask`).
+- **Rotation de page (`/Rotate`)** : `render_page_rotated` applique la rotation en aval de la rasterisation via une matrice (dimensions du pixmap permutées pour 90°/270°), pas nativement par `tiny-skia`.
 
-## 12. Interface graphique ([pdf-ui/src/main.rs](../pdf-ui/src/main.rs))
+## 12. Rendu GPU ([pdf-render-gpu/src/lib.rs](../pdf-render-gpu/src/lib.rs))
 
-Prototype `egui`/`eframe` — le pipeline `Document::open → page → page_content → Interpreter::run_page → pdf_render::render_page_scaled` tourne à chaque frame où la page ou le zoom courant a changé (`ViewerApp::ensure_texture`, qui compare `(page_index, zoom_quantifié)` à ce qui a produit la texture affichée pour éviter de re-rasteriser inutilement).
+Pipeline `wgpu` en parité fonctionnelle avec `pdf-render` (même `DisplayList` en entrée, même sémantique de sortie) :
+
+- **Chemins** : tessellés par `lyon::tessellation::{FillTessellator, StrokeTessellator}` en triangles, plutôt que rastérisés directement — c'est la différence structurelle avec le CPU.
+- **Glyphes** : mis en cache par `(font, code)` (`GlyphCache`) — le contour em-space n'est tessellé qu'une fois par processus, les occurrences suivantes ne font qu'une multiplication de matrice.
+- **Images** : dessinées en quad texturé (`build_image_quad`), même mapping pixel→carré unité→page que `pdf_render::draw_image`.
+- **Clip** : appliqué via un stencil buffer (`Stencil8`) plutôt qu'un masque logiciel — items groupés par pile de clip comparée par pointeur `Rc`, couches imbriquées accumulées par incrément (intersection), contenu testé contre la profondeur totale.
+- **`GpuRenderer`** réutilise un `Device`/`Queue` `wgpu` partagé (`from_shared`) plutôt que d'en renégocier un par page — c'est ce qui le rend viable dans une boucle de rendu interactive. Branché dans `pdf-ui` (bascule sur `NativeOptions::renderer = Renderer::Wgpu`), avec repli automatique et transparent sur `pdf-render` (CPU) si aucun adaptateur `wgpu` n'est disponible.
+
+Les deux back-ends sont comparés pixel par pixel sur des fixtures réels par `pdf-render-gpu/tests/cross_backend.rs` (voir §15).
+
+## 13. État de session ([pdf-app/src/lib.rs](../pdf-app/src/lib.rs)) et extraction de texte ([pdf-text/src/lib.rs](../pdf-text/src/lib.rs))
+
+`pdf-app::Session` porte l'état partagé entre les futurs fronts (aujourd'hui `pdf-ui`) : ouverture de fichier, page courante avec navigation bornée, rendu RGBA agnostique du backend (CPU ou GPU selon qu'un `GpuRenderer` a été attaché), recherche/sélection de texte, table des matières — avec un cache de rendu par `(page, échelle)` et un cache de texte par page, pour qu'une page déjà rastérisée/extraite ne soit jamais recalculée.
+
+`pdf-text::extract_page_text` construit un `PageText` (texte + position par caractère) à partir d'une `DisplayList`, en insérant un saut de ligne heuristique quand la ligne de base saute de plus de la moitié de la taille de police. `find_matches`/`char_index_at`/`text_in_range`/`rects_in_range` alimentent respectivement la recherche avec surlignage et la sélection de texte à la souris dans `pdf-ui`.
+
+## 14. Interface graphique ([pdf-ui/src/main.rs](../pdf-ui/src/main.rs))
+
+Prototype `egui`/`eframe`, qui parle à `pdf_app::Session` plutôt que directement à `pdf-core`/`pdf-render` (contrairement aux premières versions de ce prototype). Fonctionnalités : navigation page à page **et** défilement continu virtualisé (`egui::ScrollArea::show_rows`), zoom par re-rasterisation (boutons, molette+Ctrl, pincement trackpad), recherche texte plein document avec surlignage, panneau de miniatures, panneau de signets/plan (`/Outlines`) arborescent, sélection de texte à la souris avec copie (`⌘C`).
 
 Points d'implémentation notables :
-- **Conversion Pixmap → texture egui** : `tiny_skia::Pixmap::data()` est passé tel quel à `egui::ColorImage::from_rgba_unmultiplied`. Ça fonctionne sans conversion premultiplied/straight parce que `render_to_pixmap` peint toujours sur un fond blanc **opaque** : après compositing "over" sur un fond d'alpha 1, le résultat a toujours alpha=255 partout, donc premultiplied et straight coïncident.
-- **Raccourci assumé** : ce prototype parle directement à `pdf-core`/`pdf-render`, en court-circuitant `pdf-app` (toujours un stub). C'est exactement ce que suggère architecture.md §8.1 ("commencer le prototype en egui pour valider les flux") ; à corriger quand `pdf-app` portera l'état de session partagé entre plusieurs fenêtres/documents.
+- **Conversion Pixmap → texture egui** : le buffer RGBA (CPU ou GPU) est passé tel quel à `egui::ColorImage::from_rgba_unmultiplied`. Ça fonctionne sans conversion premultiplied/straight parce que le rendu peint toujours sur un fond blanc **opaque** : après compositing "over" sur un fond d'alpha 1, le résultat a toujours alpha=255 partout, donc premultiplied et straight coïncident.
 - **Ouverture de fichier** : dialogue natif via `rfd` (pas de dépendance GTK sur macOS, juste AppKit sous le capot).
+- **GPU optionnel** : `pdf-ui` bascule sur `NativeOptions::renderer = Renderer::Wgpu` et passe le `Device`/`Queue` d'`eframe` (`egui_wgpu::RenderState`) à `Session::set_gpu_renderer` ; sans adaptateur `wgpu` disponible, tout continue de fonctionner via `pdf-render` (CPU).
 
-## 13. Ce qu'il faut savoir avant de contribuer
+## 15. Ce qu'il faut savoir avant de contribuer
 
 - **Chaque limitation est documentée là où elle vit** : en tête de module (`//!`) et dans [STATUS.md](../STATUS.md). Si vous levez une limitation, mettez à jour les deux.
-- **Le corpus de test** ([pdf-core/tests/fixtures/](../pdf-core/tests/fixtures/)) est généré par script (reportlab + pikepdf, recette dans son README) — ne modifiez pas les `.pdf` à la main, les tests d'intégration en dépendent octet par octet (`include_bytes!`).
+- **Le corpus de test** ([pdf-core/tests/fixtures/](../pdf-core/tests/fixtures/)) est généré par script (reportlab + pikepdf + fonttools, recette dans son README) — ne modifiez pas les `.pdf` à la main, les tests d'intégration en dépendent octet par octet (`include_bytes!`).
+- **Tests de rendu par comparaison pixel** : `pdf-render/tests/golden.rs` compare chaque fixture visuel à une image de référence (`pdf-render/tests/golden/*.png`) sous seuil de tolérance ; `pdf-render-gpu/tests/cross_backend.rs` compare le rendu CPU et GPU entre eux. Si un changement de rendu est intentionnel, régénérer les références avec `UPDATE_GOLDEN=1 cargo test -p pdf-render --test golden` puis relire le diff d'image dans la PR avant de merger — ne jamais régénérer sans avoir vérifié visuellement que le nouveau rendu est correct.
 - **CI** : `cargo fmt --check`, `clippy -D warnings`, `cargo test` sur `macos-latest` ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Le test de substitution système suppose macOS.
 - **Convention d'erreur** : jamais de panique sur un fichier malformé ; on dégrade (objet ignoré, reconstruction, placeholder signalé) ou on retourne un `PdfError` précis avec l'offset.
 
-## 14. Carte des fichiers
+## 16. Carte des fichiers
 
 ```
 pdf-core/src/
@@ -215,15 +242,26 @@ pdf-core/src/
   filters.rs    Flate/LZW/ASCIIHex/ASCII85/DCTDecode + prédicteurs PNG/TIFF
   page.rs       arbre des pages, héritage, concaténation /Contents
   content.rs    tokenisation du flux de contenu (+ saut des images inline)
-  interp.rs     exécution des opérateurs → DisplayList
+  interp.rs     exécution des opérateurs → DisplayList (clip, Type0/CID inclus)
   display.rs    types DisplayList/DisplayItem/Matrix/Color/PathSegment
   encoding.rs   tables WinAnsi/Standard + noms de glyphes AGL
-  font.rs       largeurs, Unicode, contours (intégrés TrueType + système macOS)
+  font.rs       largeurs, Unicode, contours (TrueType/CFF, simples et composites)
   image.rs      interprétation /ColorSpace des pixels décodés → RGBA8
+  outline.rs    lecture de /Outlines (table des matières)
 pdf-render/src/
-  lib.rs        rasterisation tiny-skia (chemins + glyphes + images) → PNG
+  lib.rs        rasterisation tiny-skia (chemins + glyphes + images + clip) → PNG
+pdf-render/tests/
+  golden.rs     comparaison pixel par fixture vs. tests/golden/*.png
+pdf-render-gpu/src/
+  lib.rs        rasterisation wgpu+lyon, parité fonctionnelle avec pdf-render
+pdf-render-gpu/tests/
+  cross_backend.rs  comparaison pixel CPU vs GPU sur les mêmes fixtures
+pdf-text/src/
+  lib.rs        extraction de texte avec position par caractère, recherche
+pdf-app/src/
+  lib.rs        Session : état applicatif partagé, caches, recherche/sélection
 pdf-cli/src/
-  main.rs       dump / render-info / render
+  main.rs       dump / render-info / render / text
 pdf-ui/src/
-  main.rs       prototype egui/eframe : ouverture, navigation, zoom
+  main.rs       viewer egui/eframe : navigation, zoom, recherche, miniatures, signets
 ```

@@ -4,6 +4,7 @@ members = [
     "pdf-core",
     "pdf-text",
     "pdf-render",
+    "pdf-render-gpu",
     "pdf-edit",
     "pdf-app",
     "pdf-ui",
@@ -20,6 +21,7 @@ authors = ["Loïc Berthod"]
 pdf-core = { path = "pdf-core" }
 pdf-text = { path = "pdf-text" }
 pdf-render = { path = "pdf-render" }
+pdf-render-gpu = { path = "pdf-render-gpu" }
 pdf-edit = { path = "pdf-edit" }
 pdf-app = { path = "pdf-app" }
 

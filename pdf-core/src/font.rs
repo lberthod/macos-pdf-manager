@@ -1,22 +1,38 @@
-//! Métriques et encodage des polices simples (Type1/TrueType 1 octet) —
-//! architecture.md §4.6. Fournit à l'interpréteur de contenu (`interp.rs`)
-//! de quoi remplacer l'avance de texte placeholder par une largeur réelle,
-//! et le code de caractère brut par un caractère Unicode.
+//! Métriques et encodage des polices simples (Type1/TrueType 1 octet) et
+//! composites (`/Type0`/CID, codes 2 octets) — architecture.md §4.6. Fournit
+//! à l'interpréteur de contenu (`interp.rs`) de quoi remplacer l'avance de
+//! texte placeholder par une largeur réelle, et le code de caractère brut
+//! par un caractère Unicode.
 //!
 //! Limitations connues (voir sprint.md, Sprint 7-8+) :
-//! - Polices composites (`/Type0`, CID, codes 2 octets) : non gérées, un
-//!   appelant doit détecter `Font::is_composite()` et garder son
-//!   comportement de repli.
+//! - Polices composites (`/Type0`) : gérées (voir `Font::decode_composite`/
+//!   `cid_metrics`/`cid_glyph_outline`) mais avec un périmètre volontairement
+//!   restreint à l'`/Encoding` **`Identity-H`/`Identity-V`** — code source 2
+//!   octets = CID directement, sans indirection par CMap. C'est le cas
+//!   couvrant l'immense majorité des PDF `/Type0` réels (LibreOffice, export
+//!   PDF de traitements de texte, XeLaTeX...), qui embarquent systématiquement
+//!   leur sous-ensemble de police avec cette correspondance triviale. Un
+//!   `/Encoding` nommé différent (CMap prédéfini CJK comme `UniGB-UCS2-H`) ou
+//!   un flux de CMap embarqué (plages de code de largeur variable,
+//!   `usecmap`) sont traités **comme si** c'était `Identity-H` (code brut
+//!   utilisé tel quel comme CID) plutôt que rejetés : approximation
+//!   généralement fausse dans ce cas précis, mais qui n'empêche pas de
+//!   tenter un rendu plutôt que de retomber sur le placeholder complet.
+//!   `/CIDFontType2` (TrueType) : contour résolu via `/CIDToGIDMap`
+//!   (`/Identity` ou flux explicite CID->GID) puis la table `glyf`.
+//!   `/CIDFontType0` (CFF CID-keyed) : `/CIDToGIDMap` ne s'applique pas
+//!   (ISO 32000-1 §9.7.4.2) — CID->GID résolu via le charset interne de la
+//!   table CFF elle-même (`ttf_parser::cff::Table::glyph_cid`, inversé une
+//!   fois au chargement).
 //! - `/ToUnicode` (CMap dédié, ISO 32000-1 §9.10.3) : lu et prioritaire sur
 //!   l'encodage de base (`base_encoding_by_name`/`/Differences`) quand
-//!   présent — voir `parse_to_unicode_cmap`. Gère `beginbfchar`/
-//!   `beginbfrange` (forme "base + décalage" et forme tableau explicite) ;
-//!   seuls les codes source tenant sur un octet (0..256) sont retenus,
-//!   cohérent avec le reste de ce module qui ne traite que les polices
-//!   simples. Les valeurs de destination multi-unités UTF-16 (paires de
-//!   substitution, plusieurs caractères) ne sont pas incrémentées dans une
-//!   plage `bfrange` : toute la plage reçoit alors la même valeur
-//!   (approximation rare en pratique).
+//!   présent — voir `parse_to_unicode_cmap` (polices simples, table
+//!   256 entrées) et `parse_to_unicode_cmap_wide` (polices composites,
+//!   `HashMap` non bornée à 256, mêmes blocs `beginbfchar`/`beginbfrange`).
+//!   Les valeurs de destination multi-unités UTF-16 (paires de substitution,
+//!   plusieurs caractères) ne sont pas incrémentées dans une plage
+//!   `bfrange` : toute la plage reçoit alors la même valeur (approximation
+//!   rare en pratique).
 //! - Largeurs des polices standard non intégrées : seule Helvetica dispose
 //!   d'une table AFM complète (`HELVETICA_WIDTHS`) ; les 13 autres polices
 //!   standard retombent sur `DEFAULT_WIDTH`.
@@ -34,6 +50,8 @@
 //!   `/System/Library/Fonts` (chemins macOS codés en dur) — un portage
 //!   passerait par Core Text ou fontconfig.
 
+use std::collections::HashMap;
+
 use crate::display::PathSegment;
 use crate::document::Document;
 use crate::encoding::{glyph_name_to_unicode, STANDARD_ENCODING, WIN_ANSI_ENCODING};
@@ -46,21 +64,69 @@ use crate::object::{Dictionary, Object};
 /// Helvetica ne couvrent un code donné.
 const DEFAULT_WIDTH: f64 = 500.0;
 
+/// Valeur par défaut de `/DW` (ISO 32000-1 §9.7.4.3, Table 117) quand le
+/// dictionnaire CIDFont ne la précise pas.
+const DEFAULT_CID_WIDTH: f64 = 1000.0;
+
+/// `/CIDToGIDMap` (ISO 32000-1 §9.7.4.2) : uniquement pertinent pour un
+/// descendant `/CIDFontType2` (TrueType) — `/CIDFontType0` (CFF CID-keyed)
+/// résout CID -> GID via le charset interne de la table CFF (voir
+/// `CidGlyphSource::Cff`), cette table n'a alors aucun rôle.
+enum CidToGid {
+    /// CID == GID (valeur par défaut, `/CIDToGIDMap /Identity` ou absent).
+    Identity,
+    /// Flux explicite : `map[cid]` donne le GID, ISO 32000-1 §9.7.4.2.
+    Map(Vec<u16>),
+}
+
+/// Source de résolution des contours pour une police composite — diffère
+/// selon le sous-type du descendant (`/CIDFontType0` vs `/CIDFontType2`,
+/// voir la doc de module).
+enum CidGlyphSource {
+    TrueType { cid_to_gid: CidToGid },
+    /// CID -> GID précalculé une fois au chargement en parcourant tous les
+    /// glyphes de la table CFF (`ttf_parser::cff::Table::glyph_cid`, qui ne
+    /// donne que le sens GID -> CID) — pas de coût par glyphe affiché.
+    Cff { cid_to_gid: HashMap<u32, u16> },
+}
+
+/// Données propres à une police composite (`/Type0`), résolues une fois au
+/// chargement à partir du dictionnaire `/DescendantFonts` (voir la doc de
+/// module pour le périmètre exact).
+struct CidFontData {
+    /// CID -> Unicode, depuis `/ToUnicode` (voir `parse_to_unicode_cmap_wide`).
+    to_unicode: HashMap<u32, char>,
+    /// CID -> largeur (1/1000 em), depuis `/W`.
+    widths: HashMap<u32, f64>,
+    /// `/DW`, `DEFAULT_CID_WIDTH` si absent.
+    default_width: f64,
+    /// `None` si le descendant n'a ni `/FontFile2` ni `/FontFile3`
+    /// exploitable (aucun contour résolvable, mais Unicode/largeur restent
+    /// disponibles).
+    glyph_source: Option<CidGlyphSource>,
+}
+
 pub struct Font {
     subtype: String,
     encoding: [Option<char>; 256],
     widths: [Option<f64>; 256],
     use_helvetica_fallback: bool,
     /// Octets bruts d'un `/FontFile2` (TrueType) déjà décodé, s'il y en a un.
+    /// Pour une police composite, provient du `/FontDescriptor` du
+    /// descendant (`/DescendantFonts`), pas du dictionnaire `/Type0`
+    /// lui-même (qui n'en porte pas, ISO 32000-1 §9.7.3).
     embedded_truetype: Option<Vec<u8>>,
-    /// Octets bruts d'un `/FontFile3` `/Subtype /Type1C` (CFF brut, sans
-    /// conteneur OpenType) déjà décodé, s'il y en a un.
+    /// Octets bruts d'un `/FontFile3` `/Subtype /Type1C` ou `CIDFontType0C`
+    /// (CFF brut, sans conteneur OpenType) déjà décodé, s'il y en a un.
     embedded_cff: Option<Vec<u8>>,
     /// Police système de substitution (octets du fichier partagés via cache
     /// global + index de face dans la collection `.ttc`), pour les polices
     /// standard non intégrées. `None` si la police est intégrée ou si aucune
-    /// substitution n'a été trouvée.
+    /// substitution n'a été trouvée. Toujours `None` pour une police
+    /// composite (pas de notion de "police standard" pour `/Type0`).
     system_fallback: Option<(std::sync::Arc<Vec<u8>>, u32)>,
+    /// `Some` seulement si `subtype == "Type0"` (voir `is_composite`).
+    cid: Option<CidFontData>,
 }
 
 impl Font {
@@ -150,35 +216,8 @@ impl Font {
             .and_then(|o| doc.get(o).ok())
             .and_then(|desc| desc.as_dict().cloned());
 
-        let mut embedded_truetype = descriptor_dict
-            .as_ref()
-            .and_then(|d| d.get("FontFile2").cloned())
-            .and_then(|obj| doc.get(&obj).ok())
-            .and_then(|obj| match obj {
-                Object::Stream(stream) => decode_stream(&stream).ok(),
-                _ => None,
-            });
-
-        let mut embedded_cff = None;
-        if embedded_truetype.is_none() {
-            if let Some(Object::Stream(stream)) = descriptor_dict
-                .as_ref()
-                .and_then(|d| d.get("FontFile3").cloned())
-                .and_then(|obj| doc.get(&obj).ok())
-            {
-                let file_subtype = stream.dict.get("Subtype").and_then(|o| o.as_name());
-                if let Ok(bytes) = decode_stream(&stream) {
-                    match file_subtype {
-                        // Conteneur OpenType complet : ttf-parser::Face
-                        // gère indifféremment glyf et CFF en interne.
-                        Some("OpenType") => embedded_truetype = Some(bytes),
-                        // CFF brut (`Type1C`/`CIDFontType0C`) : pas de
-                        // table sfnt, nécessite le parseur CFF dédié.
-                        _ => embedded_cff = Some(bytes),
-                    }
-                }
-            }
-        }
+        let (mut embedded_truetype, mut embedded_cff) =
+            load_embedded_font_files(doc, descriptor_dict.as_ref());
 
         let system_fallback =
             if embedded_truetype.is_none() && embedded_cff.is_none() && subtype != "Type0" {
@@ -191,6 +230,94 @@ impl Font {
                 None
             };
 
+        // `/Type0` n'a pas de `/FontDescriptor`/`/Widths` propres (ISO
+        // 32000-1 §9.7.3) : tout est porté par son unique descendant
+        // (`/DescendantFonts`, un `/CIDFontType0` ou `/CIDFontType2`) — voir
+        // la doc de module pour le périmètre (Identity-H/V uniquement).
+        let cid = if subtype == "Type0" {
+            let descendant_dict = dict
+                .get("DescendantFonts")
+                .and_then(|o| doc.get(o).ok())
+                .and_then(|o| o.as_array().map(<[Object]>::to_vec))
+                .and_then(|arr| arr.into_iter().next())
+                .and_then(|obj| doc.get(&obj).ok())
+                .and_then(|obj| obj.as_dict().cloned());
+
+            let mut to_unicode = HashMap::new();
+            if let Some(to_unicode_obj) = dict.get("ToUnicode") {
+                if let Ok(Object::Stream(stream)) = doc.get(to_unicode_obj) {
+                    if let Ok(bytes) = decode_stream(&stream) {
+                        to_unicode = parse_to_unicode_cmap_wide(&bytes);
+                    }
+                }
+            }
+
+            let mut cid_widths = HashMap::new();
+            let mut default_width = DEFAULT_CID_WIDTH;
+            let mut cid_to_gid = CidToGid::Identity;
+
+            if let Some(cid_dict) = &descendant_dict {
+                if let Some(dw) = cid_dict.get("DW").and_then(number) {
+                    default_width = dw;
+                }
+                if let Some(items) = cid_dict
+                    .get("W")
+                    .and_then(|o| doc.get(o).ok())
+                    .and_then(|o| o.as_array().map(<[Object]>::to_vec))
+                {
+                    parse_cid_widths(&items, &mut cid_widths);
+                }
+
+                cid_to_gid = match cid_dict.get("CIDToGIDMap").and_then(|o| doc.get(o).ok()) {
+                    Some(Object::Stream(stream)) => decode_stream(&stream)
+                        .map(|bytes| {
+                            CidToGid::Map(
+                                bytes
+                                    .chunks_exact(2)
+                                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or(CidToGid::Identity),
+                    _ => CidToGid::Identity, // `/Identity` (ou absent, valeur par défaut).
+                };
+
+                let cid_descriptor_dict = cid_dict
+                    .get("FontDescriptor")
+                    .and_then(|o| doc.get(o).ok())
+                    .and_then(|desc| desc.as_dict().cloned());
+                let (descendant_truetype, descendant_cff) =
+                    load_embedded_font_files(doc, cid_descriptor_dict.as_ref());
+                embedded_truetype = descendant_truetype;
+                embedded_cff = descendant_cff;
+            }
+
+            let glyph_source = if embedded_truetype.is_some() {
+                Some(CidGlyphSource::TrueType { cid_to_gid })
+            } else if let Some(cff_bytes) = embedded_cff.as_ref() {
+                ttf_parser::cff::Table::parse(cff_bytes).map(|table| {
+                    let mut map = HashMap::new();
+                    for gid in 0..table.number_of_glyphs() {
+                        if let Some(cid) = table.glyph_cid(ttf_parser::GlyphId(gid)) {
+                            map.insert(cid as u32, gid);
+                        }
+                    }
+                    CidGlyphSource::Cff { cid_to_gid: map }
+                })
+            } else {
+                None
+            };
+
+            Some(CidFontData {
+                to_unicode,
+                widths: cid_widths,
+                default_width,
+                glyph_source,
+            })
+        } else {
+            None
+        };
+
         Ok(Font {
             subtype,
             encoding,
@@ -199,6 +326,7 @@ impl Font {
             embedded_truetype,
             embedded_cff,
             system_fallback,
+            cid,
         })
     }
 
@@ -273,6 +401,151 @@ impl Font {
         let face = ttf_parser::Face::parse(data, *face_index).ok()?;
         let gid = face.glyph_index(unicode?)?;
         outline_from_face(&face, gid)
+    }
+
+    /// Découpe une chaîne d'une police composite en CIDs (voir la doc de
+    /// module : `Identity-H`/`Identity-V` uniquement, code source 2 octets =
+    /// CID directement). Un dernier octet isolé (chaîne de longueur impaire,
+    /// PDF malformé) est silencieusement ignoré plutôt que de paniquer.
+    pub fn decode_composite(&self, bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]) as u32)
+            .collect()
+    }
+
+    /// Décode un CID (police composite) en `(unicode résolu, largeur en
+    /// 1/1000 em)` — symétrique de `decode_simple`. Largeur : `/W` puis
+    /// `/DW` (`DEFAULT_CID_WIDTH` si la police n'a pas pu être lue comme
+    /// composite du tout, ce qui ne devrait pas arriver si `is_composite()`
+    /// a été vérifié avant l'appel).
+    pub fn cid_metrics(&self, cid: u32) -> (Option<char>, f64) {
+        let Some(cid_data) = self.cid.as_ref() else {
+            return (None, DEFAULT_CID_WIDTH);
+        };
+        let unicode = cid_data.to_unicode.get(&cid).copied();
+        let width = cid_data
+            .widths
+            .get(&cid)
+            .copied()
+            .unwrap_or(cid_data.default_width);
+        (unicode, width)
+    }
+
+    /// Contour vectoriel du glyphe correspondant à un CID (police
+    /// composite), même espace/orientation que `glyph_outline`. `None` si
+    /// la police n'a pas de descendant exploitable (`FontFile2`/`FontFile3`
+    /// absent ou non supporté) ou si ce CID précis n'a pas de glyphe — voir
+    /// `CidGlyphSource` pour la résolution CID -> GID selon le sous-type du
+    /// descendant.
+    pub fn cid_glyph_outline(&self, cid: u32) -> Option<Vec<PathSegment>> {
+        match self.cid.as_ref()?.glyph_source.as_ref()? {
+            CidGlyphSource::TrueType { cid_to_gid } => {
+                let gid = match cid_to_gid {
+                    CidToGid::Identity => u16::try_from(cid).ok()?,
+                    CidToGid::Map(map) => *map.get(cid as usize)?,
+                };
+                let data = self.embedded_truetype.as_ref()?;
+                let face = ttf_parser::Face::parse(data, 0).ok()?;
+                outline_from_face(&face, ttf_parser::GlyphId(gid))
+            }
+            CidGlyphSource::Cff { cid_to_gid } => {
+                let gid = *cid_to_gid.get(&cid)?;
+                let data = self.embedded_cff.as_ref()?;
+                let table = ttf_parser::cff::Table::parse(data)?;
+                let scale = table.matrix().sx as f64;
+                let mut collector = OutlineCollector {
+                    segments: Vec::new(),
+                    current: (0.0, 0.0),
+                    scale: if scale != 0.0 { scale } else { 1.0 / 1000.0 },
+                };
+                table
+                    .outline(ttf_parser::GlyphId(gid), &mut collector)
+                    .ok()?;
+                Some(collector.segments)
+            }
+        }
+    }
+}
+
+/// Charge `/FontFile2` (TrueType) ou `/FontFile3` (CFF/OpenType) depuis un
+/// `/FontDescriptor` déjà résolu — factorisé entre les polices simples
+/// (`Font::load`, descripteur du dictionnaire `/Font` lui-même) et les
+/// polices composites (même logique, mais sur le `/FontDescriptor` du
+/// descendant `/DescendantFonts`, qui seul en porte un pour `/Type0`).
+fn load_embedded_font_files(
+    doc: &Document,
+    descriptor_dict: Option<&Dictionary>,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut embedded_truetype = descriptor_dict
+        .and_then(|d| d.get("FontFile2").cloned())
+        .and_then(|obj| doc.get(&obj).ok())
+        .and_then(|obj| match obj {
+            Object::Stream(stream) => decode_stream(&stream).ok(),
+            _ => None,
+        });
+
+    let mut embedded_cff = None;
+    if embedded_truetype.is_none() {
+        if let Some(Object::Stream(stream)) = descriptor_dict
+            .and_then(|d| d.get("FontFile3").cloned())
+            .and_then(|obj| doc.get(&obj).ok())
+        {
+            let file_subtype = stream.dict.get("Subtype").and_then(|o| o.as_name());
+            if let Ok(bytes) = decode_stream(&stream) {
+                match file_subtype {
+                    // Conteneur OpenType complet : ttf-parser::Face gère
+                    // indifféremment glyf et CFF en interne.
+                    Some("OpenType") => embedded_truetype = Some(bytes),
+                    // CFF brut (`Type1C`/`CIDFontType0C`) : pas de table
+                    // sfnt, nécessite le parseur CFF dédié.
+                    _ => embedded_cff = Some(bytes),
+                }
+            }
+        }
+    }
+
+    (embedded_truetype, embedded_cff)
+}
+
+/// Parse `/W` (ISO 32000-1 §9.7.4.3, Table 117) : deux formes interleavées
+/// dans le même tableau — `c [w1 w2 ...]` (largeurs individuelles pour des
+/// CIDs consécutifs à partir de `c`) et `cFirst cLast w` (largeur uniforme
+/// sur une plage). Entrées malformées (élément inattendu) : le reste du
+/// tableau est simplement ignoré plutôt que de paniquer.
+fn parse_cid_widths(items: &[Object], out: &mut HashMap<u32, f64>) {
+    let mut i = 0;
+    while i < items.len() {
+        let Some(first) = items.get(i).and_then(number) else {
+            return;
+        };
+        i += 1;
+        match items.get(i) {
+            Some(Object::Array(run)) => {
+                for (offset, w) in run.iter().enumerate() {
+                    if let Some(width) = number(w) {
+                        out.insert(first as u32 + offset as u32, width);
+                    }
+                }
+                i += 1;
+            }
+            Some(second) => {
+                let Some(last) = number(second) else {
+                    return;
+                };
+                i += 1;
+                let Some(width) = items.get(i).and_then(number) else {
+                    return;
+                };
+                i += 1;
+                let mut cid = first as i64;
+                while cid <= last as i64 {
+                    out.insert(cid as u32, width);
+                    cid += 1;
+                }
+            }
+            None => return,
+        }
     }
 }
 
@@ -535,6 +808,91 @@ fn parse_to_unicode_cmap(bytes: &[u8]) -> [Option<char>; 256] {
     map
 }
 
+/// Comme `hex_to_code`, sans la restriction à `0..256` : un CID (police
+/// composite) tient sur 2 octets, potentiellement plus large qu'un code de
+/// police simple.
+fn hex_to_code_u32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0u32, |acc, b| (acc << 8) | *b as u32)
+}
+
+/// Comme `parse_to_unicode_cmap`, pour une police composite : source ->
+/// destination non bornée à 256 (`HashMap` plutôt que tableau 256 entrées).
+/// Mêmes blocs gérés (`beginbfchar`/`beginbfrange`, même limitation sur les
+/// destinations multi-unités dans une plage — voir la doc de module).
+fn parse_to_unicode_cmap_wide(bytes: &[u8]) -> HashMap<u32, char> {
+    let mut map = HashMap::new();
+    let mut lexer = Lexer::new(bytes);
+
+    while let Ok(Some(token)) = lexer.next_token() {
+        match token {
+            Token::Keyword(kw) if kw == "beginbfchar" => {
+                while let Ok(Some(Token::HexString(src))) = lexer.next_token() {
+                    let Ok(Some(Token::HexString(dst))) = lexer.next_token() else {
+                        break;
+                    };
+                    if let Some(ch) = hex_to_char(&dst) {
+                        map.insert(hex_to_code_u32(&src), ch);
+                    }
+                }
+            }
+            Token::Keyword(kw) if kw == "beginbfrange" => {
+                while let Ok(Some(Token::HexString(lo))) = lexer.next_token() {
+                    let Ok(Some(Token::HexString(hi))) = lexer.next_token() else {
+                        break;
+                    };
+                    let Ok(Some(dst_token)) = lexer.next_token() else {
+                        break;
+                    };
+                    let lo_code = hex_to_code_u32(&lo);
+                    let hi_code = hex_to_code_u32(&hi);
+                    match dst_token {
+                        Token::HexString(base) => {
+                            let base_units: Vec<u16> = base
+                                .chunks_exact(2)
+                                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                                .collect();
+                            if let [unit] = base_units[..] {
+                                for offset in 0..=(hi_code - lo_code) {
+                                    let code_point = (unit as u32).wrapping_add(offset);
+                                    if let Some(ch) = char::from_u32(code_point) {
+                                        map.insert(lo_code + offset, ch);
+                                    }
+                                }
+                            } else if let Some(ch) =
+                                char::decode_utf16(base_units).next().and_then(|r| r.ok())
+                            {
+                                // Destination multi-unités : toute la plage
+                                // reçoit la même valeur (voir limitation en
+                                // tête de fichier).
+                                for code in lo_code..=hi_code {
+                                    map.insert(code, ch);
+                                }
+                            }
+                        }
+                        Token::ArrayStart => {
+                            for code in lo_code..=hi_code {
+                                match lexer.next_token() {
+                                    Ok(Some(Token::HexString(dst))) => {
+                                        if let Some(ch) = hex_to_char(&dst) {
+                                            map.insert(code, ch);
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            let _ = lexer.next_token(); // consomme le `]`.
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    map
+}
+
 fn base_encoding_by_name(name: &str) -> Option<[Option<char>; 256]> {
     match name {
         "WinAnsiEncoding" => Some(WIN_ANSI_ENCODING),
@@ -725,6 +1083,195 @@ mod tests {
         let dict = font_dict(&[("Subtype", Object::Name("Type0".into()))]);
         let font = Font::load(&doc, &dict).unwrap();
         assert!(font.is_composite());
+    }
+
+    #[test]
+    fn decode_composite_splits_two_byte_codes_and_drops_a_trailing_odd_byte() {
+        let doc = dummy_doc();
+        let dict = font_dict(&[("Subtype", Object::Name("Type0".into()))]);
+        let font = Font::load(&doc, &dict).unwrap();
+        // 0x0041 puis 0x00FF, plus un octet isolé en trop (silencieusement ignoré).
+        assert_eq!(
+            font.decode_composite(&[0x00, 0x41, 0x00, 0xFF, 0x9]),
+            vec![0x0041, 0x00FF]
+        );
+    }
+
+    /// `/W` mélange les deux formes autorisées (ISO 32000-1 §9.7.4.3) dans
+    /// le même tableau : `c [w1 w2 ...]` (largeurs individuelles) et
+    /// `cFirst cLast w` (plage uniforme). Un CID absent des deux doit
+    /// retomber sur `/DW`.
+    #[test]
+    fn cid_widths_handle_both_w_array_forms_and_fall_back_to_dw() {
+        let doc = dummy_doc();
+        let cid_font_dict = font_dict(&[
+            ("Subtype", Object::Name("CIDFontType2".into())),
+            ("DW", Object::Integer(1000)),
+            (
+                "W",
+                Object::Array(vec![
+                    // CID 10 -> 200, CID 11 -> 300 (forme tableau).
+                    Object::Integer(10),
+                    Object::Array(vec![Object::Integer(200), Object::Integer(300)]),
+                    // CID 20..22 -> 400 (forme plage uniforme).
+                    Object::Integer(20),
+                    Object::Integer(22),
+                    Object::Integer(400),
+                ]),
+            ),
+        ]);
+        let type0_dict = font_dict(&[
+            ("Subtype", Object::Name("Type0".into())),
+            ("Encoding", Object::Name("Identity-H".into())),
+            (
+                "DescendantFonts",
+                Object::Array(vec![Object::Dictionary(cid_font_dict)]),
+            ),
+        ]);
+        let font = Font::load(&doc, &type0_dict).unwrap();
+
+        assert_eq!(font.cid_metrics(10).1, 200.0);
+        assert_eq!(font.cid_metrics(11).1, 300.0);
+        assert_eq!(font.cid_metrics(20).1, 400.0);
+        assert_eq!(font.cid_metrics(21).1, 400.0);
+        assert_eq!(font.cid_metrics(22).1, 400.0);
+        // Ni dans la forme tableau ni dans la plage -> repli sur /DW.
+        assert_eq!(font.cid_metrics(999).1, 1000.0);
+    }
+
+    /// Symétrique de `to_unicode_bfchar_overrides_base_encoding`, pour un
+    /// code source 2 octets (`>= 256`, rejeté par `parse_to_unicode_cmap`
+    /// mais pas par la variante `_wide` des polices composites).
+    #[test]
+    fn to_unicode_wide_resolves_a_two_byte_source_code() {
+        let doc = dummy_doc();
+        let to_unicode_data =
+            b"/CIDInit /ProcSet findresource begin\nbeginbfchar\n<4E2D> <4E2D>\nendbfchar\nend";
+        let type0_dict = font_dict(&[
+            ("Subtype", Object::Name("Type0".into())),
+            ("Encoding", Object::Name("Identity-H".into())),
+            (
+                "ToUnicode",
+                Object::Stream(crate::object::Stream {
+                    dict: Dictionary::new(),
+                    raw_data: to_unicode_data.to_vec(),
+                }),
+            ),
+        ]);
+        let font = Font::load(&doc, &type0_dict).unwrap();
+        assert_eq!(font.cid_metrics(0x4E2D).0, Some('中'));
+    }
+
+    /// Bout en bout : un `/Type0`/`CIDFontType2` dont le descendant partage
+    /// le même `/FontFile2` que le fixture TrueType simple existant
+    /// (`embedded_truetype_font.pdf`), avec un `/CIDToGIDMap` explicite qui
+    /// fait pointer un CID arbitraire vers le GID du glyphe 'A' — vérifie
+    /// que la résolution CID -> GID -> contour fonctionne réellement,
+    /// pas seulement que les champs sont lus.
+    #[test]
+    fn composite_truetype_font_resolves_cid_via_explicit_cidtogidmap() {
+        let bytes = include_bytes!("../tests/fixtures/embedded_truetype_font.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let font_res = page.resources.get("Font").unwrap();
+        let simple_font_dict = doc
+            .get(font_res)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .iter()
+            .find_map(|(_, obj)| {
+                let resolved = doc.get(obj).ok()?;
+                let d = resolved.as_dict()?;
+                (d.get("Subtype").and_then(|o| o.as_name()) == Some("TrueType"))
+                    .then(|| d.clone())
+            })
+            .expect("expected an embedded TrueType font resource in the fixture");
+
+        let descriptor_obj = simple_font_dict.get("FontDescriptor").unwrap().clone();
+        let descriptor_dict = doc.get(&descriptor_obj).unwrap().as_dict().unwrap().clone();
+        let font_file2_obj = descriptor_dict.get("FontFile2").unwrap().clone();
+        let Object::Stream(font_file2_stream) = doc.get(&font_file2_obj).unwrap() else {
+            panic!("expected a FontFile2 stream");
+        };
+        let raw_truetype = decode_stream(&font_file2_stream).unwrap();
+
+        let gid_a = {
+            let face = ttf_parser::Face::parse(&raw_truetype, 0).unwrap();
+            face.glyph_index('A')
+                .or_else(|| {
+                    face.tables().cmap.and_then(|cmap| {
+                        cmap.subtables
+                            .into_iter()
+                            .find(|sub| sub.platform_id == ttf_parser::PlatformId::Macintosh)
+                            .and_then(|sub| sub.glyph_index(b'A' as u32))
+                    })
+                })
+                .expect("expected a GID for 'A' in the Monaco subset")
+                .0
+        };
+
+        // CID 9 (arbitraire) -> GID de 'A', via un flux `/CIDToGIDMap` explicite
+        // (grand assez pour couvrir les CID 0..=9).
+        let mut cid_to_gid_bytes = vec![0u8; 20];
+        cid_to_gid_bytes[9 * 2] = (gid_a >> 8) as u8;
+        cid_to_gid_bytes[9 * 2 + 1] = (gid_a & 0xff) as u8;
+
+        let cid_font_dict = font_dict(&[
+            ("Subtype", Object::Name("CIDFontType2".into())),
+            ("FontDescriptor", descriptor_obj.clone()),
+            ("DW", Object::Integer(1000)),
+            (
+                "W",
+                Object::Array(vec![
+                    Object::Integer(9),
+                    Object::Array(vec![Object::Integer(600)]),
+                ]),
+            ),
+            (
+                "CIDToGIDMap",
+                Object::Stream(crate::object::Stream {
+                    dict: Dictionary::new(),
+                    raw_data: cid_to_gid_bytes,
+                }),
+            ),
+        ]);
+        let to_unicode_data =
+            b"/CIDInit /ProcSet findresource begin\nbeginbfchar\n<0009> <0041>\nendbfchar\nend";
+        let type0_dict = font_dict(&[
+            ("Subtype", Object::Name("Type0".into())),
+            ("Encoding", Object::Name("Identity-H".into())),
+            (
+                "DescendantFonts",
+                Object::Array(vec![Object::Dictionary(cid_font_dict)]),
+            ),
+            (
+                "ToUnicode",
+                Object::Stream(crate::object::Stream {
+                    dict: Dictionary::new(),
+                    raw_data: to_unicode_data.to_vec(),
+                }),
+            ),
+        ]);
+
+        let font = Font::load(&doc, &type0_dict).unwrap();
+        assert!(font.is_composite());
+
+        let (unicode, width) = font.cid_metrics(9);
+        assert_eq!(unicode, Some('A'));
+        assert_eq!(width, 600.0);
+
+        let outline = font
+            .cid_glyph_outline(9)
+            .expect("expected an outline for CID 9 via the explicit CIDToGIDMap");
+        assert!(!outline.is_empty());
+        assert!(matches!(outline[0], PathSegment::MoveTo(_)));
+
+        // Même contour que la résolution "police simple" du même glyphe
+        // dans le fixture d'origine (même police, même GID).
+        let simple_font = Font::load(&doc, &simple_font_dict).unwrap();
+        let simple_outline = simple_font.glyph_outline(b'A', Some('A')).unwrap();
+        assert_eq!(outline, simple_outline);
     }
 
     /// Ne s'exécute utilement que sur macOS (fichiers de

@@ -84,6 +84,11 @@ pub struct Session {
     /// Table des matières, calculée au premier appel de `outline()` (`None`
     /// = pas encore demandée) : ne change jamais pendant une session.
     outline_cache: RefCell<Option<Rc<Vec<OutlineItem>>>>,
+    /// Backend GPU optionnel (voir `set_gpu_renderer`) : `None` par défaut
+    /// (rendu `pdf-render`/tiny-skia uniquement). Quand présent, `render_page`
+    /// l'essaie en premier et ne se rabat sur `pdf-render` que s'il échoue
+    /// (pas d'adaptateur `wgpu` compatible) — voir `pdf_render_gpu::GpuRenderer`.
+    gpu: Option<pdf_render_gpu::GpuRenderer>,
 }
 
 impl Session {
@@ -101,7 +106,18 @@ impl Session {
             text_cache: RefCell::new(vec![None; page_count]),
             render_cache: RefCell::new(Vec::new()),
             outline_cache: RefCell::new(None),
+            gpu: None,
         })
+    }
+
+    /// Active le backend GPU (`pdf-render-gpu`) pour les rendus suivants de
+    /// cette session — typiquement appelé une fois juste après `open()` avec
+    /// un `GpuRenderer` construit à partir du `Device`/`Queue` déjà négocié
+    /// par l'hôte (voir `pdf_render_gpu::GpuRenderer::from_shared`, et
+    /// `pdf-ui` pour l'intégration `eframe`). Sans cet appel, `render_page`
+    /// continue d'utiliser `pdf-render` (tiny-skia) comme avant.
+    pub fn set_gpu_renderer(&mut self, gpu: pdf_render_gpu::GpuRenderer) {
+        self.gpu = Some(gpu);
     }
 
     pub fn path(&self) -> &Path {
@@ -178,12 +194,26 @@ impl Session {
         }
 
         let (page, display) = self.page_display(index)?;
-        let pixmap = pdf_render::render_page_rotated(&display, page.media_box, page.rotate, scale)
-            .ok_or_else(|| "render target allocation failed".to_string())?;
-        let rendered = Rc::new(RenderedPage {
-            width: pixmap.width(),
-            height: pixmap.height(),
-            rgba: pixmap.data().to_vec(),
+        let gpu_rendered = self.gpu.as_ref().and_then(|gpu| {
+            gpu.render_page_rotated(&display, page.media_box, page.rotate, scale)
+                .map(|p| RenderedPage {
+                    width: p.width,
+                    height: p.height,
+                    rgba: p.rgba,
+                })
+        });
+        let rendered = Rc::new(match gpu_rendered {
+            Some(rendered) => rendered,
+            None => {
+                let pixmap =
+                    pdf_render::render_page_rotated(&display, page.media_box, page.rotate, scale)
+                        .ok_or_else(|| "render target allocation failed".to_string())?;
+                RenderedPage {
+                    width: pixmap.width(),
+                    height: pixmap.height(),
+                    rgba: pixmap.data().to_vec(),
+                }
+            }
         });
 
         let mut cache = self.render_cache.borrow_mut();
@@ -351,6 +381,35 @@ mod tests {
             include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
         let path = write_fixture(&bytes);
         let session = Session::open(&path).unwrap();
+
+        let rendered = session.render_current_page(1.0).unwrap();
+        assert_eq!(
+            rendered.rgba.len(),
+            (rendered.width * rendered.height * 4) as usize
+        );
+        assert!(rendered.width > 0 && rendered.height > 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Quand un `GpuRenderer` est attaché (voir `set_gpu_renderer`),
+    /// `render_page` doit produire une page de même forme (largeur/hauteur
+    /// cohérentes avec le buffer RGBA) que le chemin `pdf-render` par
+    /// défaut — que le rendu ait réellement utilisé le GPU (adaptateur
+    /// disponible) ou soit retombé sur `pdf-render` (pas d'adaptateur dans
+    /// cet environnement, voir `GpuRenderer::new`), l'appelant ne doit rien
+    /// pouvoir en distinguer côté forme du résultat.
+    #[test]
+    fn render_page_with_gpu_renderer_attached_produces_a_usable_page() {
+        let Some(gpu) = pdf_render_gpu::GpuRenderer::new() else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+        session.set_gpu_renderer(gpu);
 
         let rendered = session.render_current_page(1.0).unwrap();
         assert_eq!(

@@ -1,7 +1,7 @@
 //! Backend de rendu GPU (`wgpu` + tessellation `lyon`) — Sprint 9-10,
 //! alternative au backend CPU `tiny-skia` de `pdf-render`.
 //!
-//! Deuxième tranche, toujours volontairement limitée par rapport à
+//! Troisième tranche, toujours volontairement limitée par rapport à
 //! `pdf-render` :
 //! - Chemins **remplis** (`PaintOp::Fill`/`FillStroke`) et **tracés**
 //!   (`PaintOp::Stroke`/`FillStroke`), et glyphes (toujours remplis, règle
@@ -11,16 +11,43 @@
 //!   directement dans l'espace NDC (voir `PageToNdc::map_to_ndc`) plutôt
 //!   qu'en pixels comme côté CPU — la structure mathématique est identique
 //!   à `pdf_render::rotation_matrix`, seul l'espace de travail change.
-//! - **Pas d'images**, **pas de clip** (`W`/`W*`) — existent déjà côté
-//!   `pdf-render`/CPU, qui reste la référence tant que ce backend n'a pas
-//!   atteint la parité.
-//! - Rendu hors-écran uniquement (pas encore branché sur une fenêtre/surface
-//!   `pdf-ui`) : `render_page`/`render_page_scaled`/`render_page_rotated`
-//!   créent un contexte `wgpu` headless (`Instance::request_adapter` sans
-//!   surface) à chaque appel, rastérisent dans une texture, et relisent le
-//!   résultat en RGBA8 — suffisant pour valider le pipeline par comparaison
-//!   avec `pdf-render`, pas optimisé pour un rendu interactif (recréer le
-//!   device à chaque page serait couteux dans une vraie boucle de rendu).
+//! - **Images** (`DisplayItem::Image`) dessinées comme un quad texturé
+//!   (voir `build_image_quad`), avec le même mapping pixel -> carré unité
+//!   -> espace page que `pdf_render::draw_image` (`y` inversé : ligne 0 de
+//!   `DecodedImage` = haut de l'image = `y=1` du carré unité).
+//! - **Clip** (`W`/`W*`, voir `DisplayItem::*::clip`) appliqué via un
+//!   stencil buffer plutôt que le `tiny_skia::Mask` du CPU : les items sont
+//!   regroupés par pile de clip (`ClipStack`, comparée par pointeur `Rc`,
+//!   voir `group_items`), et chaque groupe rend d'abord ses `ClipPath`
+//!   imbriqués dans le stencil (`clip_write_pipeline`, incrémenté couche par
+//!   couche — la couche `i` ne s'écrit que là où la couche `i-1` a déjà
+//!   marqué le stencil, ce qui accumule l'**intersection** des clips), puis
+//!   son contenu avec un test stencil "= profondeur totale". Un stencil de
+//!   0 (donc un `Always` pour le groupe non clippé) évite un test inutile.
+//! - Glyphes tessellés une seule fois par `(font, code)` **par appel**
+//!   (voir `GlyphCache`) : le contour em-space est mis en cache après sa
+//!   première tessellation, puis simplement transformé (multiplication de
+//!   matrice, pas de nouvelle tessellation `lyon`) pour chaque occurrence
+//!   suivante du même glyphe sur la page — un texte de plusieurs centaines
+//!   de caractères ne tessellera dans la pratique qu'une poignée de formes
+//!   distinctes. Toujours pas un atlas de texture inter-appels (ce cache ne
+//!   survit pas à un appel à `render_page`/`GpuRenderer::render_page*`, qui
+//!   recrée pipelines/shaders/textures à chaque fois, voir plus bas).
+//! - Rendu hors-écran par construction (produit un `RenderedPage` RGBA8 lu
+//!   depuis une texture, pas encore un dessin direct dans une surface
+//!   `pdf-ui`) — mais le `Device`/`Queue` `wgpu`, eux, peuvent maintenant
+//!   être partagés entre appels : `render_page`/`render_page_scaled`/
+//!   `render_page_rotated` (fonctions libres) créent toujours un contexte
+//!   headless éphémère (`Instance::request_adapter` sans surface) à chaque
+//!   appel — pratique pour les tests et un usage ponctuel, mais chaque appel
+//!   renégocie un device (poignée de main avec le driver). `GpuRenderer`
+//!   évite ce coût : construit une fois (`GpuRenderer::new()`, ou
+//!   `from_shared` pour réutiliser le `Device`/`Queue` déjà négociés par un
+//!   hôte comme `eframe` — voir `pdf-ui`, qui sélectionne son backend
+//!   `wgpu` et lui passe `egui_wgpu::RenderState::{device,queue}`), il rend
+//!   ensuite autant de pages qu'on veut sans nouvelle négociation
+//!   d'adaptateur, seule la partie réellement coûteuse par page (pipelines/
+//!   tessellation) restant répétée.
 //!
 //! Convention de coordonnées : contrairement à `pdf-render` (espace pixmap,
 //! origine haut-gauche, Y vers le bas, d'où le flip explicite), l'espace
@@ -35,7 +62,8 @@ use lyon::tessellation::{
     FillVertexConstructor, StrokeOptions, StrokeTessellator, StrokeVertex, StrokeVertexConstructor,
     VertexBuffers,
 };
-use pdf_core::display::{Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
+use pdf_core::display::{ClipStack, Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment};
+use std::rc::Rc;
 
 /// Image RGBA8 rastérisée par ce backend — même forme que
 /// `pdf_app::RenderedPage`/le pixmap de `pdf-render`, pour rester
@@ -46,7 +74,11 @@ pub struct RenderedPage {
     pub rgba: Vec<u8>,
 }
 
-/// Rastérise une page entière (voir les limitations en tête de module).
+/// Rastérise une page entière (voir les limitations en tête de module) en
+/// créant un contexte `wgpu` headless éphémère (voir la doc de module) —
+/// pour un rendu interactif répété (`pdf-ui`), préférer `GpuRenderer`, qui
+/// réutilise un `Device`/`Queue` déjà existant (typiquement celui
+/// d'`eframe`) plutôt que d'en renégocier un nouveau à chaque page.
 /// `None` si aucun adaptateur `wgpu` n'est disponible dans l'environnement
 /// (pas de GPU/driver) — l'appelant doit alors se rabattre sur `pdf-render`.
 pub fn render_page(display: &DisplayList, media_box: [f64; 4]) -> Option<RenderedPage> {
@@ -63,27 +95,83 @@ pub fn render_page_scaled(
 }
 
 /// Comme `render_page_scaled`, en appliquant en plus la rotation de page
-/// (`/Rotate`, ISO 32000-1 §7.7.3.3). Les dimensions du pixmap sont
-/// permutées pour 90°/270° (portrait -> paysage), comme côté
-/// `pdf_render::render_page_rotated`.
+/// (`/Rotate`, ISO 32000-1 §7.7.3.3).
 pub fn render_page_rotated(
     display: &DisplayList,
     media_box: [f64; 4],
     rotate: i32,
     scale: f64,
 ) -> Option<RenderedPage> {
-    let scale = scale.max(0.01);
-    let rotate = normalize_rotate(rotate);
-    let unrotated_w = ((media_box[2] - media_box[0]) * scale).round().max(1.0) as u32;
-    let unrotated_h = ((media_box[3] - media_box[1]) * scale).round().max(1.0) as u32;
-    let (width, height) = if rotate == 90 || rotate == 270 {
-        (unrotated_h, unrotated_w)
-    } else {
-        (unrotated_w, unrotated_h)
-    };
+    GpuRenderer::new()?.render_page_rotated(display, media_box, rotate, scale)
+}
 
-    let ctx = GpuContext::new()?;
-    ctx.render(display, media_box, rotate, width, height)
+/// Rastérise avec un `wgpu::Device`/`Queue` conservé entre les appels — voir
+/// la doc de module : les pipelines/shaders/textures d'une page restent
+/// recréés à chaque appel (documenté comme un coût acceptable, largement
+/// dominé par la tessellation `lyon`), mais la négociation d'adaptateur/
+/// device (`Instance::request_adapter`/`request_device`, une poignée de main
+/// avec le driver) ne l'est plus — le coût qui rendait ce backend
+/// inutilisable dans une boucle interactive (voir `render_page`).
+///
+/// Construit via `new()` (contexte headless dédié, comme les fonctions
+/// libres ci-dessus) ou `from_shared` (réutilise le `Device`/`Queue` d'un
+/// hôte existant, typiquement `eframe`'s `egui_wgpu::RenderState` quand
+/// `NativeOptions::renderer` vaut `Wgpu` — voir `pdf-ui`).
+#[derive(Clone)]
+pub struct GpuRenderer(GpuContext);
+
+impl GpuRenderer {
+    /// Comme les fonctions libres du module : négocie son propre
+    /// `Device`/`Queue` headless. `None` si aucun adaptateur `wgpu` n'est
+    /// disponible.
+    pub fn new() -> Option<Self> {
+        GpuContext::new().map(GpuRenderer)
+    }
+
+    /// Réutilise un `Device`/`Queue` déjà négociés par l'appelant (partagés
+    /// via `Arc`, comme les expose `egui_wgpu::RenderState`) plutôt que d'en
+    /// renégocier — c'est ce qui rend ce backend viable dans une boucle de
+    /// rendu interactive (voir la doc de `GpuRenderer`).
+    pub fn from_shared(device: std::sync::Arc<wgpu::Device>, queue: std::sync::Arc<wgpu::Queue>) -> Self {
+        GpuRenderer(GpuContext { device, queue })
+    }
+
+    pub fn render_page(&self, display: &DisplayList, media_box: [f64; 4]) -> Option<RenderedPage> {
+        self.render_page_scaled(display, media_box, 1.0)
+    }
+
+    pub fn render_page_scaled(
+        &self,
+        display: &DisplayList,
+        media_box: [f64; 4],
+        scale: f64,
+    ) -> Option<RenderedPage> {
+        self.render_page_rotated(display, media_box, 0, scale)
+    }
+
+    /// Comme `render_page_scaled`, en appliquant en plus la rotation de page
+    /// (`/Rotate`, ISO 32000-1 §7.7.3.3). Les dimensions du pixmap sont
+    /// permutées pour 90°/270° (portrait -> paysage), comme côté
+    /// `pdf_render::render_page_rotated`.
+    pub fn render_page_rotated(
+        &self,
+        display: &DisplayList,
+        media_box: [f64; 4],
+        rotate: i32,
+        scale: f64,
+    ) -> Option<RenderedPage> {
+        let scale = scale.max(0.01);
+        let rotate = normalize_rotate(rotate);
+        let unrotated_w = ((media_box[2] - media_box[0]) * scale).round().max(1.0) as u32;
+        let unrotated_h = ((media_box[3] - media_box[1]) * scale).round().max(1.0) as u32;
+        let (width, height) = if rotate == 90 || rotate == 270 {
+            (unrotated_h, unrotated_w)
+        } else {
+            (unrotated_w, unrotated_h)
+        };
+
+        self.0.render(display, media_box, rotate, width, height)
+    }
 }
 
 /// Normalise une valeur `/Rotate` arbitraire au multiple de 90 le plus
@@ -191,6 +279,55 @@ impl StrokeVertexConstructor<Vertex> for WithColor {
     }
 }
 
+/// Constructeur de sommets "brut" : ne fait aucune mise à l'échelle ni
+/// mapping, juste la position em-space telle que tessellée par `lyon` —
+/// utilisé pour peupler `GlyphCache` (voir plus bas), où le mapping page ->
+/// NDC et la couleur ne sont appliqués qu'au moment de consommer le cache,
+/// une fois par occurrence du glyphe plutôt qu'une fois par tessellation.
+struct RawPosition;
+
+impl FillVertexConstructor<[f32; 2]> for RawPosition {
+    fn new_vertex(&mut self, vertex: FillVertex) -> [f32; 2] {
+        let p = vertex.position();
+        [p.x, p.y]
+    }
+}
+
+/// Géométrie tessellée d'un glyphe en espace em (non transformée) : voir
+/// `RawPosition`.
+type CachedGlyphGeometry = (Vec<[f32; 2]>, Vec<u32>);
+
+/// Cache `(font, code) -> géométrie em-space déjà tessellée` valide pour la
+/// durée d'un seul appel à `group_items` (voir la doc de module — pas un
+/// atlas persistant entre appels). `None` mémorise un glyphe dont le
+/// contour ne produit aucune géométrie exploitable (chemin dégénéré), pour
+/// éviter de retenter sa tessellation à chaque occurrence.
+type GlyphCache = std::collections::HashMap<(String, u32), Option<CachedGlyphGeometry>>;
+
+/// Transforme une géométrie de glyphe mise en cache (em-space) par
+/// `transform` (échelle police + matrice texte + CTM, voir `pdf_core::interp`)
+/// puis par `mapper` (page -> NDC), et l'ajoute à `out` — évite de
+/// re-tesseller ce qui a déjà été tessellé pour une occurrence précédente du
+/// même glyphe (voir `GlyphCache`).
+fn append_cached_glyph(
+    cached: &CachedGlyphGeometry,
+    transform: &Matrix,
+    color: [f32; 4],
+    mapper: &PageToNdc,
+    out: &mut VertexBuffers<Vertex, u32>,
+) {
+    let (positions, indices) = cached;
+    let base = out.vertices.len() as u32;
+    out.vertices.extend(positions.iter().map(|p| {
+        let (px, py) = transform.apply(p[0] as f64, p[1] as f64);
+        Vertex {
+            position: mapper.map_to_ndc(px, py),
+            color,
+        }
+    }));
+    out.indices.extend(indices.iter().map(|i| i + base));
+}
+
 fn to_rgba(color: Color) -> [f32; 4] {
     let (r, g, b) = match color {
         Color::Gray(g) => (g, g, g),
@@ -271,31 +408,275 @@ fn build_lyon_path(segments: &[PathSegment]) -> Option<LyonPath> {
     Some(builder.build())
 }
 
-/// Applique `transform` (échelle police + matrice texte + CTM, voir
-/// `pdf_core::interp`) à des segments en espace em, pour les ramener en
-/// espace page — même rôle que `pdf-render::build_glyph_path`, mais on
-/// produit ici des `PathSegment` plutôt que directement des primitives
-/// `lyon`, pour réutiliser `build_lyon_path` sans dupliquer sa logique.
-fn map_segments_to_page_space(segments: &[PathSegment], transform: &Matrix) -> Vec<PathSegment> {
-    let map = |p: (f64, f64)| transform.apply(p.0, p.1);
-    segments
-        .iter()
-        .map(|seg| match seg {
-            PathSegment::MoveTo(p) => PathSegment::MoveTo(map(*p)),
-            PathSegment::LineTo(p) => PathSegment::LineTo(map(*p)),
-            PathSegment::CurveTo { c1, c2, to } => PathSegment::CurveTo {
-                c1: map(*c1),
-                c2: map(*c2),
-                to: map(*to),
-            },
-            PathSegment::ClosePath => PathSegment::ClosePath,
-        })
-        .collect()
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
 }
 
+const IMAGE_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+};
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv);
+}
+"#;
+
+/// Construit un quad texturé plaçant `image` dans l'espace page via
+/// `transform` (carré unité PDF -> espace page, voir la doc de
+/// `DisplayItem::Image`), puis en NDC via `mapper` — même mapping pixel ->
+/// carré unité que `pdf_render::draw_image` : la ligne 0 de `DecodedImage`
+/// (haut de l'image) correspond à `y=1` du carré unité (`uv.y = 1 - y`,
+/// puisque la ligne 0 d'une texture `wgpu` est aussi son `v=0`).
+fn build_image_quad(transform: &Matrix, mapper: &PageToNdc) -> ([TexVertex; 4], [u16; 6]) {
+    let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+    let mut vertices = [TexVertex {
+        position: [0.0, 0.0],
+        uv: [0.0, 0.0],
+    }; 4];
+    for (i, (ux, uy)) in corners.iter().enumerate() {
+        let (px, py) = transform.apply(*ux, *uy);
+        vertices[i] = TexVertex {
+            position: mapper.map_to_ndc(px, py),
+            uv: [*ux as f32, (1.0 - *uy) as f32],
+        };
+    }
+    (vertices, [0, 1, 2, 0, 2, 3])
+}
+
+/// Un item de contenu à peindre au sein d'un `Group` (voir plus bas),
+/// préservant l'ordre de peinture d'origine de la `DisplayList` — chemins
+/// et glyphes d'un côté (accumulés dans un seul buffer de géométrie tant
+/// qu'aucune image ne s'intercale, pour limiter le nombre d'appels de
+/// dessin), images texturées de l'autre (chacune son propre bind group).
+enum Draw {
+    Solid(VertexBuffers<Vertex, u32>),
+    Image {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        quad: ([TexVertex; 4], [u16; 6]),
+    },
+}
+
+/// Un groupe d'items partageant la même pile de clip (comparée par
+/// pointeur `Rc`, voir `group_items`) — la frontière entre deux groupes est
+/// aussi une frontière de passe de rendu (voir `GpuContext::render`), pour
+/// pouvoir remettre à zéro le stencil buffer entre deux piles de clip
+/// différentes sans perdre le contenu déjà peint (`LoadOp::Load` sur la
+/// couleur, `LoadOp::Clear` sur le stencil).
+struct Group {
+    /// Une couche de géométrie tessellée par `ClipPath` de la pile (déjà en
+    /// NDC, via le même `mapper` que le reste du groupe), dans l'ordre —
+    /// filtrée des chemins dégénérés (voir `build_lyon_path`), comme
+    /// `pdf_render::build_clip_mask` dégrade silencieusement en "pas de
+    /// clip" plutôt que de bloquer le rendu. `is_empty()` signifie donc
+    /// "pas de clip effectif", que la pile d'origine ait été `None` ou
+    /// entièrement dégénérée.
+    clip_layers: Vec<VertexBuffers<Vertex, u32>>,
+    draws: Vec<Draw>,
+}
+
+/// Regroupe les items de `display` en `Group`s consécutifs partageant la
+/// même pile de clip (comparaison par pointeur `Rc::as_ptr`, comme
+/// `pdf_render::render_to_pixmap`'s `mask_for`) — une nouvelle pile revue
+/// plus loin dans la liste (après un `Q` de restauration, par exemple)
+/// redéclenche un nouveau groupe plutôt que de réutiliser le premier :
+/// correct dans tous les cas, simplement pas optimal si la même pile
+/// alterne souvent avec une autre (non observé en pratique, le clip PDF
+/// change rarement item par item).
+fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut current_key: Option<Option<*const Vec<pdf_core::display::ClipPath>>> = None;
+    let mut fill_tessellator = FillTessellator::new();
+    let mut stroke_tessellator = StrokeTessellator::new();
+    let mut glyph_cache: GlyphCache = GlyphCache::new();
+
+    let clip_key = |clip: &Option<ClipStack>| clip.as_ref().map(Rc::as_ptr);
+
+    for item in &display.items {
+        let clip = match item {
+            DisplayItem::Path { clip, .. }
+            | DisplayItem::Glyph { clip, .. }
+            | DisplayItem::Image { clip, .. } => clip,
+        };
+        let key = clip_key(clip);
+        if current_key != Some(key) {
+            current_key = Some(key);
+            let clip_layers = clip
+                .as_ref()
+                .map(|stack| {
+                    stack
+                        .iter()
+                        .filter_map(|clip_path| {
+                            let path = build_lyon_path(&clip_path.segments)?;
+                            let mut geometry: VertexBuffers<Vertex, u32> = VertexBuffers::new();
+                            let options = FillOptions::default()
+                                .with_fill_rule(to_lyon_fill_rule(clip_path.fill_rule));
+                            let _ = fill_tessellator.tessellate_path(
+                                &path,
+                                &options,
+                                &mut BuffersBuilder::new(
+                                    &mut geometry,
+                                    WithColor {
+                                        color: [0.0, 0.0, 0.0, 0.0],
+                                        mapper: *mapper,
+                                    },
+                                ),
+                            );
+                            Some(geometry)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            groups.push(Group {
+                clip_layers,
+                draws: Vec::new(),
+            });
+        }
+        let group = groups.last_mut().expect("just pushed if empty");
+
+        let pending = match group.draws.last_mut() {
+            Some(Draw::Solid(geometry)) => geometry,
+            _ => {
+                group.draws.push(Draw::Solid(VertexBuffers::new()));
+                let Some(Draw::Solid(geometry)) = group.draws.last_mut() else {
+                    unreachable!()
+                };
+                geometry
+            }
+        };
+
+        match item {
+            DisplayItem::Path {
+                segments,
+                paint,
+                fill_rule,
+                fill_color,
+                stroke_color,
+                line_width,
+                ..
+            } => {
+                let Some(path) = build_lyon_path(segments) else {
+                    continue;
+                };
+                if matches!(paint, PaintOp::Fill | PaintOp::FillStroke) {
+                    let options =
+                        FillOptions::default().with_fill_rule(to_lyon_fill_rule(*fill_rule));
+                    let _ = fill_tessellator.tessellate_path(
+                        &path,
+                        &options,
+                        &mut BuffersBuilder::new(
+                            pending,
+                            WithColor {
+                                color: to_rgba(*fill_color),
+                                mapper: *mapper,
+                            },
+                        ),
+                    );
+                }
+                if matches!(paint, PaintOp::Stroke | PaintOp::FillStroke) {
+                    let options =
+                        StrokeOptions::default().with_line_width(line_width.max(0.1) as f32);
+                    let _ = stroke_tessellator.tessellate_path(
+                        &path,
+                        &options,
+                        &mut BuffersBuilder::new(
+                            pending,
+                            WithColor {
+                                color: to_rgba(*stroke_color),
+                                mapper: *mapper,
+                            },
+                        ),
+                    );
+                }
+            }
+            DisplayItem::Glyph {
+                font,
+                code,
+                outline: Some(segments),
+                transform,
+                color,
+                ..
+            } => {
+                let cached = glyph_cache
+                    .entry((font.clone(), *code))
+                    .or_insert_with(|| {
+                        let path = build_lyon_path(segments)?;
+                        let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+                        let _ = fill_tessellator.tessellate_path(
+                            &path,
+                            &FillOptions::default(), // nonzero, correct pour des glyphes.
+                            &mut BuffersBuilder::new(&mut geometry, RawPosition),
+                        );
+                        if geometry.indices.is_empty() {
+                            None
+                        } else {
+                            Some((geometry.vertices, geometry.indices))
+                        }
+                    });
+                if let Some(geometry) = cached.as_ref() {
+                    append_cached_glyph(geometry, transform, to_rgba(*color), mapper, pending);
+                }
+            }
+            DisplayItem::Glyph { outline: None, .. } => {}
+            DisplayItem::Image {
+                pixels: Some(image),
+                transform,
+                ..
+            } => {
+                if image.width == 0 || image.height == 0 {
+                    continue;
+                }
+                group.draws.push(Draw::Image {
+                    width: image.width,
+                    height: image.height,
+                    rgba: image.rgba.clone(),
+                    quad: build_image_quad(transform, mapper),
+                });
+            }
+            DisplayItem::Image { pixels: None, .. } => {}
+        }
+    }
+
+    // Une `DisplayList` vide ne produit aucun groupe, mais la page doit
+    // quand même être rasterisée en blanc (`rasterize` clippe la couleur
+    // au premier groupe) — sans ce groupe placeholder, la texture cible ne
+    // serait jamais touchée et resterait à son contenu non initialisé.
+    if groups.is_empty() {
+        groups.push(Group {
+            clip_layers: Vec::new(),
+            draws: Vec::new(),
+        });
+    }
+
+    groups
+}
+
+#[derive(Clone)]
 struct GpuContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: std::sync::Arc<wgpu::Device>,
+    queue: std::sync::Arc<wgpu::Queue>,
 }
 
 impl GpuContext {
@@ -309,7 +690,10 @@ impl GpuContext {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
                 .ok()?;
-        Some(Self { device, queue })
+        Some(Self {
+            device: std::sync::Arc::new(device),
+            queue: std::sync::Arc::new(queue),
+        })
     }
 
     fn render(
@@ -328,92 +712,11 @@ impl GpuContext {
             rotate,
         };
 
-        let mut geometry: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-        let mut fill_tessellator = FillTessellator::new();
-        let mut stroke_tessellator = StrokeTessellator::new();
-
-        for item in &display.items {
-            match item {
-                DisplayItem::Path {
-                    segments,
-                    paint,
-                    fill_rule,
-                    fill_color,
-                    stroke_color,
-                    line_width,
-                    ..
-                } => {
-                    let Some(path) = build_lyon_path(segments) else {
-                        continue;
-                    };
-                    if matches!(paint, PaintOp::Fill | PaintOp::FillStroke) {
-                        let options =
-                            FillOptions::default().with_fill_rule(to_lyon_fill_rule(*fill_rule));
-                        let _ = fill_tessellator.tessellate_path(
-                            &path,
-                            &options,
-                            &mut BuffersBuilder::new(
-                                &mut geometry,
-                                WithColor {
-                                    color: to_rgba(*fill_color),
-                                    mapper,
-                                },
-                            ),
-                        );
-                    }
-                    if matches!(paint, PaintOp::Stroke | PaintOp::FillStroke) {
-                        let options =
-                            StrokeOptions::default().with_line_width(line_width.max(0.1) as f32);
-                        let _ = stroke_tessellator.tessellate_path(
-                            &path,
-                            &options,
-                            &mut BuffersBuilder::new(
-                                &mut geometry,
-                                WithColor {
-                                    color: to_rgba(*stroke_color),
-                                    mapper,
-                                },
-                            ),
-                        );
-                    }
-                }
-                DisplayItem::Glyph {
-                    outline: Some(segments),
-                    transform,
-                    color,
-                    ..
-                } => {
-                    let mapped = map_segments_to_page_space(segments, transform);
-                    let Some(path) = build_lyon_path(&mapped) else {
-                        continue;
-                    };
-                    let _ = fill_tessellator.tessellate_path(
-                        &path,
-                        &FillOptions::default(), // nonzero, correct pour des glyphes.
-                        &mut BuffersBuilder::new(
-                            &mut geometry,
-                            WithColor {
-                                color: to_rgba(*color),
-                                mapper,
-                            },
-                        ),
-                    );
-                }
-                // Images, glyphes sans contour, clip : voir limitations en
-                // tête de module.
-                _ => {}
-            }
-        }
-
-        self.rasterize(&geometry, width, height)
+        let groups = group_items(display, &mapper);
+        self.rasterize(&groups, width, height)
     }
 
-    fn rasterize(
-        &self,
-        geometry: &VertexBuffers<Vertex, u32>,
-        width: u32,
-        height: u32,
-    ) -> Option<RenderedPage> {
+    fn rasterize(&self, groups: &[Group], width: u32, height: u32) -> Option<RenderedPage> {
         use wgpu::util::DeviceExt;
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -432,100 +735,431 @@ impl GpuContext {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let shader = self
+        // Stencil dédié au clip (voir la doc de module) : recréé pour
+        // chaque appel comme le reste de ce contexte headless, remis à zéro
+        // (`LoadOp::Clear`) à chaque frontière de groupe plutôt qu'une seule
+        // fois, pour ne jamais mélanger l'accumulation d'intersection de
+        // deux piles de clip différentes.
+        let stencil = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pdf-render-gpu-stencil"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Stencil8,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let stencil_view = stencil.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let solid_shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pdf-render-gpu-solid"),
                 source: wgpu::ShaderSource::Wgsl(SHADER.into()),
             });
-        let pipeline_layout = self
+        let image_shader = self
             .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("pdf-render-gpu-fill"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                offset: 0,
-                                shader_location: 0,
-                                format: wgpu::VertexFormat::Float32x2,
-                            },
-                            wgpu::VertexAttribute {
-                                offset: 8,
-                                shader_location: 1,
-                                format: wgpu::VertexFormat::Float32x4,
-                            },
-                        ],
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pdf-render-gpu-image"),
+                source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()),
             });
 
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pdf-render-gpu-vertices"),
-                contents: bytemuck::cast_slice(&geometry.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pdf-render-gpu-indices"),
-                contents: bytemuck::cast_slice(&geometry.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        let solid_pipeline_layout =
+            self.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[],
+                    push_constant_ranges: &[],
+                });
+
+        let image_bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pdf-render-gpu-image-bind-group-layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let image_pipeline_layout =
+            self.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[&image_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        // Trois familles de pipelines, chacune en variante "non clippée"
+        // (le stencil n'est jamais testé, `Always`) et "clippée" (le
+        // fragment n'est peint que là où le stencil vaut la référence
+        // dynamique posée par `set_stencil_reference` — la profondeur
+        // totale de la pile de clip du groupe courant, voir plus bas) :
+        // - `clip_write` : peint les `ClipPath` eux-mêmes dans le stencil
+        //   (pas de sortie couleur), une couche à la fois, incrémentée
+        //   uniquement là où la couche précédente est déjà passée —
+        //   accumule ainsi l'intersection des clips imbriqués.
+        // - `content_*` : chemins/glyphes (`SHADER`, couleur pleine).
+        // - `image_*` : quads texturés (`IMAGE_SHADER`).
+        let no_stencil_test = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Stencil8,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Always,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Keep,
+                },
+                back: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Always,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Keep,
+                },
+                read_mask: 0,
+                write_mask: 0,
+            },
+            bias: wgpu::DepthBiasState::default(),
+        };
+        let masked_by_stencil = wgpu::DepthStencilState {
+            stencil: wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    ..no_stencil_test.stencil.front
+                },
+                back: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    ..no_stencil_test.stencil.back
+                },
+                read_mask: 0xff,
+                write_mask: 0,
+            },
+            ..no_stencil_test.clone()
+        };
+        let clip_write_state = wgpu::DepthStencilState {
+            stencil: wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::IncrementClamp,
+                },
+                back: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::IncrementClamp,
+                },
+                read_mask: 0xff,
+                write_mask: 0xff,
+            },
+            ..no_stencil_test.clone()
+        };
+
+        let solid_vertex_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }];
+        let image_vertex_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TexVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        }];
+
+        let make_solid_pipeline = |label: &str,
+                                    depth_stencil: wgpu::DepthStencilState,
+                                    color_writes: wgpu::ColorWrites| {
+            self.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&solid_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &solid_shader,
+                        entry_point: "vs_main",
+                        compilation_options: Default::default(),
+                        buffers: &solid_vertex_buffers,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &solid_shader,
+                        entry_point: "fs_main",
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: color_writes,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(depth_stencil),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                })
+        };
+        let content_pipeline =
+            make_solid_pipeline("pdf-render-gpu-content", no_stencil_test.clone(), wgpu::ColorWrites::ALL);
+        let content_pipeline_clipped = make_solid_pipeline(
+            "pdf-render-gpu-content-clipped",
+            masked_by_stencil.clone(),
+            wgpu::ColorWrites::ALL,
+        );
+        let clip_write_pipeline = make_solid_pipeline(
+            "pdf-render-gpu-clip-write",
+            clip_write_state,
+            wgpu::ColorWrites::empty(),
+        );
+
+        let make_image_pipeline = |label: &str, depth_stencil: wgpu::DepthStencilState| {
+            self.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&image_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &image_shader,
+                        entry_point: "vs_main",
+                        compilation_options: Default::default(),
+                        buffers: &image_vertex_buffers,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &image_shader,
+                        entry_point: "fs_main",
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(depth_stencil),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                })
+        };
+        let image_pipeline = make_image_pipeline("pdf-render-gpu-image", no_stencil_test);
+        let image_pipeline_clipped =
+            make_image_pipeline("pdf-render-gpu-image-clipped", masked_by_stencil);
+
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
+
+        for (group_index, group) in groups.iter().enumerate() {
+            let clip_depth = group.clip_layers.len() as u32;
+            let is_clipped = clip_depth > 0;
+
+            let color_load = if group_index == 0 {
+                wgpu::LoadOp::Clear(wgpu::Color::WHITE)
+            } else {
+                wgpu::LoadOp::Load
+            };
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pdf-render-gpu-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &stencil_view,
+                    depth_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if !geometry.indices.is_empty() {
-                pass.set_pipeline(&pipeline);
+
+            for (layer_index, geometry) in group.clip_layers.iter().enumerate() {
+                if geometry.indices.is_empty() {
+                    continue;
+                }
+                let vertex_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("pdf-render-gpu-clip-vertices"),
+                            contents: bytemuck::cast_slice(&geometry.vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                let index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("pdf-render-gpu-clip-indices"),
+                            contents: bytemuck::cast_slice(&geometry.indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+                pass.set_pipeline(&clip_write_pipeline);
+                pass.set_stencil_reference(layer_index as u32);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..geometry.indices.len() as u32, 0, 0..1);
+            }
+
+            if is_clipped {
+                pass.set_stencil_reference(clip_depth);
+            }
+
+            for draw in &group.draws {
+                match draw {
+                    Draw::Solid(geometry) => {
+                        if geometry.indices.is_empty() {
+                            continue;
+                        }
+                        let vertex_buffer = self.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("pdf-render-gpu-vertices"),
+                                contents: bytemuck::cast_slice(&geometry.vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            },
+                        );
+                        let index_buffer = self.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("pdf-render-gpu-indices"),
+                                contents: bytemuck::cast_slice(&geometry.indices),
+                                usage: wgpu::BufferUsages::INDEX,
+                            },
+                        );
+                        let pipeline = if is_clipped {
+                            &content_pipeline_clipped
+                        } else {
+                            &content_pipeline
+                        };
+                        pass.set_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..geometry.indices.len() as u32, 0, 0..1);
+                    }
+                    Draw::Image {
+                        width: img_w,
+                        height: img_h,
+                        rgba,
+                        quad,
+                    } => {
+                        let texture = self.device.create_texture_with_data(
+                            &self.queue,
+                            &wgpu::TextureDescriptor {
+                                label: Some("pdf-render-gpu-image-src"),
+                                size: wgpu::Extent3d {
+                                    width: *img_w,
+                                    height: *img_h,
+                                    depth_or_array_layers: 1,
+                                },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                    | wgpu::TextureUsages::COPY_DST,
+                                view_formats: &[],
+                            },
+                            wgpu::util::TextureDataOrder::LayerMajor,
+                            rgba,
+                        );
+                        let texture_view =
+                            texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("pdf-render-gpu-image-bind-group"),
+                                layout: &image_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &texture_view,
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(&sampler),
+                                    },
+                                ],
+                            });
+                        let (vertices, indices) = quad;
+                        let vertex_buffer = self.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("pdf-render-gpu-image-vertices"),
+                                contents: bytemuck::cast_slice(vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            },
+                        );
+                        let index_buffer = self.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("pdf-render-gpu-image-indices"),
+                                contents: bytemuck::cast_slice(indices),
+                                usage: wgpu::BufferUsages::INDEX,
+                            },
+                        );
+                        let pipeline = if is_clipped {
+                            &image_pipeline_clipped
+                        } else {
+                            &image_pipeline
+                        };
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &bind_group, &[]);
+                        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                    }
+                }
             }
         }
 
@@ -625,6 +1259,31 @@ mod tests {
                 clip: None,
             }],
         }
+    }
+
+    /// `GpuRenderer` doit rester utilisable pour plusieurs pages
+    /// successives avec le même `Device`/`Queue` (le cas d'usage visé côté
+    /// `pdf-ui`, voir la doc de `GpuRenderer`) — deux appels avec des
+    /// couleurs différentes ne doivent pas se mélanger ni paniquer sur un
+    /// device réutilisé.
+    #[test]
+    fn gpu_renderer_renders_multiple_pages_with_the_same_device() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        let red = renderer
+            .render_page(&rect_display(Color::Rgb(1.0, 0.0, 0.0)), [0.0, 0.0, 100.0, 100.0])
+            .unwrap();
+        let blue = renderer
+            .render_page(&rect_display(Color::Rgb(0.0, 0.0, 1.0)), [0.0, 0.0, 100.0, 100.0])
+            .unwrap();
+
+        let red_center = pixel(&red, 50, 50);
+        assert_eq!((red_center.0, red_center.1, red_center.2), (255, 0, 0));
+        let blue_center = pixel(&blue, 50, 50);
+        assert_eq!((blue_center.0, blue_center.1, blue_center.2), (0, 0, 255));
     }
 
     /// Symétrique de `pdf_render::tests::renders_filled_rect_with_correct_color_and_flip` :
@@ -731,6 +1390,51 @@ mod tests {
         assert!(
             has_non_white_pixel,
             "expected glyph ink somewhere on the page"
+        );
+    }
+
+    /// Deux occurrences du même glyphe (même `font`/`code`, donc la seconde
+    /// est servie par `GlyphCache` plutôt que re-tessellée) à deux positions
+    /// distinctes doivent chacune peindre à leur propre endroit — preuve que
+    /// `append_cached_glyph` applique bien la matrice `transform` *par
+    /// occurrence* plutôt que de rejouer la position mise en cache lors de
+    /// la première tessellation.
+    #[test]
+    fn repeated_glyph_renders_at_each_occurrence_position_via_cache() {
+        let outline = vec![
+            PathSegment::MoveTo((0.0, 0.0)),
+            PathSegment::LineTo((10.0, 0.0)),
+            PathSegment::LineTo((10.0, 10.0)),
+            PathSegment::LineTo((0.0, 10.0)),
+            PathSegment::ClosePath,
+        ];
+        let glyph_at = |tx: f64, ty: f64| DisplayItem::Glyph {
+            font: "F1".into(),
+            code: 65,
+            unicode: Some('A'),
+            transform: Matrix::translation(tx, ty),
+            color: Color::Gray(0.0),
+            advance_is_estimated: false,
+            outline: Some(outline.clone()),
+            clip: None,
+        };
+        let display = DisplayList {
+            items: vec![glyph_at(10.0, 10.0), glyph_at(70.0, 70.0)],
+        };
+        let Some(page) = render_page(&display, [0.0, 0.0, 100.0, 100.0]) else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        let first = pixel(&page, 15, 100 - 15);
+        assert_eq!((first.0, first.1, first.2), (0, 0, 0));
+        let second = pixel(&page, 75, 100 - 75);
+        assert_eq!((second.0, second.1, second.2), (0, 0, 0));
+        let between = pixel(&page, 50, 50);
+        assert_eq!(
+            (between.0, between.1, between.2),
+            (255, 255, 255),
+            "the cached glyph must not also paint at the first occurrence's position"
         );
     }
 
@@ -845,5 +1549,209 @@ mod tests {
             (bottom_left.0, bottom_left.1, bottom_left.2),
             (255, 255, 255)
         );
+    }
+
+    /// Symétrique de `pdf_render::tests::draws_decoded_image_at_correct_position` :
+    /// image bicolore (rouge à gauche, bleu à droite) occupant toute la
+    /// page — preuve que le quad texturé (`build_image_quad`) est bien
+    /// placé et que le flip pixel -> carré unité ne mélange pas les
+    /// moitiés gauche/droite ni ne les inverse verticalement.
+    #[test]
+    fn draws_decoded_image_at_correct_position() {
+        use pdf_core::display::DecodedImage;
+
+        let width = 10u32;
+        let height = 10u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _y in 0..height {
+            for x in 0..width {
+                if x < width / 2 {
+                    rgba.extend_from_slice(&[255, 0, 0, 255]); // rouge à gauche
+                } else {
+                    rgba.extend_from_slice(&[0, 0, 255, 255]); // bleu à droite
+                }
+            }
+        }
+        let image = DecodedImage {
+            width,
+            height,
+            rgba,
+        };
+        let display = DisplayList {
+            items: vec![DisplayItem::Image {
+                resource: "Im0".into(),
+                transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
+                pixels: Some(image),
+                clip: None,
+            }],
+        };
+        let Some(page) = render_page(&display, [0.0, 0.0, 100.0, 100.0]) else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        let left = pixel(&page, 25, 50);
+        assert_eq!((left.0, left.1, left.2), (255, 0, 0));
+        let right = pixel(&page, 75, 50);
+        assert_eq!((right.0, right.1, right.2), (0, 0, 255));
+    }
+
+    /// Symétrique de `pdf_render::tests::semi_transparent_image_blends_with_page_background` :
+    /// une image rouge à ~50% d'alpha peinte sur le fond blanc doit se
+    /// fondre avec lui (rose), pas apparaître en rouge plein comme si
+    /// l'alpha du `DecodedImage` était ignoré par le shader de texture.
+    #[test]
+    fn semi_transparent_image_blends_with_page_background() {
+        use pdf_core::display::DecodedImage;
+
+        let width = 4u32;
+        let height = 4u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            rgba.extend_from_slice(&[255, 0, 0, 128]); // rouge à ~50% d'alpha.
+        }
+        let image = DecodedImage {
+            width,
+            height,
+            rgba,
+        };
+        let display = DisplayList {
+            items: vec![DisplayItem::Image {
+                resource: "Im0".into(),
+                transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
+                pixels: Some(image),
+                clip: None,
+            }],
+        };
+        let Some(page) = render_page(&display, [0.0, 0.0, 100.0, 100.0]) else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+        let center = pixel(&page, 50, 50);
+        // Ni blanc pur (alpha ignoré à 0) ni rouge pur (alpha ignoré à 255) :
+        // un mélange, avec un vert/bleu résiduel du fond blanc.
+        assert!(center.1 > 0 && center.1 < 255);
+        assert_eq!(center.1, center.2);
+        assert!(center.0 > center.1);
+    }
+
+    /// Symétrique de `pdf_render::tests::clip_restricts_painted_area_to_the_clip_path` :
+    /// un rectangle noir couvrant toute la page, mais peint sous un clip
+    /// (`W`/`W*`, `DisplayItem::Path::clip`) restreint à `10..50` — seule
+    /// cette zone doit être noire, le reste doit rester blanc — preuve que
+    /// le stencil buffer (voir la doc de module) est réellement appliqué,
+    /// pas juste porté par le `DisplayItem` sans effet.
+    #[test]
+    fn clip_restricts_painted_area_to_the_clip_path() {
+        use pdf_core::display::ClipPath;
+
+        let clip_rect = vec![
+            PathSegment::MoveTo((10.0, 10.0)),
+            PathSegment::LineTo((50.0, 10.0)),
+            PathSegment::LineTo((50.0, 50.0)),
+            PathSegment::LineTo((10.0, 50.0)),
+            PathSegment::ClosePath,
+        ];
+        let clip = Some(Rc::new(vec![ClipPath {
+            segments: clip_rect,
+            fill_rule: FillRule::NonZero,
+        }]));
+
+        let display = DisplayList {
+            items: vec![DisplayItem::Path {
+                segments: vec![
+                    PathSegment::MoveTo((0.0, 0.0)),
+                    PathSegment::LineTo((100.0, 0.0)),
+                    PathSegment::LineTo((100.0, 100.0)),
+                    PathSegment::LineTo((0.0, 100.0)),
+                    PathSegment::ClosePath,
+                ],
+                paint: PaintOp::Fill,
+                fill_rule: FillRule::NonZero,
+                fill_color: Color::Gray(0.0),
+                stroke_color: Color::default(),
+                line_width: 1.0,
+                sets_clip: false,
+                clip,
+            }],
+        };
+        let Some(page) = render_page(&display, [0.0, 0.0, 100.0, 100.0]) else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        // Centre de la zone de clip (10..50, 10..50) -> doit être peint noir.
+        let inside = pixel(&page, 30, 100 - 30);
+        assert_eq!((inside.0, inside.1, inside.2), (0, 0, 0));
+
+        // Hors du clip -> doit être resté blanc malgré le rectangle plein page.
+        let outside = pixel(&page, 80, 100 - 80);
+        assert_eq!((outside.0, outside.1, outside.2), (255, 255, 255));
+    }
+
+    /// Deux clips consécutifs mais disjoints (chacun sa propre pile `Rc`,
+    /// comme deux `q ... W n ... Q` successifs) doivent chacun restreindre
+    /// leur propre item — preuve que le stencil est bien remis à zéro à
+    /// chaque frontière de groupe (voir `Group`/`GpuContext::rasterize`)
+    /// plutôt que de laisser le stencil du premier clip "fuiter" sur le
+    /// second (ce qui, avec un stencil jamais nettoyé, ferait échouer le
+    /// test stencil `Equal` du second groupe puisque son compteur partirait
+    /// d'une valeur déjà non nulle).
+    #[test]
+    fn two_sequential_disjoint_clips_each_restrict_their_own_item() {
+        use pdf_core::display::ClipPath;
+
+        let clip_a = Some(Rc::new(vec![ClipPath {
+            segments: vec![
+                PathSegment::MoveTo((0.0, 0.0)),
+                PathSegment::LineTo((40.0, 0.0)),
+                PathSegment::LineTo((40.0, 100.0)),
+                PathSegment::LineTo((0.0, 100.0)),
+                PathSegment::ClosePath,
+            ],
+            fill_rule: FillRule::NonZero,
+        }]));
+        let clip_b = Some(Rc::new(vec![ClipPath {
+            segments: vec![
+                PathSegment::MoveTo((60.0, 0.0)),
+                PathSegment::LineTo((100.0, 0.0)),
+                PathSegment::LineTo((100.0, 100.0)),
+                PathSegment::LineTo((60.0, 100.0)),
+                PathSegment::ClosePath,
+            ],
+            fill_rule: FillRule::NonZero,
+        }]));
+
+        let full_page_rect = |clip: Option<ClipStack>| DisplayItem::Path {
+            segments: vec![
+                PathSegment::MoveTo((0.0, 0.0)),
+                PathSegment::LineTo((100.0, 0.0)),
+                PathSegment::LineTo((100.0, 100.0)),
+                PathSegment::LineTo((0.0, 100.0)),
+                PathSegment::ClosePath,
+            ],
+            paint: PaintOp::Fill,
+            fill_rule: FillRule::NonZero,
+            fill_color: Color::Gray(0.0),
+            stroke_color: Color::default(),
+            line_width: 1.0,
+            sets_clip: false,
+            clip,
+        };
+
+        let display = DisplayList {
+            items: vec![full_page_rect(clip_a), full_page_rect(clip_b)],
+        };
+        let Some(page) = render_page(&display, [0.0, 0.0, 100.0, 100.0]) else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        let in_a = pixel(&page, 20, 50);
+        assert_eq!((in_a.0, in_a.1, in_a.2), (0, 0, 0));
+        let in_b = pixel(&page, 80, 50);
+        assert_eq!((in_b.0, in_b.1, in_b.2), (0, 0, 0));
+        let between = pixel(&page, 50, 50);
+        assert_eq!((between.0, between.1, between.2), (255, 255, 255));
     }
 }

@@ -4,10 +4,11 @@
 //! `DisplayList`.
 //!
 //! Limitations connues à ce stade — voir sprint.md :
-//! - Polices composites (`/Type0`, CID, codes 2 octets) : non gérées par
-//!   `font::Font` ; repli sur l'avance placeholder et `unicode: None`
-//!   (`DisplayItem::Glyph::advance_is_estimated` le signale).
-//! - `/ToUnicode` n'est pas lu (seul `/Encoding`+`/Differences` l'est).
+//! - Polices composites (`/Type0`) : gérées (`show_text` branche sur
+//!   `Font::is_composite()`, codes 2 octets = CID via `Font::decode_composite`)
+//!   mais seulement pour l'`/Encoding` `Identity-H`/`Identity-V` — voir la
+//!   doc de module de `font.rs` pour le périmètre exact et ce qui retombe en
+//!   best-effort plutôt que d'être rejeté.
 //! - Le clip (`W`/`W*`) est suivi dans l'état graphique (intersection des
 //!   clips imbriqués, sauvegardé/restauré par `q`/`Q`) et propagé à chaque
 //!   `DisplayItem` émis ensuite ; son application effective au rendu se
@@ -394,50 +395,97 @@ impl<'a> Interpreter<'a> {
             .ok()
             .flatten()
             .and_then(|obj| obj.as_dict().cloned())
-            .and_then(|dict| Font::load(self.doc, &dict).ok())
-            .filter(|f| !f.is_composite()); // polices composites (Type0) : repli placeholder.
+            .and_then(|dict| Font::load(self.doc, &dict).ok());
 
-        for &code in bytes {
-            let scale = Matrix::new(
-                self.gs.font_size * self.gs.h_scale,
-                0.0,
-                0.0,
-                self.gs.font_size,
-                0.0,
-                self.gs.text_rise,
-            );
-            let transform = scale.then(&self.text_matrix).then(&self.gs.ctm);
-
-            let (unicode, width_per_mille, advance_is_estimated, outline) = match &font {
-                Some(f) => {
-                    let (u, w) = f.decode_simple(code);
-                    (u, w, false, f.glyph_outline(code, u))
+        match &font {
+            // Police composite (`/Type0`) : codes 2 octets = CID (voir
+            // `Font::decode_composite` pour le périmètre exact,
+            // Identity-H/V). L'espacement de mot (`Tw`) ne s'applique qu'au
+            // code 1 octet 32 (ISO 32000-1 §9.3.3) : jamais le cas ici.
+            Some(f) if f.is_composite() => {
+                for cid in f.decode_composite(bytes) {
+                    let (unicode, width_per_mille) = f.cid_metrics(cid);
+                    let outline = f.cid_glyph_outline(cid);
+                    self.emit_glyph(&font_name, cid, unicode, width_per_mille, false, outline, false);
                 }
-                None => (None, PLACEHOLDER_GLYPH_WIDTH_PER_MILLE, true, None),
-            };
-
-            self.display.items.push(DisplayItem::Glyph {
-                font: font_name.clone(),
-                code: code as u32,
-                unicode,
-                transform,
-                color: self.gs.fill_color,
-                advance_is_estimated,
-                outline,
-                clip: self.gs.clip.clone(),
-            });
-
-            let word_spacing = if code == b' ' {
-                self.gs.word_spacing
-            } else {
-                0.0
-            };
-            let advance = (width_per_mille / 1000.0 * self.gs.font_size
-                + self.gs.char_spacing
-                + word_spacing)
-                * self.gs.h_scale;
-            self.text_matrix = Matrix::translation(advance, 0.0).then(&self.text_matrix);
+            }
+            Some(f) => {
+                for &code in bytes {
+                    let (unicode, width_per_mille) = f.decode_simple(code);
+                    let outline = f.glyph_outline(code, unicode);
+                    self.emit_glyph(
+                        &font_name,
+                        code as u32,
+                        unicode,
+                        width_per_mille,
+                        false,
+                        outline,
+                        code == b' ',
+                    );
+                }
+            }
+            None => {
+                for &code in bytes {
+                    self.emit_glyph(
+                        &font_name,
+                        code as u32,
+                        None,
+                        PLACEHOLDER_GLYPH_WIDTH_PER_MILLE,
+                        true,
+                        None,
+                        code == b' ',
+                    );
+                }
+            }
         }
+    }
+
+    /// Émet un `DisplayItem::Glyph` pour un code/CID déjà résolu en
+    /// `(unicode, largeur)` et avance `text_matrix` en conséquence — partagé
+    /// entre les trois chemins de `show_text` (police simple, composite,
+    /// non résolue) pour ne pas dupliquer le calcul de transform/avance.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_glyph(
+        &mut self,
+        font_name: &str,
+        code: u32,
+        unicode: Option<char>,
+        width_per_mille: f64,
+        advance_is_estimated: bool,
+        outline: Option<Vec<PathSegment>>,
+        apply_word_spacing: bool,
+    ) {
+        let scale = Matrix::new(
+            self.gs.font_size * self.gs.h_scale,
+            0.0,
+            0.0,
+            self.gs.font_size,
+            0.0,
+            self.gs.text_rise,
+        );
+        let transform = scale.then(&self.text_matrix).then(&self.gs.ctm);
+
+        self.display.items.push(DisplayItem::Glyph {
+            font: font_name.to_string(),
+            code,
+            unicode,
+            transform,
+            color: self.gs.fill_color,
+            advance_is_estimated,
+            outline,
+            clip: self.gs.clip.clone(),
+        });
+
+        let word_spacing = if apply_word_spacing {
+            self.gs.word_spacing
+        } else {
+            0.0
+        };
+        let advance = (width_per_mille / 1000.0 * self.gs.font_size
+            + self.gs.char_spacing
+            + word_spacing)
+            * self.gs.h_scale;
+        self.text_matrix = Matrix::translation(advance, 0.0).then(&self.text_matrix);
     }
 
     fn apply_ext_gstate(&mut self, ops: &[Object]) -> Result<()> {
@@ -664,6 +712,77 @@ mod tests {
         }
     }
 
+    /// Symétrique de `text_showing_emits_one_glyph_per_byte`, pour une
+    /// police composite (`/Type0`/`Identity-H`) : la chaîne hexadécimale
+    /// `<00090041>` doit produire deux glyphes (CID 9 et CID 0x41), pas
+    /// quatre (un par octet) — preuve que `show_text` détecte réellement
+    /// `Font::is_composite()` et découpe en CIDs 2 octets plutôt que de
+    /// retomber sur l'itération par octet du chemin police simple/placeholder.
+    #[test]
+    fn text_showing_on_a_composite_font_emits_one_glyph_per_two_byte_cid() {
+        let content = "BT /F1 24 Tf 72 720 Td <00090041> Tj ET";
+        let body = format!(
+            "%PDF-1.7\n\
+             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+             2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+             3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n\
+             4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n\
+             5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>\nendobj\n\
+             6 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /DW 1000 /W [9 [600]] >>\nendobj\n",
+            content.len(),
+            content
+        );
+        let mut bytes = body.into_bytes();
+        let offset_of = |data: &[u8], needle: &str| -> usize {
+            data.windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+                .unwrap()
+        };
+        let offsets: Vec<usize> = (1..=6)
+            .map(|n| offset_of(&bytes, &format!("{n} 0 obj")))
+            .collect();
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len() + 1,
+            xref_offset
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let display =
+            Interpreter::run_page(&doc, page.resources, content.as_bytes()).unwrap();
+
+        let glyphs: Vec<&DisplayItem> = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyph { .. }))
+            .collect();
+        assert_eq!(glyphs.len(), 2, "expected 2 glyphs (one per CID), not one per byte");
+
+        let DisplayItem::Glyph {
+            code: first_code, ..
+        } = glyphs[0]
+        else {
+            unreachable!()
+        };
+        let DisplayItem::Glyph {
+            code: second_code, ..
+        } = glyphs[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*first_code, 0x0009);
+        assert_eq!(*second_code, 0x0041);
+    }
+
     #[test]
     fn cm_concatenation_transforms_subsequent_points() {
         let (doc, resources) = doc_with_page("2 0 0 2 10 10 cm 0 0 5 5 re f");
@@ -806,6 +925,55 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// Bout en bout sur un vrai `/Type0`/`CIDFontType2` (`/Identity-H`,
+    /// `/CIDToGIDMap /Identity`, sous-ensemble TrueType Monaco réel généré
+    /// avec `fonttools subset` — voir
+    /// `pdf-core/tests/fixtures/README.md`) : "AB" doit se recomposer
+    /// exactement via `/ToUnicode`, avec un vrai contour résolu pour chaque
+    /// glyphe (pas `None`) — preuve que le chemin composite de `show_text`
+    /// fonctionne sur un PDF réel généré par un outil tiers, pas seulement
+    /// sur les fixtures synthétiques de `font.rs`.
+    #[test]
+    fn real_type0_fixture_recovers_unicode_text_and_real_outlines() {
+        let bytes = include_bytes!("../tests/fixtures/type0_cid_truetype.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+
+        let glyphs: Vec<&DisplayItem> = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyph { .. }))
+            .collect();
+        assert_eq!(glyphs.len(), 2);
+
+        let text: String = glyphs
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Glyph { unicode, .. } => *unicode,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "AB");
+
+        for glyph in &glyphs {
+            let DisplayItem::Glyph {
+                outline,
+                advance_is_estimated,
+                ..
+            } = glyph
+            else {
+                unreachable!()
+            };
+            assert!(
+                outline.as_ref().is_some_and(|o| !o.is_empty()),
+                "expected a real outline for each glyph of the Type0 fixture"
+            );
+            assert!(!advance_is_estimated);
+        }
     }
 
     #[test]

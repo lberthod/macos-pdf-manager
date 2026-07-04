@@ -14,6 +14,7 @@
 - `cjk_text.pdf` — texte chinois simplifié (`你好，世界`) en police Songti **intégrée** (`/System/Library/Fonts/Supplemental/Songti.ttc`, choisie parce qu'elle a des contours TrueType `glyf` — la plupart des polices CJK système macOS sont CFF/OTF, non supportées par l'embarqueur TrueType de reportlab). Le glyphe se rend correctement (contour résolu via le `cmap` de la police) **et** le texte est intégralement récupérable via le CMap `/ToUnicode` que reportlab embarque par défaut pour ce type de sous-ensemble (`font.rs::parse_to_unicode_cmap`) — sert de fixture de non-régression pour ce parseur.
 - `large_60_pages.pdf` — document de 60 pages (texte + rectangle par page, cross-reference stream + object streams), pour les tests de navigation/recherche/miniatures sur un document de taille non triviale.
 - `outline_test.pdf` — 4 pages, une table des matières plate ("Section 1".."Section 4", une par page), générée avec `reportlab.Canvas.bookmarkPage`/`addOutlineEntry`. Sert à tester la lecture de `/Outlines` (`pdf-core::outline`), en particulier la résolution des destinations directes (`/Dest` tableau `[page /Fit]`) en index de page.
+- `type0_cid_truetype.pdf` — texte "AB" en police composite **`/Type0`/`CIDFontType2`** (`/Encoding /Identity-H`, `/CIDToGIDMap /Identity`) : sous-ensemble TrueType Monaco réel (2 glyphes) extrait via `fonttools subset --text="AB"`, dont les GID (renumérotés par le sous-ensembleur) servent directement de codes 2 octets dans le flux de contenu (`<0001 0002>` — cas réel le plus courant, où le CID est le GID directement plutôt que passer par un `/CIDToGIDMap` explicite). Construit **à la main avec pikepdf** (comme `embedded_cff_font.pdf`), avec un `/ToUnicode` (`beginbfchar` GID -> `A`/`B`) et un `/W` donnant une largeur distincte à chaque GID (`/DW` sert de repli). Premier fixture réel `/Type0` du corpus (les autres tests composites de `pdf-core::font`/`interp` restent synthétiques) — sert de non-régression bout en bout pour `font.rs::cid_glyph_outline`/`cid_metrics` et `interp::show_text` sur un vrai PDF produit par un outil tiers.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -180,6 +181,52 @@ for i in range(4):
 c11.save()
 with Pdf.open(io.BytesIO(buf11.getvalue())) as pdf:
     pdf.save("outline_test.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# type0_cid_truetype.pdf (nécessite aussi fonttools : pip install fonttools)
+# 1) sous-ensembler une police TrueType (glyf) en ligne de commande :
+#    fonttools subset /System/Library/Fonts/Monaco.ttf --text="AB" \
+#      --output-file=/tmp/monaco_subset.ttf --no-layout-closure
+# 2) lire les octets bruts + les GID (renumérotés par le sous-ensembleur) des glyphes retenus :
+from fontTools.ttLib import TTFont as _TTFont
+with open("/tmp/monaco_subset.ttf", "rb") as f:
+    truetype_bytes = f.read()
+subset_font = _TTFont("/tmp/monaco_subset.ttf")
+cmap = subset_font.getBestCmap()
+gid_a = subset_font.getGlyphID(cmap[ord("A")])
+gid_b = subset_font.getGlyphID(cmap[ord("B")])
+
+pdf12 = pikepdf.new()
+page12 = pdf12.add_blank_page(page_size=(400, 200))
+font_file2 = pikepdf.Stream(pdf12, truetype_bytes)
+descriptor12 = pdf12.make_indirect(pikepdf.Dictionary(
+    Type=pikepdf.Name.FontDescriptor, FontName=pikepdf.Name("/Monaco-Identity-H"), Flags=32,
+    FontBBox=pikepdf.Array([-100, -200, 1000, 900]), ItalicAngle=0, Ascent=900,
+    Descent=-200, CapHeight=700, StemV=80, FontFile2=font_file2,
+))
+cid_font12 = pdf12.make_indirect(pikepdf.Dictionary(
+    Type=pikepdf.Name.Font, Subtype=pikepdf.Name.CIDFontType2, BaseFont=pikepdf.Name("/Monaco-Identity-H"),
+    CIDSystemInfo=pikepdf.Dictionary(Registry="Adobe", Ordering="Identity", Supplement=0),
+    FontDescriptor=descriptor12, DW=600,
+    # /CIDToGIDMap /Identity : le code du flux de contenu (2 octets) EST le GID directement.
+    W=pikepdf.Array([gid_a, pikepdf.Array([650]), gid_b, pikepdf.Array([700])]),
+    CIDToGIDMap=pikepdf.Name.Identity,
+))
+to_unicode12 = (
+    "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+    "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+    "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+    "2 beginbfchar\n"
+    f"<{gid_a:04X}> <0041>\n<{gid_b:04X}> <0042>\n"
+    "endbfchar\nendcmap\nend\nend\n"
+).encode("ascii")
+font12 = pdf12.make_indirect(pikepdf.Dictionary(
+    Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type0, BaseFont=pikepdf.Name("/Monaco-Identity-H"),
+    Encoding=pikepdf.Name("/Identity-H"), DescendantFonts=pikepdf.Array([cid_font12]),
+    ToUnicode=pikepdf.Stream(pdf12, to_unicode12),
+))
+page12.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font12))
+page12.Contents = pikepdf.Stream(pdf12, f"BT /F1 48 Tf 50 100 Td <{gid_a:04X}{gid_b:04X}> Tj ET".encode("ascii"))
+pdf12.save("type0_cid_truetype.pdf")
 ```
 
-Ce corpus reste modeste (14 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9), mais couvre désormais au moins un représentant de chaque catégorie avancée citée par ce critère (rotation, formulaire, chiffrement, CJK, document de taille non triviale, table des matières) — un PDF réellement scanné (image plein page sans couche texte) et un PDF/A restent à ajouter.
+Ce corpus reste modeste (15 fichiers) : loin du « plusieurs centaines de PDF variés » visé par le critère de sortie de la Phase 1 (architecture.md §9), mais couvre désormais au moins un représentant de chaque catégorie avancée citée par ce critère (rotation, formulaire, chiffrement, CJK, document de taille non triviale, table des matières, police composite `/Type0`) — un PDF réellement scanné (image plein page sans couche texte) et un PDF/A restent à ajouter.

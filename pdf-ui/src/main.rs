@@ -42,10 +42,26 @@ const HIGHLIGHT_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(90
 const SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 60, 110, 90);
 
 fn main() -> eframe::Result<()> {
+    // Backend `wgpu` plutôt que le `glow` par défaut d'eframe : condition
+    // nécessaire pour partager le `Device`/`Queue` d'eframe avec
+    // `pdf-render-gpu` (voir `ViewerApp::new` et
+    // `pdf_render_gpu::GpuRenderer::from_shared`) — sans quoi ce backend
+    // devrait renégocier son propre device à chaque page (voir la doc de
+    // module de `pdf-render-gpu`, le problème que cette intégration résout).
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
     eframe::run_native(
         "PDF Manager (prototype)",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(ViewerApp::new(std::env::args().nth(1))))),
+        options,
+        Box::new(|cc| {
+            let gpu = cc
+                .wgpu_render_state
+                .as_ref()
+                .map(|rs| pdf_render_gpu::GpuRenderer::from_shared(rs.device.clone(), rs.queue.clone()));
+            Ok(Box::new(ViewerApp::new(std::env::args().nth(1), gpu)))
+        }),
     )
 }
 
@@ -96,12 +112,19 @@ struct ViewerApp {
     selection_cursor: Option<usize>,
     selection_rects: Vec<pdf_app::MatchRect>,
     selection_text: String,
+    /// `Device`/`Queue` partagés avec le renderer `wgpu` d'eframe (voir
+    /// `main`) — `None` si le backend `glow` a été sélectionné ou si aucun
+    /// adaptateur `wgpu` n'était disponible au démarrage. Cloné dans chaque
+    /// `Session` ouverte (voir `open_path`) : `GpuRenderer` ne fait que
+    /// partager des `Arc`, un clone est donc bon marché.
+    gpu: Option<pdf_render_gpu::GpuRenderer>,
 }
 
 impl ViewerApp {
-    fn new(initial_path: Option<String>) -> Self {
+    fn new(initial_path: Option<String>, gpu: Option<pdf_render_gpu::GpuRenderer>) -> Self {
         let mut app = Self {
             session: None,
+            gpu,
             zoom: 1.0,
             texture: None,
             texture_state: None,
@@ -151,7 +174,12 @@ impl ViewerApp {
         self.selection_text.clear();
 
         match Session::open(path) {
-            Ok(session) => self.session = Some(session),
+            Ok(mut session) => {
+                if let Some(gpu) = &self.gpu {
+                    session.set_gpu_renderer(gpu.clone());
+                }
+                self.session = Some(session);
+            }
             Err(e) => {
                 self.error = Some(format!("Impossible d'ouvrir le fichier : {e}"));
                 self.session = None;

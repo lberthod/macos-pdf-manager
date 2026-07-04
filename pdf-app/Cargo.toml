@@ -8,4 +8,5 @@ license.workspace = true
 pdf-core = { workspace = true }
 pdf-text = { workspace = true }
 pdf-render = { workspace = true }
+pdf-render-gpu = { workspace = true }
 pdf-edit = { workspace = true }

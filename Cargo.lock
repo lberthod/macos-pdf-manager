@@ -917,12 +917,14 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "parking_lot",
  "percent-encoding",
+ "pollster 0.3.0",
  "raw-window-handle",
  "static_assertions",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+ "wgpu",
  "winapi",
  "windows-sys 0.52.0",
  "winit",
@@ -2407,6 +2409,7 @@ dependencies = [
  "pdf-core",
  "pdf-edit",
  "pdf-render",
+ "pdf-render-gpu",
  "pdf-text",
 ]
 
@@ -2471,7 +2474,9 @@ dependencies = [
  "eframe",
  "egui",
  "pdf-app",
+ "pdf-render-gpu",
  "rfd",
+ "wgpu",
 ]
 
 [[package]]

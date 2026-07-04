@@ -14,13 +14,14 @@
 //!   standard retombent sur `DEFAULT_WIDTH`.
 //! - `MacRomanEncoding` est approximé par `WinAnsiEncoding` (tables réelles
 //!   distinctes au-delà de l'ASCII) faute de table dédiée pour l'instant.
-//! - Contours de glyphes : seules les polices **TrueType intégrées**
-//!   (`/FontFile2`) sont supportées, via `ttf-parser`. Les polices CFF/
-//!   Type1C intégrées (`/FontFile3`) et Type1 (`/FontFile`) n'ont pas encore
-//!   de parseur de contours ; les polices standard non intégrées (cas le
-//!   plus courant, Helvetica etc.) n'ont pas de contour du tout — seule la
-//!   substitution système (Core Text, non implémentée) pourrait fournir un
-//!   rendu visuel dans ce cas.
+//! - Contours de glyphes : polices **TrueType intégrées** (`/FontFile2`)
+//!   via `ttf-parser`, et **substitution système macOS** pour les polices
+//!   standard non intégrées (Helvetica/Times/Courier + alias Arial,
+//!   sélection de face gras/italique dans les `.ttc`, voir `system_font`).
+//!   Les polices CFF/Type1C intégrées (`/FontFile3`) et Type1 (`/FontFile`)
+//!   n'ont pas encore de parseur de contours. La substitution lit
+//!   directement les fichiers de `/System/Library/Fonts` (chemins macOS
+//!   codés en dur) — un portage passerait par Core Text ou fontconfig.
 
 use crate::display::PathSegment;
 use crate::document::Document;
@@ -40,6 +41,11 @@ pub struct Font {
     use_helvetica_fallback: bool,
     /// Octets bruts d'un `/FontFile2` (TrueType) déjà décodé, s'il y en a un.
     embedded_truetype: Option<Vec<u8>>,
+    /// Police système de substitution (octets du fichier partagés via cache
+    /// global + index de face dans la collection `.ttc`), pour les polices
+    /// standard non intégrées. `None` si la police est intégrée ou si aucune
+    /// substitution n'a été trouvée.
+    system_fallback: Option<(std::sync::Arc<Vec<u8>>, u32)>,
 }
 
 impl Font {
@@ -119,12 +125,23 @@ impl Font {
                 _ => None,
             });
 
+        let system_fallback = if embedded_truetype.is_none() && subtype != "Type0" {
+            let base_font = dict
+                .get("BaseFont")
+                .and_then(|o| o.as_name())
+                .unwrap_or("Helvetica");
+            system_font::lookup(base_font)
+        } else {
+            None
+        };
+
         Ok(Font {
             subtype,
             encoding,
             widths,
             use_helvetica_fallback,
             embedded_truetype,
+            system_fallback,
         })
     }
 
@@ -161,30 +178,115 @@ impl Font {
     /// par des outils comme reportlab, qui n'embarquent qu'un cmap Mac
     /// Roman indexé par code plutôt que par point de code Unicode.
     pub fn glyph_outline(&self, code: u8, unicode: Option<char>) -> Option<Vec<PathSegment>> {
-        let data = self.embedded_truetype.as_ref()?;
-        let face = ttf_parser::Face::parse(data, 0).ok()?;
-
-        let gid = unicode.and_then(|u| face.glyph_index(u)).or_else(|| {
-            face.tables().cmap.and_then(|cmap| {
-                cmap.subtables
-                    .into_iter()
-                    .find(|sub| sub.platform_id == ttf_parser::PlatformId::Macintosh)
-                    .and_then(|sub| sub.glyph_index(code as u32))
-            })
-        })?;
-
-        let units_per_em = face.units_per_em() as f64;
-        if units_per_em <= 0.0 {
-            return None;
+        if let Some(data) = self.embedded_truetype.as_ref() {
+            let face = ttf_parser::Face::parse(data, 0).ok()?;
+            let gid = unicode.and_then(|u| face.glyph_index(u)).or_else(|| {
+                face.tables().cmap.and_then(|cmap| {
+                    cmap.subtables
+                        .into_iter()
+                        .find(|sub| sub.platform_id == ttf_parser::PlatformId::Macintosh)
+                        .and_then(|sub| sub.glyph_index(code as u32))
+                })
+            })?;
+            return outline_from_face(&face, gid);
         }
 
-        let mut collector = OutlineCollector {
-            segments: Vec::new(),
-            current: (0.0, 0.0),
-            scale: 1.0 / units_per_em,
+        // Substitution système (police standard non intégrée) : les polices
+        // système ont toujours un cmap Unicode, donc seule la résolution par
+        // caractère Unicode a du sens ici.
+        let (data, face_index) = self.system_fallback.as_ref()?;
+        let face = ttf_parser::Face::parse(data, *face_index).ok()?;
+        let gid = face.glyph_index(unicode?)?;
+        outline_from_face(&face, gid)
+    }
+}
+
+fn outline_from_face(
+    face: &ttf_parser::Face,
+    gid: ttf_parser::GlyphId,
+) -> Option<Vec<PathSegment>> {
+    let units_per_em = face.units_per_em() as f64;
+    if units_per_em <= 0.0 {
+        return None;
+    }
+    let mut collector = OutlineCollector {
+        segments: Vec::new(),
+        current: (0.0, 0.0),
+        scale: 1.0 / units_per_em,
+    };
+    face.outline_glyph(gid, &mut collector)?;
+    Some(collector.segments)
+}
+
+/// Substitution des 14 polices standard PDF (et alias courants) par les
+/// polices système macOS — architecture.md §4.6. Un PDF qui référence
+/// `Helvetica` sans l'intégrer suppose que le lecteur la connaît : c'est le
+/// cas le plus courant en pratique, et sans cette substitution aucun texte
+/// de ces documents ne peut être dessiné.
+mod system_font {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// `None` mémorisé = fichier absent (évite de re-tenter la lecture).
+    type FontFileCache = HashMap<&'static str, Option<Arc<Vec<u8>>>>;
+
+    /// Cache global des fichiers de police système (un `.ttc` fait 1-2 Mo ;
+    /// on ne veut le lire qu'une fois par processus, pas à chaque `Tj`).
+    fn cache() -> &'static Mutex<FontFileCache> {
+        static CACHE: OnceLock<Mutex<FontFileCache>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Mappe un `/BaseFont` (préfixe de sous-ensemble déjà toléré) vers un
+    /// fichier système + le style attendu (gras, italique).
+    pub fn lookup(base_font: &str) -> Option<(Arc<Vec<u8>>, u32)> {
+        // Les sous-ensembles sont nommés `ABCDEF+RealName` (ISO 32000-1 §9.6.4).
+        let name = base_font.split('+').next_back().unwrap_or(base_font);
+        let lower = name.to_ascii_lowercase();
+
+        let path: &'static str = if lower.starts_with("helvetica") || lower.starts_with("arial") {
+            "/System/Library/Fonts/Helvetica.ttc"
+        } else if lower.starts_with("times") {
+            "/System/Library/Fonts/Times.ttc"
+        } else if lower.starts_with("courier") {
+            "/System/Library/Fonts/Courier.ttc"
+        } else if lower.starts_with("symbol") {
+            "/System/Library/Fonts/Symbol.ttf"
+        } else if lower.starts_with("zapf") {
+            "/System/Library/Fonts/ZapfDingbats.ttf"
+        } else {
+            // Police inconnue non intégrée : Helvetica fait office de repli
+            // générique (même choix que la plupart des viewers).
+            "/System/Library/Fonts/Helvetica.ttc"
         };
-        face.outline_glyph(gid, &mut collector)?;
-        Some(collector.segments)
+
+        let bold = lower.contains("bold");
+        let italic = lower.contains("italic") || lower.contains("oblique");
+
+        let data = {
+            let mut cache = cache().lock().ok()?;
+            cache
+                .entry(path)
+                .or_insert_with(|| std::fs::read(path).ok().map(Arc::new))
+                .clone()?
+        };
+
+        let face_index = select_face(&data, bold, italic);
+        Some((data, face_index))
+    }
+
+    /// Choisit la face d'une collection `.ttc` correspondant au style
+    /// demandé ; face 0 en repli (fichiers `.ttf` simples inclus).
+    fn select_face(data: &[u8], bold: bool, italic: bool) -> u32 {
+        let count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+        for index in 0..count {
+            if let Ok(face) = ttf_parser::Face::parse(data, index) {
+                if face.is_bold() == bold && face.is_italic() == italic {
+                    return index;
+                }
+            }
+        }
+        0
     }
 }
 
@@ -443,6 +545,25 @@ mod tests {
         let dict = font_dict(&[("Subtype", Object::Name("Type0".into()))]);
         let font = Font::load(&doc, &dict).unwrap();
         assert!(font.is_composite());
+    }
+
+    /// Ne s'exécute utilement que sur macOS (fichiers de
+    /// `/System/Library/Fonts`) — la CI GitHub Actions tourne sur
+    /// `macos-latest`, donc le chemin est couvert.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn non_embedded_helvetica_gets_system_outline() {
+        let doc = dummy_doc();
+        let dict = font_dict(&[
+            ("Subtype", Object::Name("Type1".into())),
+            ("BaseFont", Object::Name("Helvetica".into())),
+            ("Encoding", Object::Name("WinAnsiEncoding".into())),
+        ]);
+        let font = Font::load(&doc, &dict).unwrap();
+        let outline = font
+            .glyph_outline(b'A', Some('A'))
+            .expect("system Helvetica substitution should provide an outline for 'A'");
+        assert!(!outline.is_empty());
     }
 
     #[test]

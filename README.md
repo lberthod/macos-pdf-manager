@@ -13,9 +13,9 @@
 
 ## État actuel (voir [STATUS.md](./STATUS.md) pour le détail précis)
 
-Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu → rendu CPU en PNG, avec de vraies métriques de police et de vrais contours de glyphes pour les polices TrueType intégrées.
+Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu → rendu CPU en PNG, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType **intégrées** comme polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier...).
 
-Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, l'UI graphique, et le rendu de texte pour les polices non intégrées (le cas le plus courant en pratique). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque.
+Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, l'UI graphique, le décodage des images (JPEG...), les polices composites CJK. Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
 
 ## Structure du projet
 
@@ -24,7 +24,7 @@ Workspace Cargo multi-crates :
 | Crate | Rôle | État |
 |---|---|---|
 | `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices, filtres | Fonctionnel sur un sous-ensemble réel (voir STATUS.md) |
-| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels + glyphes TrueType intégrés | Fonctionnel, partiel (pas d'images, pas de police système) |
+| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels + glyphes (intégrés et substitués système) | Fonctionnel, partiel (pas d'images, pas de clip) |
 | `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`) | Fonctionnel |
 | `pdf-text` | Extraction / analyse / réécriture de la couche texte | Stub vide |
 | `pdf-edit` | Opérations d'édition, journal, undo/redo | Stub vide |

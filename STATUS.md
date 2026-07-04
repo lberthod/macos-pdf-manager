@@ -1,6 +1,6 @@
 # État précis du projet
 
-**Dernière mise à jour :** 2026-07-04
+**Dernière mise à jour :** 2026-07-04 (substitution de police système ajoutée)
 **But de ce document :** donner une image exacte et vérifiable de ce qui fonctionne, de ce qui est simulé (placeholder), et de ce qui n'existe pas encore — par opposition à [architecture.md](./architecture.md) (la cible) et [sprint.md](./sprint.md) (le plan). Chaque affirmation ci-dessous est vérifiable en lisant le fichier cité ou en lançant la commande indiquée.
 
 ---
@@ -30,11 +30,16 @@ cargo run --bin pdf-cli -- render pdf-core/tests/fixtures/embedded_truetype_font
 produit un PNG 612×792 avec le texte "AVIL" réellement dessiné (contours de la police Monaco intégrée, pas une image de substitution).
 
 ```bash
+cargo run --bin pdf-cli -- render pdf-core/tests/fixtures/multipage_classic_xref.pdf /tmp/out2.png 0
+```
+produit un PNG où la phrase "Page 1 - Hello, PDF Manager!" est dessinée avec la **vraie Helvetica système** (substitution macOS : le PDF référence Helvetica sans l'intégrer, cas le plus courant en pratique).
+
+```bash
 cargo run --bin pdf-cli -- render-info pdf-core/tests/fixtures/multipage_classic_xref.pdf 0
 ```
 affiche `Recovered text: "Page 1 - Hello, PDF Manager!"` — le texte est reconstruit caractère par caractère via l'encodage réel de la police (pas une supposition).
 
-**Tests :** 48 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
+**Tests :** 49 tests automatisés (`cargo test --workspace`), tous verts, `cargo clippy --workspace --all-targets` sans avertissement.
 
 ---
 
@@ -49,8 +54,8 @@ affiche `Recovered text: "Page 1 - Hello, PDF Manager!"` — le texte est recons
 | Contenu | ~40 opérateurs : état graphique, chemins, texte, couleur, Form XObjects (récursif, garde de profondeur) | Clip (`W`/`W*`) signalé mais pas appliqué ; patterns/shadings ignorés ; contenu marqué ignoré |
 | Police — largeurs | `/Widths`+`/FirstChar` ; repli sur table AFM Helvetica intégrée si absent | Les 13 autres polices standard (Times, Courier...) n'ont pas de table dédiée, retombent sur une largeur par défaut arbitraire (500/1000 em) |
 | Police — encodage | `WinAnsiEncoding`/`StandardEncoding` complets (256 codes) + `/Differences` via un sous-ensemble de l'Adobe Glyph List | `/ToUnicode` (CMap dédié, souvent plus précis) n'est pas lu ; `MacRomanEncoding` est approximé par WinAnsi au-delà de l'ASCII |
-| Police — contours | Polices **TrueType intégrées** (`/FontFile2`) via `ttf-parser`, avec repli sur cmap Macintosh (1,0) par code brut quand pas de cmap Unicode | CFF/Type1C (`/FontFile3`), Type1 (`/FontFile`) : aucun contour. Polices standard **non intégrées** (Helvetica, Times...) : aucun contour — c'est le cas le plus fréquent en pratique et il n'est pas couvert |
-| Rendu | Chemins (fill/stroke/fill+stroke, nonzero/even-odd, courbes de Bézier), glyphes avec contour disponible, conversion Gray/RGB/CMYK | Pas de substitution de police système (Core Text), pas de rendu des images, pas d'application du clip, pas de GPU |
+| Police — contours | Polices **TrueType intégrées** (`/FontFile2`) via `ttf-parser` (repli cmap Macintosh par code brut si pas de cmap Unicode) ; **substitution système macOS** pour les polices standard non intégrées : Helvetica/Times/Courier/Symbol/ZapfDingbats + alias Arial, sélection de la face gras/italique dans les `.ttc`, cache global des fichiers | CFF/Type1C (`/FontFile3`), Type1 (`/FontFile`) : aucun contour. Substitution par lecture directe de `/System/Library/Fonts` (chemins macOS codés en dur, pas via l'API Core Text) — non portable en l'état |
+| Rendu | Chemins (fill/stroke/fill+stroke, nonzero/even-odd, courbes de Bézier), glyphes (intégrés **et** substitués), conversion Gray/RGB/CMYK | Pas de rendu des images, pas d'application du clip, pas de GPU |
 | Polices composites | Détection de `/Type0` (`Font::is_composite()`) | Aucune gestion réelle : codes 2 octets, `/DescendantFonts`, `/W` CID — tout retombe sur le comportement placeholder (pas d'Unicode, largeur par défaut) |
 
 ---
@@ -81,9 +86,9 @@ C'est **loin** du corpus « plusieurs centaines de PDF variés » visé par le c
 
 ## 5. Prochaines étapes logiques (par ordre de valeur/effort)
 
-1. **Substitution de police système (Core Text)** ou parsing CFF — sans ça, le rendu de texte reste invisible pour l'immense majorité des PDF réels (polices standard non intégrées). C'est probablement le manque le plus impactant actuellement.
-2. **Décodage JPEG (`DCTDecode`)** — nécessaire dès qu'un PDF contient une photo, très fréquent.
-3. **Corpus de test large** — condition pour véritablement clore la Phase 1/2 et détecter les régressions sur des cas réels variés.
-4. **Prototype UI (`egui`)** — premier pas vers une application utilisable, même minimale.
+1. **Décodage JPEG (`DCTDecode`)** — nécessaire dès qu'un PDF contient une photo, très fréquent.
+2. **Corpus de test large** — condition pour véritablement clore la Phase 1/2 et détecter les régressions sur des cas réels variés.
+3. **Prototype UI (`egui`)** — premier pas vers une application utilisable, même minimale.
+4. **Contours CFF/Type1C (`/FontFile3`)** — deuxième format de police intégrée le plus courant après TrueType.
 
 Pour le contexte produit (pourquoi ce projet, contraintes, décisions à trancher), voir [architecture.md §1](./architecture.md#1-objectif-et-périmètre) et [§12](./architecture.md#12-points-à-trancher-avec-le-développeur-avant-le-démarrage).

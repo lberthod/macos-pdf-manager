@@ -5,27 +5,36 @@
 //! un raccourci direct vers `pdf-core`/`pdf-render`.
 //!
 //! Fonctionnalités : ouverture de fichier (dialogue natif via `rfd`),
-//! navigation page suivante/précédente, zoom par boutons **et** par
+//! navigation page suivante/précédente, zoom par boutons, par
 //! molette+Ctrl/pincement trackpad (`egui::InputState::zoom_delta`,
-//! re-rasterisation à chaque cran, pas un agrandissement d'image),
-//! recherche texte (`Session::find_pages_containing`) qui saute
-//! d'occurrence en occurrence page par page **avec surlignage** des
-//! résultats sur la page affichée (`Session::find_matches_on_current_page`),
-//! panneau de miniatures cliquables et panneau de signets (`/Outlines`,
-//! `Session::outline`) pour naviguer directement à une page, un mode
-//! **défilement continu** (`egui::ScrollArea::show_rows`, virtualisé : seules
-//! les pages proches de la zone visible sont rastérisées) qui affiche
-//! toutes les pages empilées verticalement au lieu d'une à la fois, et la
-//! **sélection de texte à la souris** (glisser sur la page en mode page
-//! unique, via `Session::char_index_at_on_current_page`/
-//! `selection_on_current_page`) avec copie dans le presse-papiers (bouton
-//! ou ⌘C).
+//! re-rasterisation à chaque cran, pas un agrandissement d'image) **et**
+//! "Ajuster à la largeur" (`fit_to_width`, calcule le zoom depuis la largeur
+//! réellement disponible du panneau), recherche texte
+//! (`Session::find_pages_containing`) qui saute d'occurrence en occurrence
+//! page par page **avec surlignage** des résultats sur la page affichée
+//! (`Session::find_matches_on_current_page`), panneau de miniatures
+//! cliquables et panneau de signets (`/Outlines`, `Session::outline`) pour
+//! naviguer directement à une page, un mode **défilement continu**
+//! (`egui::ScrollArea::show_rows`, virtualisé : seules les pages proches de
+//! la zone visible sont rastérisées) qui affiche toutes les pages empilées
+//! verticalement au lieu d'une à la fois, et la **sélection de texte à la
+//! souris** (glisser sur la page en mode page unique, via
+//! `Session::char_index_at_on_current_page`/`selection_on_current_page`)
+//! avec copie dans le presse-papiers (bouton ou ⌘C) et surlignage
+//! `/Highlight` (bouton, réutilise la sélection courante).
 //!
-//! Non géré (voir STATUS.md) : onglets/multi-documents, annotations,
-//! raccourcis clavier au-delà des boutons/⌘C, sélection de texte en mode
-//! défilement continu (page unique seulement). Limitation du défilement
-//! continu : la hauteur de ligne est calculée une fois sur la page 0
-//! (documents à pages de tailles hétérogènes mal gérés).
+//! Raccourcis clavier (`handle_keyboard_shortcuts`) : ⌘F (focus recherche),
+//! ⌘+/⌘-/⌘0 (zoom), flèches gauche/droite et Page Haut/Bas (page
+//! précédente/suivante — désactivés tant qu'un champ de texte a le focus,
+//! voir `egui::Context::wants_keyboard_input`), en plus de ⌘Z/⌘⇧Z
+//! (annuler/rétablir) et ⌘S (enregistrer) câblés via le menu natif (voir
+//! `native_menu.rs`).
+//!
+//! Non géré (voir STATUS.md) : onglets/multi-documents, sélection de texte
+//! en mode défilement continu (page unique seulement), indicateur de
+//! modifications non sauvegardées. Limitation du défilement continu : la
+//! hauteur de ligne est calculée une fois sur la page 0 (documents à pages
+//! de tailles hétérogènes mal gérés).
 
 mod native_menu;
 
@@ -37,6 +46,10 @@ use std::path::PathBuf;
 
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 4.0;
+/// Identifiant stable du champ de recherche, pour pouvoir lui donner le
+/// focus depuis `⌘F` (`handle_keyboard_shortcuts`) sans dépendre de l'ordre
+/// d'appel des widgets `egui` dans la frame.
+const SEARCH_FIELD_ID: &str = "search_query_field";
 /// Échelle de rendu des miniatures (page 612pt de large -> ~92px).
 const THUMBNAIL_SCALE: f64 = 0.15;
 /// Jaune translucide pour le surlignage des résultats de recherche.
@@ -78,6 +91,10 @@ fn main() -> eframe::Result<()> {
 struct ViewerApp {
     session: Option<Session>,
     zoom: f32,
+    /// Mis à `true` par le bouton "Ajuster à la largeur" ; consommé au
+    /// prochain rendu du `CentralPanel` (mode page unique), seul endroit où
+    /// la largeur disponible réelle (`ui.available_width()`) est connue.
+    fit_width_requested: bool,
     texture: Option<egui::TextureHandle>,
     /// (page affichée, zoom affiché, densité de pixels affichée) par la
     /// texture courante — sert à détecter qu'un nouveau rendu est
@@ -153,6 +170,7 @@ impl ViewerApp {
             gpu,
             native_menu: None,
             zoom: 1.0,
+            fit_width_requested: false,
             texture: None,
             texture_state: None,
             texture_logical_size: None,
@@ -358,6 +376,84 @@ impl ViewerApp {
 
     fn set_zoom(&mut self, zoom: f32) {
         self.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+    }
+
+    /// Ajuste le zoom pour que la largeur de la page courante (à 100 %,
+    /// indépendamment du zoom actuel) remplisse `available_width` (points
+    /// logiques `egui`, la largeur de la zone de dessin de la page) — le
+    /// réglage qu'utilisent la plupart des lecteurs PDF par défaut, absent
+    /// jusqu'ici (zoom toujours figé à 100 % à l'ouverture).
+    fn fit_to_width(&mut self, available_width: f32) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Ok(media_box) = session.current_page_media_box() else {
+            return;
+        };
+        let page_width = media_box[2] - media_box[0];
+        if page_width <= 0.0 {
+            return;
+        }
+        // Petite marge pour ne pas déclencher la barre de défilement
+        // horizontale à cause d'un arrondi.
+        self.set_zoom((available_width - 4.0) / page_width as f32);
+    }
+
+    /// Raccourcis clavier globaux : `⌘F` donne le focus au champ de
+    /// recherche, `⌘+`/`⌘-`/`⌘0` zooment/réinitialisent, flèches
+    /// gauche/droite et Page Haut/Bas changent de page — ces derniers
+    /// seulement quand aucun widget texte n'a le focus (`wants_keyboard_input`)
+    /// pour ne pas voler les flèches à la saisie dans le champ de recherche.
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.session.is_none() {
+            return;
+        }
+
+        let (focus_search, zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::F),
+                i.modifiers.command
+                    && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)),
+                i.modifiers.command && i.key_pressed(egui::Key::Minus),
+                i.modifiers.command && i.key_pressed(egui::Key::Num0),
+            )
+        });
+        if focus_search {
+            ctx.memory_mut(|m| {
+                m.request_focus(egui::Id::new(SEARCH_FIELD_ID));
+            });
+        }
+        if zoom_in {
+            self.set_zoom(self.zoom + 0.25);
+        }
+        if zoom_out {
+            self.set_zoom(self.zoom - 0.25);
+        }
+        if zoom_reset {
+            self.set_zoom(1.0);
+        }
+
+        if ctx.wants_keyboard_input() {
+            return; // laisse les flèches au champ de texte actuellement focus.
+        }
+        let (prev_page, next_page) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::PageUp),
+                i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::PageDown),
+            )
+        });
+        if prev_page {
+            if let Some(session) = &mut self.session {
+                session.prev_page();
+                self.scroll_to_page = Some(session.page_index());
+            }
+        }
+        if next_page {
+            if let Some(session) = &mut self.session {
+                session.next_page();
+                self.scroll_to_page = Some(session.page_index());
+            }
+        }
     }
 
     /// Saute à l'occurrence suivante/précédente (cyclique) dans
@@ -757,6 +853,8 @@ impl eframe::App for ViewerApp {
             self.open_path(path);
         }
 
+        self.handle_keyboard_shortcuts(ctx);
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Ouvrir…").clicked() {
@@ -815,6 +913,9 @@ impl eframe::App for ViewerApp {
                     if ui.button("Réinitialiser").clicked() {
                         self.set_zoom(1.0);
                     }
+                    if ui.button("↔ Ajuster à la largeur").clicked() {
+                        self.fit_width_requested = true;
+                    }
                 });
 
                 if !self.selection_text.is_empty() {
@@ -860,7 +961,10 @@ impl eframe::App for ViewerApp {
             ui.horizontal(|ui| {
                 let has_doc = self.session.is_some();
                 ui.add_enabled_ui(has_doc, |ui| {
-                    let response = ui.text_edit_singleline(&mut self.search_query);
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .id(egui::Id::new(SEARCH_FIELD_ID)),
+                    );
                     let submitted =
                         response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("🔍 Rechercher").clicked() || submitted {
@@ -938,6 +1042,11 @@ impl eframe::App for ViewerApp {
             if self.continuous_scroll {
                 self.show_continuous_scroll(ui, ctx);
                 return;
+            }
+
+            if self.fit_width_requested {
+                self.fit_width_requested = false;
+                self.fit_to_width(ui.available_width());
             }
 
             self.ensure_texture(ctx);

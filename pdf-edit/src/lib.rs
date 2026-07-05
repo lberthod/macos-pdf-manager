@@ -22,10 +22,12 @@
 //!   champ de formulaire — seule l'API `pdf-edit` existe, testée
 //!   directement et via `pdf-cli`. Le câblage UI (outil de surlignage à la
 //!   souris, édition de champ au clic) est un chantier UX séparé.
-//! - Pas de transparence réelle (`/ca`, ExtGState) sur les surlignages :
-//!   `pdf-core::interp` ne gère que `/LW` dans `gs` pour l'instant (voir sa
-//!   doc de module) — un surlignage est donc rendu en couleur pleine, pas
-//!   semi-transparente comme le ferait un vrai lecteur.
+//! - Transparence partielle seulement sur les surlignages : `pdf-core::interp`
+//!   gère `/ca`/`/CA` (`ExtGState`) en plus de `/LW`, donc `add_highlight_annotation`
+//!   rend son aplat à `HIGHLIGHT_FILL_ALPHA` d'opacité constante plutôt qu'en
+//!   couleur pleine — mais pas de vrais groupes de transparence ni de modes de
+//!   fusion (`Multiply`, utilisé par les vrais lecteurs pour les surlignages),
+//!   donc le rendu reste une approximation.
 //! - Un seul niveau de nom de champ (`/T` direct) est résolu pour
 //!   `set_form_field_value` — pas de noms qualifiés par `/Parent`
 //!   (`"parent.enfant"`), rare en dehors de formulaires très structurés.
@@ -172,12 +174,21 @@ impl EditSession {
         self.redo_stack.clear();
     }
 
+    /// Opacité constante (`/ca`) appliquée au remplissage d'un surlignage —
+    /// se rapproche du rendu "encre transparente" des vrais lecteurs (qui
+    /// utilisent plutôt un mode de fusion `Multiply`, non géré ici, voir la
+    /// doc de module) sans nécessiter de groupes de transparence.
+    const HIGHLIGHT_FILL_ALPHA: f64 = 0.4;
+
     /// Ajoute une annotation `/Highlight` couvrant `rect` (`[x0 y0 x1 y1]`,
     /// espace page) sur la page `page_index`, avec un flux d'apparence
-    /// (`/AP /N`) qui remplit ce rectangle de `color` (RGB 0.0-1.0) — voir
-    /// la doc de module pour la limitation "pas de vraie transparence".
-    /// `quad_points` (ISO 32000-1 §12.5.6.10, 8 nombres = 4 sommets, sens
-    /// direct) : si vide, dérivé automatiquement des quatre coins de `rect`.
+    /// (`/AP /N`) qui remplit ce rectangle de `color` (RGB 0.0-1.0) à
+    /// `HIGHLIGHT_FILL_ALPHA` d'opacité (`/ca` d'un `ExtGState` référencé
+    /// dans les `/Resources` du flux, voir `interp::apply_ext_gstate`) —
+    /// sans quoi le texte sous le surlignage serait entièrement caché par
+    /// un aplat opaque. `quad_points` (ISO 32000-1 §12.5.6.10, 8 nombres =
+    /// 4 sommets, sens direct) : si vide, dérivé automatiquement des quatre
+    /// coins de `rect`.
     pub fn add_highlight_annotation(
         &mut self,
         page_index: usize,
@@ -207,14 +218,26 @@ impl EditSession {
             vec![x0, y1, x1, y1, x0, y0, x1, y0]
         };
 
+        let gs_num = self.alloc_num();
+        let mut gs_dict = Dictionary::new();
+        gs_dict.insert("Type", Object::Name("ExtGState".to_string()));
+        gs_dict.insert("ca", Object::Real(Self::HIGHLIGHT_FILL_ALPHA));
+        self.pending.insert(gs_num, Object::Dictionary(gs_dict));
+
         let ap_num = self.alloc_num();
         let ap_content = format!(
-            "{:.3} {:.3} {:.3} rg 0 0 {width:.3} {height:.3} re f",
+            "/GS0 gs {:.3} {:.3} {:.3} rg 0 0 {width:.3} {height:.3} re f",
             color.0, color.1, color.2
         );
+        let mut ap_resources = Dictionary::new();
+        let mut ext_gstate_dict = Dictionary::new();
+        ext_gstate_dict.insert("GS0", Object::Reference(ObjRef::new(gs_num, 0)));
+        ap_resources.insert("ExtGState", Object::Dictionary(ext_gstate_dict));
+
         let mut ap_dict = Dictionary::new();
         ap_dict.insert("Type", Object::Name("XObject".to_string()));
         ap_dict.insert("Subtype", Object::Name("Form".to_string()));
+        ap_dict.insert("Resources", Object::Dictionary(ap_resources));
         ap_dict.insert(
             "BBox",
             Object::Array(vec![
@@ -246,6 +269,125 @@ impl EditSession {
         annot_dict.insert(
             "QuadPoints",
             Object::Array(quad.into_iter().map(Object::Real).collect()),
+        );
+        annot_dict.insert(
+            "C",
+            Object::Array(vec![
+                Object::Real(color.0 as f64),
+                Object::Real(color.1 as f64),
+                Object::Real(color.2 as f64),
+            ]),
+        );
+        let mut ap_ref_dict = Dictionary::new();
+        ap_ref_dict.insert("N", Object::Reference(ObjRef::new(ap_num, 0)));
+        annot_dict.insert("AP", Object::Dictionary(ap_ref_dict));
+        self.pending
+            .insert(annot_num, Object::Dictionary(annot_dict));
+
+        self.append_to_annots(page_ref, ObjRef::new(annot_num, 0))?;
+        Ok(())
+    }
+
+    /// Ajoute une annotation `/Underline` couvrant `rect` (Sprint 20) : une
+    /// ligne tracée près du bas du rectangle, comme un vrai lecteur PDF.
+    /// Partage `add_line_markup_annotation` avec `add_strikeout_annotation`
+    /// — seule la position verticale de la ligne diffère.
+    pub fn add_underline_annotation(
+        &mut self,
+        page_index: usize,
+        rect: [f64; 4],
+        color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.add_line_markup_annotation("Underline", page_index, rect, color, 0.08)
+    }
+
+    /// Ajoute une annotation `/StrikeOut` couvrant `rect` (Sprint 20) : une
+    /// ligne tracée au centre du rectangle.
+    pub fn add_strikeout_annotation(
+        &mut self,
+        page_index: usize,
+        rect: [f64; 4],
+        color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.add_line_markup_annotation("StrikeOut", page_index, rect, color, 0.5)
+    }
+
+    /// Construit une annotation de type "ligne tracée" (`/Underline` ou
+    /// `/StrikeOut`, ISO 32000-1 §12.5.6.9/.10) : contrairement à
+    /// `/Highlight` (rectangle rempli semi-transparent), l'apparence est un
+    /// simple trait horizontal à `line_y_fraction` de la hauteur de `rect` —
+    /// pas de vraie ligne de base connue pour une plage de caractères
+    /// arbitraire (même limitation que `add_highlight_annotation`), la
+    /// fraction est donc une approximation raisonnable plutôt qu'une mesure
+    /// exacte.
+    fn add_line_markup_annotation(
+        &mut self,
+        subtype: &str,
+        page_index: usize,
+        rect: [f64; 4],
+        color: (f32, f32, f32),
+        line_y_fraction: f64,
+    ) -> Result<(), String> {
+        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
+        let page_ref = page
+            .object_ref
+            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+
+        let (x0, y0, x1, y1) = (
+            rect[0].min(rect[2]),
+            rect[1].min(rect[3]),
+            rect[0].max(rect[2]),
+            rect[1].max(rect[3]),
+        );
+        let width = (x1 - x0).max(1.0);
+        let height = (y1 - y0).max(1.0);
+        let line_y = height * line_y_fraction;
+
+        let ap_num = self.alloc_num();
+        let ap_content = format!(
+            "{:.3} {:.3} {:.3} RG 1 w 0 {line_y:.3} m {width:.3} {line_y:.3} l S",
+            color.0, color.1, color.2
+        );
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("Type", Object::Name("XObject".to_string()));
+        ap_dict.insert("Subtype", Object::Name("Form".to_string()));
+        ap_dict.insert("Resources", Object::Dictionary(Dictionary::new()));
+        ap_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(width),
+                Object::Real(height),
+            ]),
+        );
+        let ap_stream = Object::Stream(Stream {
+            dict: ap_dict,
+            raw_data: ap_content.into_bytes(),
+        });
+        self.pending.insert(ap_num, ap_stream);
+
+        let annot_num = self.alloc_num();
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("Type", Object::Name("Annot".to_string()));
+        annot_dict.insert("Subtype", Object::Name(subtype.to_string()));
+        annot_dict.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Real(x0),
+                Object::Real(y0),
+                Object::Real(x1),
+                Object::Real(y1),
+            ]),
+        );
+        annot_dict.insert(
+            "QuadPoints",
+            Object::Array(
+                vec![x0, y1, x1, y1, x0, y0, x1, y0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect(),
+            ),
         );
         annot_dict.insert(
             "C",
@@ -1345,6 +1487,59 @@ mod tests {
         assert!(
             has_yellow_fill,
             "expected the highlight's yellow fill to survive save+reopen, got: {:?}",
+            display.items
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Symétrique de `add_highlight_persists_and_renders_after_reopen`, pour
+    /// `/Underline` et `/StrikeOut` (Sprint 20) : une ligne tracée (pas
+    /// remplie) doit survivre à la sauvegarde+réouverture.
+    #[test]
+    fn add_underline_and_strikeout_persist_and_render_as_stroked_lines() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_underline_annotation(0, [100.0, 600.0, 300.0, 630.0], (1.0, 0.0, 0.0))
+            .unwrap();
+        session
+            .add_strikeout_annotation(0, [100.0, 500.0, 300.0, 530.0], (0.0, 0.0, 1.0))
+            .unwrap();
+
+        let out_path = write_fixture(b"placeholder-for-unique-name-underline");
+        session.save_as(&out_path).unwrap();
+
+        let reopened_bytes = std::fs::read(&out_path).unwrap();
+        let doc = pdf_core::Document::open(reopened_bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display = Interpreter::run_page_with_annotations(&doc, &page, &content).unwrap();
+
+        let has_stroked_line = |r: f64, g: f64, b: f64| {
+            display.items.iter().any(|item| {
+                matches!(
+                    item,
+                    pdf_core::display::DisplayItem::Path {
+                        paint: pdf_core::display::PaintOp::Stroke,
+                        stroke_color: pdf_core::display::Color::Rgb(cr, cg, cb),
+                        ..
+                    } if (*cr - r).abs() < 0.01 && (*cg - g).abs() < 0.01 && (*cb - b).abs() < 0.01
+                )
+            })
+        };
+        assert!(
+            has_stroked_line(1.0, 0.0, 0.0),
+            "expected a red stroked line for the underline, got: {:?}",
+            display.items
+        );
+        assert!(
+            has_stroked_line(0.0, 0.0, 1.0),
+            "expected a blue stroked line for the strikeout, got: {:?}",
             display.items
         );
 

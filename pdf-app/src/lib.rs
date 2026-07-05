@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use pdf_core::Document;
+use pdf_core::{Document, Object};
 
 /// Ré-exporté tel quel (pas de conversion vers un type propre à `pdf-app`,
 /// contrairement à `MatchRect`) : `OutlineItem` ne porte aucune notion liée
@@ -61,6 +61,31 @@ impl From<pdf_text::GlyphRect> for MatchRect {
             x1: r.x1,
             y1: r.y1,
         }
+    }
+}
+
+/// Annotation visible d'une page (Sprint 20) : juste assez d'information
+/// pour que `pdf-ui` puisse dessiner son contour et proposer de la
+/// supprimer (`Session::remove_annotation_on_current_page`, déjà existant)
+/// — pas une copie complète du dictionnaire d'annotation. `index` est la
+/// position dans `/Annots`, celle attendue par `remove_annotation`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnotationInfo {
+    pub index: usize,
+    pub rect: [f64; 4],
+    /// `/Subtype` (`"Highlight"`, `"FreeText"`, `"Underline"`,
+    /// `"StrikeOut"`...), chaîne vide si absent.
+    pub subtype: String,
+}
+
+/// Comme `Object::as_int`/`as_real` mais accepte indifféremment `Integer` et
+/// `Real` — les `/Rect`/`/BBox` d'un PDF réel mélangent les deux (voir la
+/// même nécessité dans `pdf_core::interp::obj_num`, privée à ce crate).
+fn obj_num(o: &Object) -> f64 {
+    match o {
+        Object::Integer(n) => *n as f64,
+        Object::Real(f) => *f,
+        _ => 0.0,
     }
 }
 
@@ -245,24 +270,38 @@ impl Session {
         Ok(self.cached_page_text(self.page_index)?.text().to_string())
     }
 
-    /// Recherche `query` (insensible à la casse) dans le texte de chaque
-    /// page et retourne les index de page où au moins une occurrence a été
-    /// trouvée. Le texte de chaque page n'est extrait qu'une fois (voir
-    /// `text_cache`) : une deuxième recherche sur le même document ne
-    /// ré-interprète aucun flux de contenu.
+    /// Texte de tout le document, une page par section séparée par un saut de
+    /// page (`\x0c`) — utilisé par l'export `.txt` (Sprint 18). Réutilise le
+    /// même cache par page que `find_pages_containing`/
+    /// `extract_current_page_text` : n'importe quelle page déjà vue n'est pas
+    /// ré-extraite.
+    pub fn extract_all_text(&self) -> Result<String, String> {
+        let mut out = String::new();
+        for index in 0..self.page_count {
+            if index > 0 {
+                out.push('\x0c');
+                out.push('\n');
+            }
+            out.push_str(self.cached_page_text(index)?.text());
+        }
+        Ok(out)
+    }
+
+    /// Recherche `query` (insensible à la casse **et aux accents**, voir
+    /// `pdf_text::normalize_for_search`) dans le texte de chaque page et
+    /// retourne les index de page où au moins une occurrence a été trouvée.
+    /// Le texte de chaque page n'est extrait qu'une fois (voir `text_cache`) :
+    /// une deuxième recherche sur le même document ne ré-interprète aucun
+    /// flux de contenu.
     pub fn find_pages_containing(&self, query: &str) -> Result<Vec<usize>, String> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let query = query.to_lowercase();
+        let query = pdf_text::normalize_for_search(query);
         let mut matches = Vec::new();
         for index in 0..self.page_count {
-            if self
-                .cached_page_text(index)?
-                .text()
-                .to_lowercase()
-                .contains(&query)
-            {
+            let haystack = pdf_text::normalize_for_search(self.cached_page_text(index)?.text());
+            if haystack.contains(&query) {
                 matches.push(index);
             }
         }
@@ -290,6 +329,24 @@ impl Session {
         point: (f64, f64),
     ) -> Result<Option<usize>, String> {
         Ok(self.cached_page_text(self.page_index)?.char_index_at(point))
+    }
+
+    /// Plage de caractères (page courante) du "mot" contenant `index` — voir
+    /// `pdf_text::PageText::word_range_at`, utilisé pour le double-clic.
+    pub fn word_range_at_on_current_page(
+        &self,
+        index: usize,
+    ) -> Result<std::ops::Range<usize>, String> {
+        Ok(self.cached_page_text(self.page_index)?.word_range_at(index))
+    }
+
+    /// Plage de caractères (page courante) de la "ligne" contenant `index` —
+    /// voir `pdf_text::PageText::line_range_at`, utilisé pour le triple-clic.
+    pub fn line_range_at_on_current_page(
+        &self,
+        index: usize,
+    ) -> Result<std::ops::Range<usize>, String> {
+        Ok(self.cached_page_text(self.page_index)?.line_range_at(index))
     }
 
     /// Texte et rectangles (espace page PDF, un par caractère, non fusionnés
@@ -348,11 +405,179 @@ impl Session {
         self.refresh_after_edit()
     }
 
+    /// Souligne la sélection de texte courante (Sprint 20, voir
+    /// `pdf_edit::EditSession::add_underline_annotation`).
+    pub fn add_underline_on_current_page(
+        &mut self,
+        rect: [f64; 4],
+        color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.edit
+            .add_underline_annotation(self.page_index, rect, color)?;
+        self.refresh_after_edit()
+    }
+
+    /// Barre la sélection de texte courante (Sprint 20, voir
+    /// `pdf_edit::EditSession::add_strikeout_annotation`).
+    pub fn add_strikeout_on_current_page(
+        &mut self,
+        rect: [f64; 4],
+        color: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.edit
+            .add_strikeout_annotation(self.page_index, rect, color)?;
+        self.refresh_after_edit()
+    }
+
+    /// Remplace (par superposition : masque + redessine, voir
+    /// `pdf_edit::EditSession::replace_text_with_overlay`) le texte de la
+    /// page courante situé dans `rect` par `text` (Sprint 20, câblage UI de
+    /// l'édition de texte 6b).
+    pub fn replace_text_on_current_page(
+        &mut self,
+        rect: [f64; 4],
+        text: &str,
+        font_size: f64,
+        text_color: (f32, f32, f32),
+        background: (f32, f32, f32),
+    ) -> Result<(), String> {
+        self.edit.replace_text_with_overlay(
+            self.page_index,
+            rect,
+            text,
+            font_size,
+            text_color,
+            background,
+        )?;
+        self.refresh_after_edit()
+    }
+
     /// Retire l'annotation d'indice `annot_index` de la page courante (voir
     /// `pdf_edit::EditSession::remove_annotation`) et rafraîchit le rendu.
     pub fn remove_annotation_on_current_page(&mut self, annot_index: usize) -> Result<(), String> {
         self.edit.remove_annotation(self.page_index, annot_index)?;
         self.refresh_after_edit()
+    }
+
+    /// Liste les annotations visibles de la page courante (Sprint 20) — même
+    /// filtre `Hidden`/`NoView` que le rendu normal
+    /// (`pdf_core::interp::run_page_with_annotations`), pour que `pdf-ui`
+    /// puisse afficher un contour cliquable par annotation et proposer de la
+    /// supprimer (`remove_annotation_on_current_page`, l'`index` renvoyé ici
+    /// est directement celui attendu par cette méthode).
+    pub fn annotations_on_current_page(&self) -> Result<Vec<AnnotationInfo>, String> {
+        let page = self.doc.page(self.page_index).map_err(|e| e.to_string())?;
+        let Some(annots_obj) = page.dict.get("Annots") else {
+            return Ok(Vec::new());
+        };
+        let annots = self.doc.get(annots_obj).map_err(|e| e.to_string())?;
+        let Some(refs) = annots.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for (index, annot_ref) in refs.iter().enumerate() {
+            let Ok(annot_obj) = self.doc.get(annot_ref) else {
+                continue;
+            };
+            let Some(dict) = annot_obj.as_dict() else {
+                continue;
+            };
+            if let Some(flags) = dict.get("F").and_then(|o| o.as_int()) {
+                if flags & 0x2 != 0 || flags & 0x20 != 0 {
+                    continue; // Hidden ou NoView, ISO 32000-1 §12.5.3 tableau 165.
+                }
+            }
+            let Some(rect_arr) = dict
+                .get("Rect")
+                .and_then(|o| o.as_array())
+                .filter(|r| r.len() >= 4)
+            else {
+                continue;
+            };
+            let rect = [
+                obj_num(&rect_arr[0]),
+                obj_num(&rect_arr[1]),
+                obj_num(&rect_arr[2]),
+                obj_num(&rect_arr[3]),
+            ];
+            let subtype = dict
+                .get("Subtype")
+                .and_then(|o| o.as_name())
+                .unwrap_or("")
+                .to_string();
+            out.push(AnnotationInfo {
+                index,
+                rect,
+                subtype,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Insère une page blanche à `at_index` (Sprint 19, câblage `pdf-ui` de
+    /// `pdf_edit::EditSession::insert_blank_page`) — reprend le `MediaBox` de
+    /// la page courante si le document en a au moins une, sinon une page
+    /// Lettre US par défaut (612×792pt).
+    pub fn insert_blank_page_at(&mut self, at_index: usize) -> Result<(), String> {
+        let media_box = self
+            .current_page_media_box()
+            .unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        self.edit.insert_blank_page(at_index, media_box)?;
+        self.refresh_after_edit()
+    }
+
+    /// Insère une nouvelle page à `at_index` dont le contenu est l'image
+    /// JPEG `jpeg_bytes` (voir `pdf_edit::EditSession::insert_image_page` :
+    /// JPEG seulement, intégré tel quel).
+    pub fn insert_image_page_at(
+        &mut self,
+        at_index: usize,
+        jpeg_bytes: &[u8],
+    ) -> Result<(), String> {
+        self.edit.insert_image_page(at_index, jpeg_bytes)?;
+        self.refresh_after_edit()
+    }
+
+    /// Supprime la page `index` (voir `pdf_edit::EditSession::delete_page`).
+    pub fn delete_page_at(&mut self, index: usize) -> Result<(), String> {
+        self.edit.delete_page(index)?;
+        self.refresh_after_edit()
+    }
+
+    /// Déplace la page `from` à la position `to` (voir
+    /// `pdf_edit::EditSession::move_page`) — utilisé par le glisser-déposer
+    /// des miniatures.
+    pub fn move_page(&mut self, from: usize, to: usize) -> Result<(), String> {
+        self.edit.move_page(from, to)?;
+        self.refresh_after_edit()
+    }
+
+    /// Ajoute `delta` degrés (multiple de 90) à la rotation persistée de la
+    /// page `index` (voir `pdf_edit::EditSession::rotate_page` — distinct
+    /// d'une rotation de vue éphémère, qui n'existe pas dans ce viewer).
+    pub fn rotate_page_at(&mut self, index: usize, delta: i32) -> Result<(), String> {
+        self.edit.rotate_page(index, delta)?;
+        self.refresh_after_edit()
+    }
+
+    /// Concatène la totalité du PDF situé à `source_path` à la fin du
+    /// document courant (voir `pdf_edit::EditSession::merge_document`) —
+    /// ouvre `source_path` en lecture seule, ne modifie jamais ce fichier.
+    pub fn merge_document_from_path(&mut self, source_path: &Path) -> Result<(), String> {
+        let bytes = std::fs::read(source_path).map_err(|e| e.to_string())?;
+        let source = Document::open(bytes).map_err(|e| e.to_string())?;
+        self.edit.merge_document(&source)?;
+        self.refresh_after_edit()
+    }
+
+    /// Extrait `indices` du document courant (état actuel, y compris les
+    /// éditions en attente) vers un nouveau fichier autonome `dest` (voir
+    /// `pdf_edit::extract_pages`) — ne modifie pas la session en cours, sert
+    /// au "découper"/"extraire une sélection de pages".
+    pub fn extract_pages_to_file(&self, indices: &[usize], dest: &Path) -> Result<(), String> {
+        let bytes = pdf_edit::extract_pages(&self.doc, indices)?;
+        std::fs::write(dest, bytes).map_err(|e| e.to_string())
     }
 
     /// Défait la dernière opération d'édition et rafraîchit le rendu.
@@ -383,6 +608,25 @@ impl Session {
     /// mise à jour.
     pub fn save_edits_in_place(&self) -> Result<(), String> {
         self.edit.save_as(&self.path)
+    }
+
+    /// Octets du document courant, éditions en attente incluses (voir
+    /// `pdf_edit::EditSession::to_bytes`) — sans toucher au fichier sur
+    /// disque. Utilisé pour imprimer "tel qu'affiché" (Sprint 21, #48) via
+    /// un fichier temporaire, sans attendre un `save_edits_in_place`.
+    pub fn current_bytes(&self) -> Result<Vec<u8>, String> {
+        self.edit.to_bytes()
+    }
+
+    /// Octets d'une version optimisée du document courant (Sprint 22, #45) :
+    /// un vrai garbage collector par reconstruction (`pdf_edit::export_optimized`,
+    /// ne copie que les objets atteignables depuis les pages) — élimine les
+    /// objets orphelins laissés par `undo`/les éditions successives (voir la
+    /// limitation documentée sur `undo_edit`). Opère sur `self.doc`, donc
+    /// inclut déjà toute édition en attente (`refresh_after_edit` le tient à
+    /// jour).
+    pub fn export_optimized(&self) -> Result<Vec<u8>, String> {
+        pdf_edit::export_optimized(&self.doc)
     }
 
     /// Après toute opération d'édition : régénère les octets du document
@@ -763,9 +1007,13 @@ mod tests {
         // page 612x792 : y_pixmap = 792 - y_page, donc y_page in [600,630]
         // correspond à y_pixmap in [162,192].
         let after_pixel_index = (175 * after.width as usize + 150) * 4;
+        // Jaune (1,1,0) à `HIGHLIGHT_FILL_ALPHA` (0.4) sur fond blanc (voir
+        // `pdf_edit::EditSession::add_highlight_annotation`) : le résultat
+        // n'est pas le jaune pur, mais une teinte pâle qui laisse deviner le
+        // fond — exactement le but de l'opacité partielle.
         assert_eq!(
             &after.rgba[after_pixel_index..after_pixel_index + 3],
-            &[255, 255, 0],
+            &[255, 255, 153],
             "expected the yellow highlight to be visible right after adding it, before any save"
         );
 
@@ -790,7 +1038,7 @@ mod tests {
         let with_highlight = session.render_current_page(1.0).unwrap();
         assert_eq!(
             &with_highlight.rgba[pixel_index..pixel_index + 3],
-            &[255, 255, 0]
+            &[255, 255, 153]
         );
 
         assert!(session.undo_edit().unwrap());
@@ -805,7 +1053,7 @@ mod tests {
         let after_redo = session.render_current_page(1.0).unwrap();
         assert_eq!(
             &after_redo.rgba[pixel_index..pixel_index + 3],
-            &[255, 255, 0]
+            &[255, 255, 153]
         );
 
         std::fs::remove_file(&path).ok();
@@ -835,6 +1083,198 @@ mod tests {
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(annots, 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn insert_blank_page_at_increases_page_count_and_refreshes_render() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session.insert_blank_page_at(0).unwrap();
+        assert_eq!(session.page_count(), 6);
+        // La nouvelle page (vierge) doit être rastérisable sans erreur.
+        assert!(session.render_page(0, 1.0).is_ok());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_page_at_decreases_page_count_and_undo_restores_it() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session.delete_page_at(2).unwrap();
+        assert_eq!(session.page_count(), 4);
+
+        assert!(session.undo_edit().unwrap());
+        assert_eq!(session.page_count(), 5);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn move_page_reorders_pages() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        let before = session.extract_all_text().unwrap();
+        session.move_page(0, 4).unwrap();
+        let after = session.extract_all_text().unwrap();
+        assert_ne!(
+            before, after,
+            "reordering pages must change the reading order"
+        );
+        assert_eq!(session.page_count(), 5, "moving keeps the same page count");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rotate_page_at_persists_after_save_and_reopen() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session.rotate_page_at(0, 90).unwrap();
+        session.save_edits_in_place().unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reopened.page(0).unwrap().rotate, 90);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn merge_document_from_path_appends_all_pages_of_the_source() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let base_path = write_fixture(&bytes);
+        let source_bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/embedded_truetype_font.pdf").to_vec();
+        let source_path = write_fixture(&source_bytes);
+        let mut session = Session::open(&base_path).unwrap();
+
+        session.merge_document_from_path(&source_path).unwrap();
+        assert_eq!(session.page_count(), 6); // 5 pages d'origine + 1 fusionnée.
+        assert!(session.render_page(5, 1.0).is_ok());
+
+        std::fs::remove_file(&base_path).ok();
+        std::fs::remove_file(&source_path).ok();
+    }
+
+    #[test]
+    fn extract_pages_to_file_produces_a_standalone_document() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = Session::open(&path).unwrap();
+
+        let dest = std::env::temp_dir().join(format!(
+            "pdf_app_test_extract_{}_{:p}.pdf",
+            std::process::id(),
+            &bytes
+        ));
+        session.extract_pages_to_file(&[1, 3], &dest).unwrap();
+
+        let extracted = pdf_core::Document::open(std::fs::read(&dest).unwrap()).unwrap();
+        assert_eq!(extracted.page_count().unwrap(), 2);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn annotations_on_current_page_lists_added_annotations_and_survives_removal() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        assert!(session.annotations_on_current_page().unwrap().is_empty());
+
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+        session
+            .add_underline_on_current_page([100.0, 500.0, 300.0, 530.0], (1.0, 0.0, 0.0))
+            .unwrap();
+
+        let annots = session.annotations_on_current_page().unwrap();
+        assert_eq!(annots.len(), 2);
+        assert_eq!(annots[0].subtype, "Highlight");
+        assert_eq!(annots[0].rect, [100.0, 600.0, 300.0, 630.0]);
+        assert_eq!(annots[1].subtype, "Underline");
+
+        session
+            .remove_annotation_on_current_page(annots[0].index)
+            .unwrap();
+        let after_removal = session.annotations_on_current_page().unwrap();
+        assert_eq!(after_removal.len(), 1);
+        assert_eq!(after_removal[0].subtype, "Underline");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn replace_text_on_current_page_keeps_original_text_extractable() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session
+            .replace_text_on_current_page(
+                [72.0, 715.0, 400.0, 735.0],
+                "Titre remplace",
+                18.0,
+                (0.0, 0.0, 0.0),
+                (1.0, 1.0, 1.0),
+            )
+            .unwrap();
+
+        let text = session.extract_current_page_text().unwrap();
+        assert!(
+            text.contains("Page 1 - Hello, PDF Manager!"),
+            "original text must remain extractable behind the overlay, got: {text:?}"
+        );
+        assert!(
+            text.contains("Titre remplace"),
+            "new overlay text must be extractable too, got: {text:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn export_optimized_produces_a_reopenable_document_with_all_pages() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+
+        let optimized = session.export_optimized().unwrap();
+        let reopened = pdf_core::Document::open(optimized).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 5);
+        let page = reopened.page(0).unwrap();
+        let annots = page
+            .dict
+            .get("Annots")
+            .and_then(|o| o.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(annots, 1, "the pending highlight must survive optimization");
 
         std::fs::remove_file(&path).ok();
     }

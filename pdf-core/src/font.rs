@@ -114,7 +114,10 @@ pub struct Font {
     subtype: String,
     encoding: [Option<char>; 256],
     widths: [Option<f64>; 256],
-    use_helvetica_fallback: bool,
+    /// Table de largeurs AFM à utiliser en repli si `/Widths` est absent
+    /// (cas normal des 14 polices standard), choisie d'après `/BaseFont`
+    /// (voir `standard_width_fallback`). `None` pour une police composite.
+    width_fallback: Option<fn(u8) -> Option<f64>>,
     /// Octets bruts d'un `/FontFile2` (TrueType) déjà décodé, s'il y en a un.
     /// Pour une police composite, provient du `/FontDescriptor` du
     /// descendant (`/DescendantFonts`), pas du dictionnaire `/Type0`
@@ -213,7 +216,16 @@ impl Font {
             }
         }
 
-        let use_helvetica_fallback = subtype != "Type0" && widths.iter().all(|w| w.is_none());
+        let base_font = dict
+            .get("BaseFont")
+            .and_then(|o| o.as_name())
+            .unwrap_or("Helvetica");
+
+        let width_fallback = if subtype != "Type0" && widths.iter().all(|w| w.is_none()) {
+            Some(standard_width_fallback(base_font))
+        } else {
+            None
+        };
 
         let descriptor_dict = dict
             .get("FontDescriptor")
@@ -225,10 +237,6 @@ impl Font {
 
         let system_fallback =
             if embedded_truetype.is_none() && embedded_cff.is_none() && subtype != "Type0" {
-                let base_font = dict
-                    .get("BaseFont")
-                    .and_then(|o| o.as_name())
-                    .unwrap_or("Helvetica");
                 system_font::lookup(base_font)
             } else {
                 None
@@ -326,7 +334,7 @@ impl Font {
             subtype,
             encoding,
             widths,
-            use_helvetica_fallback,
+            width_fallback,
             embedded_truetype,
             embedded_cff,
             system_fallback,
@@ -339,13 +347,7 @@ impl Font {
     pub fn decode_simple(&self, code: u8) -> (Option<char>, f64) {
         let unicode = self.encoding[code as usize];
         let width = self.widths[code as usize]
-            .or_else(|| {
-                if self.use_helvetica_fallback {
-                    helvetica_width(code)
-                } else {
-                    None
-                }
-            })
+            .or_else(|| self.width_fallback.and_then(|f| f(code)))
             .unwrap_or(DEFAULT_WIDTH);
         (unicode, width)
     }
@@ -904,6 +906,420 @@ fn base_encoding_by_name(name: &str) -> Option<[Option<char>; 256]> {
         "MacRomanEncoding" => Some(WIN_ANSI_ENCODING), // approximation, voir limitations ci-dessus.
         _ => None,
     }
+}
+
+/// Choisit la table de largeurs AFM Core 14 à utiliser en repli d'après le
+/// nom de `/BaseFont` (préfixe de sous-ensemble toléré, comme
+/// `system_font::lookup`) : Times/Courier ont des métriques très différentes
+/// d'Helvetica (largeurs proportionnelles vs Times, ou fixes pour Courier),
+/// et les confondre décale les glyphes suivants au sein d'un mot (largeur
+/// trop grande ou trop petite qui s'accumule), d'où les espaces parasites
+/// visibles au milieu des mots en Times/Courier avant ce correctif. Tout nom
+/// non reconnu (Helvetica/Arial, Symbol, ZapfDingbats, ...) retombe sur les
+/// largeurs Helvetica, comme avant.
+fn standard_width_fallback(base_font: &str) -> fn(u8) -> Option<f64> {
+    let name = base_font.split('+').next_back().unwrap_or(base_font);
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("courier") {
+        courier_width
+    } else if lower.contains("times") {
+        let bold = lower.contains("bold");
+        let italic = lower.contains("italic") || lower.contains("oblique");
+        match (bold, italic) {
+            (true, true) => times_bold_italic_width,
+            (true, false) => times_bold_width,
+            (false, true) => times_italic_width,
+            (false, false) => times_roman_width,
+        }
+    } else {
+        helvetica_width
+    }
+}
+
+/// Largeurs Courier (Adobe Core 14 AFM) : chasse fixe, communes aux 4
+/// variantes (Roman/Bold/Italique/BoldItalique).
+fn courier_width(code: u8) -> Option<f64> {
+    if (32..=126).contains(&code) {
+        Some(600.0)
+    } else {
+        None
+    }
+}
+
+/// Largeurs Times-Roman (Adobe Core 14 AFM), millièmes d'em, codes ASCII
+/// imprimables 32-126.
+fn times_roman_width(code: u8) -> Option<f64> {
+    Some(match code {
+        32 => 250.0,
+        33 => 333.0,
+        34 => 408.0,
+        35 => 500.0,
+        36 => 500.0,
+        37 => 833.0,
+        38 => 778.0,
+        39 => 180.0,
+        40 => 333.0,
+        41 => 333.0,
+        42 => 500.0,
+        43 => 564.0,
+        44 => 250.0,
+        45 => 333.0,
+        46 => 250.0,
+        47 => 278.0,
+        48..=57 => 500.0,
+        58 => 278.0,
+        59 => 278.0,
+        60 => 564.0,
+        61 => 564.0,
+        62 => 564.0,
+        63 => 444.0,
+        64 => 921.0,
+        65 => 722.0,
+        66 => 667.0,
+        67 => 667.0,
+        68 => 722.0,
+        69 => 611.0,
+        70 => 556.0,
+        71 => 722.0,
+        72 => 722.0,
+        73 => 333.0,
+        74 => 389.0,
+        75 => 722.0,
+        76 => 611.0,
+        77 => 889.0,
+        78 => 722.0,
+        79 => 722.0,
+        80 => 556.0,
+        81 => 722.0,
+        82 => 667.0,
+        83 => 556.0,
+        84 => 611.0,
+        85 => 722.0,
+        86 => 722.0,
+        87 => 944.0,
+        88 => 722.0,
+        89 => 722.0,
+        90 => 611.0,
+        91 => 333.0,
+        92 => 278.0,
+        93 => 333.0,
+        94 => 469.0,
+        95 => 500.0,
+        96 => 333.0,
+        97 => 444.0,
+        98 => 500.0,
+        99 => 444.0,
+        100 => 500.0,
+        101 => 444.0,
+        102 => 333.0,
+        103 => 500.0,
+        104 => 500.0,
+        105 => 278.0,
+        106 => 278.0,
+        107 => 500.0,
+        108 => 278.0,
+        109 => 778.0,
+        110 => 500.0,
+        111 => 500.0,
+        112 => 500.0,
+        113 => 500.0,
+        114 => 333.0,
+        115 => 389.0,
+        116 => 278.0,
+        117 => 500.0,
+        118 => 500.0,
+        119 => 722.0,
+        120 => 500.0,
+        121 => 500.0,
+        122 => 444.0,
+        123 => 480.0,
+        124 => 200.0,
+        125 => 480.0,
+        126 => 541.0,
+        _ => return None,
+    })
+}
+
+/// Largeurs Times-Bold (Adobe Core 14 AFM), millièmes d'em, codes ASCII
+/// imprimables 32-126.
+fn times_bold_width(code: u8) -> Option<f64> {
+    Some(match code {
+        32 => 250.0,
+        33 => 333.0,
+        34 => 555.0,
+        35 => 500.0,
+        36 => 500.0,
+        37 => 1000.0,
+        38 => 833.0,
+        39 => 278.0,
+        40 => 333.0,
+        41 => 333.0,
+        42 => 500.0,
+        43 => 570.0,
+        44 => 250.0,
+        45 => 333.0,
+        46 => 250.0,
+        47 => 278.0,
+        48..=57 => 500.0,
+        58 => 333.0,
+        59 => 333.0,
+        60 => 570.0,
+        61 => 570.0,
+        62 => 570.0,
+        63 => 500.0,
+        64 => 930.0,
+        65 => 722.0,
+        66 => 667.0,
+        67 => 722.0,
+        68 => 722.0,
+        69 => 667.0,
+        70 => 611.0,
+        71 => 778.0,
+        72 => 778.0,
+        73 => 389.0,
+        74 => 500.0,
+        75 => 778.0,
+        76 => 667.0,
+        77 => 944.0,
+        78 => 722.0,
+        79 => 778.0,
+        80 => 611.0,
+        81 => 778.0,
+        82 => 722.0,
+        83 => 556.0,
+        84 => 667.0,
+        85 => 722.0,
+        86 => 722.0,
+        87 => 1000.0,
+        88 => 722.0,
+        89 => 722.0,
+        90 => 667.0,
+        91 => 333.0,
+        92 => 278.0,
+        93 => 333.0,
+        94 => 581.0,
+        95 => 500.0,
+        96 => 333.0,
+        97 => 500.0,
+        98 => 556.0,
+        99 => 444.0,
+        100 => 556.0,
+        101 => 444.0,
+        102 => 333.0,
+        103 => 500.0,
+        104 => 556.0,
+        105 => 278.0,
+        106 => 333.0,
+        107 => 556.0,
+        108 => 278.0,
+        109 => 833.0,
+        110 => 556.0,
+        111 => 500.0,
+        112 => 556.0,
+        113 => 556.0,
+        114 => 444.0,
+        115 => 389.0,
+        116 => 333.0,
+        117 => 556.0,
+        118 => 500.0,
+        119 => 722.0,
+        120 => 500.0,
+        121 => 500.0,
+        122 => 444.0,
+        123 => 394.0,
+        124 => 220.0,
+        125 => 394.0,
+        126 => 520.0,
+        _ => return None,
+    })
+}
+
+/// Largeurs Times-Italic (Adobe Core 14 AFM), millièmes d'em, codes ASCII
+/// imprimables 32-126.
+fn times_italic_width(code: u8) -> Option<f64> {
+    Some(match code {
+        32 => 250.0,
+        33 => 333.0,
+        34 => 420.0,
+        35 => 500.0,
+        36 => 500.0,
+        37 => 833.0,
+        38 => 778.0,
+        39 => 214.0,
+        40 => 333.0,
+        41 => 333.0,
+        42 => 500.0,
+        43 => 675.0,
+        44 => 250.0,
+        45 => 333.0,
+        46 => 250.0,
+        47 => 278.0,
+        48..=57 => 500.0,
+        58 => 333.0,
+        59 => 333.0,
+        60 => 675.0,
+        61 => 675.0,
+        62 => 675.0,
+        63 => 500.0,
+        64 => 920.0,
+        65 => 611.0,
+        66 => 611.0,
+        67 => 667.0,
+        68 => 722.0,
+        69 => 611.0,
+        70 => 611.0,
+        71 => 722.0,
+        72 => 722.0,
+        73 => 333.0,
+        74 => 444.0,
+        75 => 667.0,
+        76 => 556.0,
+        77 => 833.0,
+        78 => 667.0,
+        79 => 722.0,
+        80 => 611.0,
+        81 => 722.0,
+        82 => 611.0,
+        83 => 500.0,
+        84 => 556.0,
+        85 => 722.0,
+        86 => 611.0,
+        87 => 833.0,
+        88 => 611.0,
+        89 => 556.0,
+        90 => 556.0,
+        91 => 389.0,
+        92 => 278.0,
+        93 => 389.0,
+        94 => 422.0,
+        95 => 500.0,
+        96 => 333.0,
+        97 => 500.0,
+        98 => 500.0,
+        99 => 444.0,
+        100 => 500.0,
+        101 => 444.0,
+        102 => 278.0,
+        103 => 500.0,
+        104 => 500.0,
+        105 => 278.0,
+        106 => 278.0,
+        107 => 444.0,
+        108 => 278.0,
+        109 => 722.0,
+        110 => 500.0,
+        111 => 500.0,
+        112 => 500.0,
+        113 => 500.0,
+        114 => 389.0,
+        115 => 389.0,
+        116 => 278.0,
+        117 => 500.0,
+        118 => 444.0,
+        119 => 667.0,
+        120 => 444.0,
+        121 => 444.0,
+        122 => 389.0,
+        123 => 400.0,
+        124 => 275.0,
+        125 => 400.0,
+        126 => 541.0,
+        _ => return None,
+    })
+}
+
+/// Largeurs Times-BoldItalic (Adobe Core 14 AFM), millièmes d'em, codes
+/// ASCII imprimables 32-126.
+fn times_bold_italic_width(code: u8) -> Option<f64> {
+    Some(match code {
+        32 => 250.0,
+        33 => 389.0,
+        34 => 555.0,
+        35 => 500.0,
+        36 => 500.0,
+        37 => 833.0,
+        38 => 778.0,
+        39 => 278.0,
+        40 => 333.0,
+        41 => 333.0,
+        42 => 500.0,
+        43 => 570.0,
+        44 => 250.0,
+        45 => 333.0,
+        46 => 250.0,
+        47 => 278.0,
+        48..=57 => 500.0,
+        58 => 333.0,
+        59 => 333.0,
+        60 => 570.0,
+        61 => 570.0,
+        62 => 570.0,
+        63 => 500.0,
+        64 => 832.0,
+        65 => 667.0,
+        66 => 667.0,
+        67 => 667.0,
+        68 => 722.0,
+        69 => 667.0,
+        70 => 667.0,
+        71 => 722.0,
+        72 => 778.0,
+        73 => 389.0,
+        74 => 500.0,
+        75 => 667.0,
+        76 => 611.0,
+        77 => 889.0,
+        78 => 722.0,
+        79 => 722.0,
+        80 => 611.0,
+        81 => 722.0,
+        82 => 667.0,
+        83 => 556.0,
+        84 => 611.0,
+        85 => 722.0,
+        86 => 667.0,
+        87 => 889.0,
+        88 => 667.0,
+        89 => 611.0,
+        90 => 611.0,
+        91 => 333.0,
+        92 => 278.0,
+        93 => 333.0,
+        94 => 570.0,
+        95 => 500.0,
+        96 => 333.0,
+        97 => 500.0,
+        98 => 500.0,
+        99 => 444.0,
+        100 => 500.0,
+        101 => 444.0,
+        102 => 333.0,
+        103 => 500.0,
+        104 => 556.0,
+        105 => 278.0,
+        106 => 278.0,
+        107 => 500.0,
+        108 => 278.0,
+        109 => 778.0,
+        110 => 556.0,
+        111 => 500.0,
+        112 => 500.0,
+        113 => 500.0,
+        114 => 389.0,
+        115 => 389.0,
+        116 => 278.0,
+        117 => 556.0,
+        118 => 444.0,
+        119 => 667.0,
+        120 => 500.0,
+        121 => 444.0,
+        122 => 389.0,
+        123 => 348.0,
+        124 => 220.0,
+        125 => 348.0,
+        126 => 570.0,
+        _ => return None,
+    })
 }
 
 /// Largeurs Helvetica (Adobe Core 14 AFM), millièmes d'em, codes ASCII

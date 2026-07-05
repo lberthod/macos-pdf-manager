@@ -1,0 +1,15 @@
+<key>CFBundleDocumentTypes</key>
+<array>
+  <dict>
+    <key>CFBundleTypeName</key>
+    <string>PDF Document</string>
+    <key>CFBundleTypeRole</key>
+    <string>Editor</string>
+    <key>LSItemContentTypes</key>
+    <array>
+      <string>com.adobe.pdf</string>
+    </array>
+    <key>LSHandlerRank</key>
+    <string>Alternate</string>
+  </dict>
+</array>

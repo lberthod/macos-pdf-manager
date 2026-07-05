@@ -1,15 +1,14 @@
-//! Prototype de viewer PDF (egui) — architecture.md §8.1 : "commencer le
-//! prototype en egui pour valider les flux, migrer le chrome vers natif
-//! ensuite". Ce binaire parle à `pdf-app::Session` pour l'état de session
-//! (document ouvert, page courante, rendu) — voir STATUS.md, ce n'est plus
-//! un raccourci direct vers `pdf-core`/`pdf-render`.
+//! Viewer PDF (egui) — architecture.md §8.1 : "commencer le prototype en
+//! egui pour valider les flux, migrer le chrome vers natif ensuite". Ce
+//! binaire parle à `pdf-app::Session` pour l'état de session (document
+//! ouvert, page courante, rendu) — voir STATUS.md, ce n'est plus un
+//! raccourci direct vers `pdf-core`/`pdf-render`.
 //!
 //! Fonctionnalités : ouverture de fichier (dialogue natif via `rfd`),
 //! navigation page suivante/précédente, zoom par boutons, par
 //! molette+Ctrl/pincement trackpad (`egui::InputState::zoom_delta`,
 //! re-rasterisation à chaque cran, pas un agrandissement d'image) **et**
-//! "Ajuster à la largeur" (`fit_to_width`, calcule le zoom depuis la largeur
-//! réellement disponible du panneau), recherche texte
+//! "Ajuster à la largeur"/"Ajuster à la page", recherche texte
 //! (`Session::find_pages_containing`) qui saute d'occurrence en occurrence
 //! page par page **avec surlignage** des résultats sur la page affichée
 //! (`Session::find_matches_on_current_page`), panneau de miniatures
@@ -18,30 +17,46 @@
 //! (`egui::ScrollArea::show_rows`, virtualisé : seules les pages proches de
 //! la zone visible sont rastérisées) qui affiche toutes les pages empilées
 //! verticalement au lieu d'une à la fois, et la **sélection de texte à la
-//! souris** (glisser sur la page en mode page unique, via
-//! `Session::char_index_at_on_current_page`/`selection_on_current_page`)
-//! avec copie dans le presse-papiers (bouton ou ⌘C) et surlignage
-//! `/Highlight` (bouton, réutilise la sélection courante).
+//! souris** (glisser/double-clic/triple-clic sur la page en mode page
+//! unique, via `Session::char_index_at_on_current_page`/
+//! `selection_on_current_page`) avec copie dans le presse-papiers (bouton
+//! ou ⌘C) et surlignage/soulignement/barré `/Highlight`/`/Underline`/
+//! `/StrikeOut` (boutons, réutilisent la sélection courante), ajout de
+//! texte libre et remplacement de texte par superposition (#30/#40, dialogue
+//! modale de saisie), manipulation de pages (insérer/supprimer/pivoter/
+//! réordonner par glisser-déposer/fusionner/extraire, panneau miniatures),
+//! impression (délégation à Aperçu via AppleScript) et export optimisé.
 //!
-//! Raccourcis clavier (`handle_keyboard_shortcuts`) : ⌘F (focus recherche),
-//! ⌘+/⌘-/⌘0 (zoom), flèches gauche/droite et Page Haut/Bas (page
-//! précédente/suivante — désactivés tant qu'un champ de texte a le focus,
-//! voir `egui::Context::wants_keyboard_input`), en plus de ⌘Z/⌘⇧Z
-//! (annuler/rétablir) et ⌘S (enregistrer) câblés via le menu natif (voir
-//! `native_menu.rs`).
+//! **Onglets multi-documents (Sprint 49)** : `ViewerApp` porte `Vec<DocumentTab>`
+//! — chaque onglet a sa propre `Session`, son propre thread de rendu en
+//! arrière-plan (`render_worker`) et tout son état d'affichage (zoom,
+//! sélection, recherche...), complètement indépendant des autres onglets.
+//! `ViewerApp` ne porte que ce qui est réellement global à l'application :
+//! la barre de menus native, le backend GPU partagé, et la liste
+//! d'onglets elle-même. Voir `DocumentTab` pour l'état par document et
+//! `ViewerApp` pour la coordination (barre d'onglets, routage des commandes
+//! du menu natif vers l'onglet actif).
 //!
-//! Non géré (voir STATUS.md) : onglets/multi-documents, sélection de texte
-//! en mode défilement continu (page unique seulement), indicateur de
-//! modifications non sauvegardées. Limitation du défilement continu : la
-//! hauteur de ligne est calculée une fois sur la page 0 (documents à pages
-//! de tailles hétérogènes mal gérés).
+//! Raccourcis clavier (`DocumentTab::handle_keyboard_shortcuts`) : ⌘F (focus
+//! recherche), ⌘G (focus "aller à la page"), ⌘+/⌘-/⌘0 (zoom), flèches
+//! gauche/droite et Page Haut/Bas (page précédente/suivante — désactivés
+//! tant qu'un champ de texte a le focus), en plus de ⌘Z/⌘⇧Z
+//! (annuler/rétablir), ⌘S (enregistrer), ⌘P (imprimer), ⌘T (nouvel onglet)
+//! et ⌘W (fermer l'onglet) câblés via le menu natif (voir `native_menu.rs`).
+//!
+//! Limitations connues : sélection de texte en mode défilement continu
+//! (page unique seulement), indicateur de modifications non sauvegardées,
+//! hauteur de ligne du défilement continu dérivée de la page 0 uniquement
+//! (documents à pages de tailles hétérogènes mal gérés).
 
 mod native_menu;
+mod render_worker;
 
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
 use pdf_app::Session;
-use std::collections::HashMap;
+use render_worker::{RenderKind, RenderWorker};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const ZOOM_MIN: f32 = 0.25;
@@ -50,12 +65,56 @@ const ZOOM_MAX: f32 = 4.0;
 /// focus depuis `⌘F` (`handle_keyboard_shortcuts`) sans dépendre de l'ordre
 /// d'appel des widgets `egui` dans la frame.
 const SEARCH_FIELD_ID: &str = "search_query_field";
+/// Identifiant stable du champ "Aller à la page", pour lui donner le focus
+/// depuis `⌘G` (`handle_keyboard_shortcuts`), symétrique de `SEARCH_FIELD_ID`.
+const GOTO_PAGE_FIELD_ID: &str = "goto_page_field";
 /// Échelle de rendu des miniatures (page 612pt de large -> ~92px).
 const THUMBNAIL_SCALE: f64 = 0.15;
+/// Densité de rendu minimale (pixels bitmap par point PDF), indépendante de
+/// `ctx.pixels_per_point()`. Sur un écran externe non-Retina (souvent 1.0),
+/// se caler uniquement sur la densité de l'écran donne un rendu peu
+/// suréchantillonné (arêtes de glyphes crénelées/floues, visibles surtout
+/// sur les fûts verticaux/horizontaux faute de hinting TrueType, voir
+/// `pdf-render`). Sur-échantillonner à au moins 2x lisse ces arêtes même
+/// quand `pixels_per_point() == 1.0`, au prix d'un peu plus de calcul/mémoire
+/// texture.
+const MIN_RENDER_DENSITY: f32 = 2.0;
+
+/// Densité de rendu effective à utiliser pour rastériser une page/miniature :
+/// au moins `MIN_RENDER_DENSITY`, ou plus si l'écran est un Retina >2x.
+fn render_density(ctx: &egui::Context) -> f32 {
+    ctx.pixels_per_point().max(MIN_RENDER_DENSITY)
+}
 /// Jaune translucide pour le surlignage des résultats de recherche.
 const HIGHLIGHT_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(90, 85, 10, 90);
 /// Bleu translucide pour la sélection de texte à la souris.
 const SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 60, 110, 90);
+/// Contour des annotations existantes (panneau "annotations", Sprint 20).
+const ANNOTATION_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 60, 200);
+/// Taille de police par défaut du texte ajouté/remplacé (Sprint 20) — pas de
+/// réglage utilisateur pour l'instant, comme `pdf-cli add-text`/`replace-text`.
+const DEFAULT_TEXT_FONT_SIZE: f64 = 14.0;
+/// Largeur/hauteur (points page) de la boîte par défaut d'un nouveau texte
+/// libre ajouté au clic (Sprint 20, #30) — l'utilisateur ne redimensionne pas
+/// encore la boîte lui-même, voir la limitation documentée dans STATUS.md.
+const NEW_TEXT_BOX_SIZE: (f64, f64) = (220.0, 24.0);
+
+/// Ce que fait `text_modal` une fois l'utilisateur ayant validé sa saisie
+/// (Sprint 20) — `AddFreeText` pour #30 (ajouter du texte), `ReplaceText`
+/// pour #40 (remplacer un texte existant par superposition, réutilise la
+/// sélection courante).
+enum PendingTextAction {
+    AddFreeText { rect: [f64; 4] },
+    ReplaceText { rect: [f64; 4] },
+}
+
+/// État de la boîte de dialogue modale de saisie de texte (Sprint 20) —
+/// une seule à la fois, partagée entre "ajouter du texte" et "remplacer le
+/// texte sélectionné" (`action` distingue laquelle des deux valider).
+struct TextInputModal {
+    action: PendingTextAction,
+    input: String,
+}
 
 fn main() -> eframe::Result<()> {
     // Backend `wgpu` plutôt que le `glow` par défaut d'eframe : condition
@@ -64,12 +123,18 @@ fn main() -> eframe::Result<()> {
     // `pdf_render_gpu::GpuRenderer::from_shared`) — sans quoi ce backend
     // devrait renégocier son propre device à chaque page (voir la doc de
     // module de `pdf-render-gpu`, le problème que cette intégration résout).
+    // Icône de fenêtre/dock en `cargo run` (hors bundle `.app`, qui utilise
+    // `icons/icon.icns` via `[package.metadata.bundle]`, voir Cargo.toml) :
+    // sans elle, `eframe` affiche l'icône Rust générique par défaut.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../icons/icon_256.png"))
+        .expect("icône embarquée invalide");
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default().with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
-        "PDF Manager (prototype)",
+        "PapyrusPDF",
         options,
         Box::new(|cc| {
             let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
@@ -83,18 +148,40 @@ fn main() -> eframe::Result<()> {
             // silencieusement écraser. `ViewerApp::update` l'installe plutôt
             // à sa toute première frame, garantie de tourner une fois la
             // boucle `winit`/AppKit pleinement démarrée.
-            Ok(Box::new(ViewerApp::new(std::env::args().nth(1), gpu)))
+            Ok(Box::new(ViewerApp::new(
+                std::env::args().nth(1).map(PathBuf::from),
+                gpu,
+            )))
         }),
     )
 }
 
-struct ViewerApp {
+/// Résultat de `DocumentTab::update_content` transmis à `ViewerApp` — pour
+/// l'instant, seule l'ouverture d'un nouveau document (bouton "Ouvrir…" de
+/// la barre d'outils d'un onglet) doit remonter au niveau de l'application
+/// (elle crée un **nouvel onglet**, elle ne remplace jamais le contenu de
+/// l'onglet courant — voir la doc de module).
+#[derive(Default)]
+struct DocumentTabOutcome {
+    open_in_new_tab: Option<PathBuf>,
+}
+
+/// État complet d'un document ouvert dans un onglet (Sprint 49) — tout ce
+/// qui était auparavant un champ direct de `ViewerApp` avant l'introduction
+/// des onglets multi-documents, à l'exception du backend GPU partagé (cloné
+/// une fois à la création, voir `gpu`) et de la barre de menus native (une
+/// seule pour toute l'application, portée par `ViewerApp`).
+struct DocumentTab {
     session: Option<Session>,
     zoom: f32,
     /// Mis à `true` par le bouton "Ajuster à la largeur" ; consommé au
     /// prochain rendu du `CentralPanel` (mode page unique), seul endroit où
     /// la largeur disponible réelle (`ui.available_width()`) est connue.
     fit_width_requested: bool,
+    /// Comme `fit_width_requested`, pour le bouton "↕ Ajuster à la page"
+    /// (Sprint 21, #10) — consommé au prochain rendu du `CentralPanel`, où
+    /// `ui.available_size()` (largeur **et** hauteur) est connue.
+    fit_page_requested: bool,
     texture: Option<egui::TextureHandle>,
     /// (page affichée, zoom affiché, densité de pixels affichée) par la
     /// texture courante — sert à détecter qu'un nouveau rendu est
@@ -111,6 +198,10 @@ struct ViewerApp {
     /// interprétée comme des points, deux fois trop grande sur un écran 2x.
     texture_logical_size: Option<egui::Vec2>,
     error: Option<String>,
+    /// Contenu du champ "Aller à la page" (Sprint 18) — texte libre plutôt
+    /// que déjà parsé, pour permettre à l'utilisateur de taper sans que le
+    /// champ ne se corrige/reformatte sous ses yeux à chaque frappe.
+    goto_page_input: String,
     search_query: String,
     /// Index des pages (0-based) contenant `search_query`, dans l'ordre du
     /// document ; `None` tant qu'aucune recherche n'a été lancée.
@@ -127,6 +218,12 @@ struct ViewerApp {
     highlight_rects: Vec<pdf_app::MatchRect>,
     show_thumbnails: bool,
     thumbnails: HashMap<usize, egui::TextureHandle>,
+    /// Pages cochées dans le panneau de miniatures (Sprint 19, manipulation
+    /// de pages) — sert uniquement à "✂ Extraire la sélection…" ; vidé après
+    /// toute édition (voir `invalidate_after_edit`) puisqu'une insertion,
+    /// suppression ou déplacement de page rend les indices précédents
+    /// périmés.
+    thumbnail_selection: HashSet<usize>,
     show_outline: bool,
     continuous_scroll: bool,
     /// Textures du mode défilement continu, indépendantes de `texture`
@@ -150,31 +247,80 @@ struct ViewerApp {
     selection_cursor: Option<usize>,
     selection_rects: Vec<pdf_app::MatchRect>,
     selection_text: String,
+    /// Armé par le bouton "📝 Ajouter texte" (Sprint 20, #30) : le prochain
+    /// simple clic (pas glissement) sur la page ouvre `text_modal` pour
+    /// saisir le texte à ajouter à cet endroit, puis se désarme.
+    add_text_mode: bool,
+    /// Boîte de dialogue de saisie de texte actuellement ouverte (#30/#40),
+    /// `None` si aucune — voir `TextInputModal`.
+    text_modal: Option<TextInputModal>,
+    /// Annotations de la page courante (Sprint 20, #32) — recalculées à
+    /// chaque changement de page/édition (voir `ensure_annotations`),
+    /// affichées en contour cliquable pour la suppression.
+    annotations: Vec<pdf_app::AnnotationInfo>,
+    /// (page affichée) pour laquelle `annotations` est à jour — évite de
+    /// rappeler `Session::annotations_on_current_page` à chaque frame.
+    annotations_state: Option<usize>,
+    /// Annotation actuellement sélectionnée dans le contour cliquable
+    /// (#32) — un bouton "🗑 Supprimer l'annotation" apparaît tant qu'une
+    /// sélection existe.
+    selected_annotation: Option<usize>,
+    /// Dernier décalage de défilement connu de la `ScrollArea` de la page
+    /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
+    /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
+    /// prochain pincement pour calculer le nouveau décalage sans dépendre
+    /// d'un accès direct à l'état interne de `ScrollArea`.
+    last_scroll_offset: egui::Vec2,
+    /// Rectangle écran de la zone de défilement à la frame précédente — sert
+    /// à convertir la position du curseur en coordonnées locales à la zone,
+    /// avec un décalage d'une frame (imperceptible, la taille de la fenêtre
+    /// ne change pas à chaque frame).
+    last_scroll_viewport: Option<egui::Rect>,
+    /// Décalage à appliquer à la `ScrollArea` à la prochaine frame (calculé
+    /// par un pincement, consommé par `ScrollArea::scroll_offset` avant le
+    /// prochain rendu).
+    pending_scroll_offset: Option<egui::Vec2>,
+    /// Compteur d'impressions demandées dans cet onglet (Sprint 21, #48) —
+    /// sert uniquement à donner un nom de fichier temporaire unique par
+    /// impression, voir `print_document`.
+    print_requests: u64,
+    /// Thread de rendu en arrière-plan (Sprint 21, #20) — miniatures et
+    /// pages du défilement continu, voir `render_worker`. Un par onglet :
+    /// chaque `DocumentTab` a son propre document, indépendant des autres.
+    render_worker: RenderWorker,
+    /// Incrémenté à l'ouverture d'un fichier et après chaque édition (voir
+    /// `refresh_render_worker_document`) : les résultats du thread
+    /// d'arrière-plan portant une autre génération sont ignorés
+    /// (`drain_background_renders`), et les requêtes déjà envoyées pour
+    /// l'ancienne génération n'écrasent jamais un résultat plus récent.
+    render_generation: u64,
+    /// `(kind, page_index, scale_key)` déjà envoyés à `render_worker` pour
+    /// `render_generation` — évite de renvoyer la même requête à chaque
+    /// frame tant que le résultat n'est pas encore arrivé. Vidé à chaque
+    /// nouvelle génération (voir `refresh_render_worker_document`).
+    background_requested: HashSet<(RenderKind, usize, u32)>,
     /// `Device`/`Queue` partagés avec le renderer `wgpu` d'eframe (voir
     /// `main`) — `None` si le backend `glow` a été sélectionné ou si aucun
-    /// adaptateur `wgpu` n'était disponible au démarrage. Cloné dans chaque
-    /// `Session` ouverte (voir `open_path`) : `GpuRenderer` ne fait que
-    /// partager des `Arc`, un clone est donc bon marché.
+    /// adaptateur `wgpu` n'était disponible au démarrage. Cloné depuis
+    /// `ViewerApp::gpu` à la création de l'onglet (voir `ViewerApp::open_new_tab`) :
+    /// `GpuRenderer` ne fait que partager des `Arc`, un clone est donc bon
+    /// marché.
     gpu: Option<pdf_render_gpu::GpuRenderer>,
-    /// Barre de menus native macOS (Sprint 11-12, sprint.md) — `None` sur
-    /// les plateformes non macOS ou si l'installation a échoué, auquel cas
-    /// seuls la barre d'outils `egui` et le glisser-déposer restent
-    /// utilisables pour ouvrir un fichier.
-    native_menu: Option<NativeMenu>,
 }
 
-impl ViewerApp {
-    fn new(initial_path: Option<String>, gpu: Option<pdf_render_gpu::GpuRenderer>) -> Self {
-        let mut app = Self {
+impl DocumentTab {
+    fn new(initial_path: Option<PathBuf>, gpu: Option<pdf_render_gpu::GpuRenderer>) -> Self {
+        let mut tab = Self {
             session: None,
             gpu,
-            native_menu: None,
             zoom: 1.0,
             fit_width_requested: false,
+            fit_page_requested: false,
             texture: None,
             texture_state: None,
             texture_logical_size: None,
             error: None,
+            goto_page_input: String::new(),
             search_query: String::new(),
             search_results: None,
             search_cursor: 0,
@@ -183,6 +329,7 @@ impl ViewerApp {
             highlight_rects: Vec::new(),
             show_thumbnails: false,
             thumbnails: HashMap::new(),
+            thumbnail_selection: HashSet::new(),
             show_outline: false,
             continuous_scroll: false,
             page_textures: HashMap::new(),
@@ -193,11 +340,38 @@ impl ViewerApp {
             selection_cursor: None,
             selection_rects: Vec::new(),
             selection_text: String::new(),
+            add_text_mode: false,
+            text_modal: None,
+            annotations: Vec::new(),
+            annotations_state: None,
+            selected_annotation: None,
+            last_scroll_offset: egui::Vec2::ZERO,
+            last_scroll_viewport: None,
+            pending_scroll_offset: None,
+            print_requests: 0,
+            render_worker: RenderWorker::spawn(),
+            render_generation: 0,
+            background_requested: HashSet::new(),
         };
         if let Some(p) = initial_path {
-            app.open_path(PathBuf::from(p));
+            tab.open_path(p);
         }
-        app
+        tab
+    }
+
+    /// Titre affiché dans la barre d'onglets (`ViewerApp::update`) — le nom
+    /// de fichier du document ouvert, ou un intitulé générique pour un
+    /// onglet encore vide (juste après "Fermer l'onglet" sur le dernier
+    /// onglet restant, voir `ViewerApp::close_tab`).
+    fn title(&self) -> String {
+        match &self.session {
+            Some(session) => session
+                .path()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Document".to_string()),
+            None => "Nouvel onglet".to_string(),
+        }
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -211,6 +385,7 @@ impl ViewerApp {
         self.highlight_state = None;
         self.highlight_rects.clear();
         self.thumbnails.clear();
+        self.thumbnail_selection.clear();
         self.page_textures.clear();
         self.page_textures_zoom_key = None;
         self.scroll_to_page = None;
@@ -219,6 +394,14 @@ impl ViewerApp {
         self.selection_cursor = None;
         self.selection_rects.clear();
         self.selection_text.clear();
+        self.add_text_mode = false;
+        self.text_modal = None;
+        self.annotations.clear();
+        self.annotations_state = None;
+        self.selected_annotation = None;
+        self.last_scroll_offset = egui::Vec2::ZERO;
+        self.last_scroll_viewport = None;
+        self.pending_scroll_offset = None;
 
         match Session::open(path) {
             Ok(mut session) => {
@@ -226,23 +409,12 @@ impl ViewerApp {
                     session.set_gpu_renderer(gpu.clone());
                 }
                 self.session = Some(session);
+                self.refresh_render_worker_document();
             }
             Err(e) => {
                 self.error = Some(format!("Impossible d'ouvrir le fichier : {e}"));
                 self.session = None;
             }
-        }
-    }
-
-    /// Ouvre le sélecteur de fichier natif (`rfd`, `NSOpenPanel` sous le
-    /// capot) et charge le fichier choisi — partagé entre le bouton de la
-    /// barre d'outils et le menu natif "Fichier > Ouvrir…".
-    fn open_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .pick_file()
-        {
-            self.open_path(path);
         }
     }
 
@@ -272,6 +444,76 @@ impl ViewerApp {
         }
     }
 
+    /// "🗜 Optimiser et enregistrer sous…" (Sprint 22, #45 — jusqu'ici
+    /// seulement accessible via `pdf-cli optimize`) : reconstruit le
+    /// document en ne gardant que les objets atteignables
+    /// (`Session::export_optimized`, garbage collector par reconstruction —
+    /// nettoie en particulier les objets orphelins laissés par `undo`) et
+    /// écrit le résultat vers un nouvel emplacement choisi via `NSSavePanel`.
+    /// N'écrase jamais le fichier ouvert : c'est délibérément un "enregistrer
+    /// sous", pas un "enregistrer" (l'optimisation réécrit tout le fichier,
+    /// contrairement à la sauvegarde incrémentale habituelle).
+    fn export_optimized_dialog(&mut self) {
+        let Some(session) = &self.session else {
+            self.error = Some("Aucun document ouvert à optimiser.".to_string());
+            return;
+        };
+        let bytes = match session.export_optimized() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.error = Some(format!("Échec de l'optimisation : {e}"));
+                return;
+            }
+        };
+        let default_name = session
+            .path()
+            .file_stem()
+            .map(|n| format!("{}-optimise.pdf", n.to_string_lossy()))
+            .unwrap_or_else(|| "document-optimise.pdf".to_string());
+        if let Some(dest) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&dest, bytes) {
+                self.error = Some(format!("Échec de l'export optimisé : {e}"));
+            }
+        }
+    }
+
+    /// Exporte le texte de tout le document vers un fichier `.txt` choisi via
+    /// `NSSavePanel` (`rfd`) — Sprint 18. Réutilise `Session::extract_all_text`
+    /// (une page par section séparée par un saut de page), pas de nouvelle
+    /// extraction : le texte de chaque page est déjà mis en cache par
+    /// `pdf-app` dès qu'il a été vu une première fois (recherche, affichage).
+    fn export_text_dialog(&mut self) {
+        let Some(session) = &self.session else {
+            self.error = Some("Aucun document ouvert à exporter.".to_string());
+            return;
+        };
+        let text = match session.extract_all_text() {
+            Ok(text) => text,
+            Err(e) => {
+                self.error = Some(format!("Échec de l'extraction du texte : {e}"));
+                return;
+            }
+        };
+        let default_name = session
+            .path()
+            .file_stem()
+            .map(|n| format!("{}.txt", n.to_string_lossy()))
+            .unwrap_or_else(|| "document.txt".to_string());
+        if let Some(dest) = rfd::FileDialog::new()
+            .add_filter("Texte", &["txt"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&dest, text) {
+                self.error = Some(format!("Échec de l'export du texte : {e}"));
+            }
+        }
+    }
+
     /// "Fichier > Enregistrer" (`⌘S`, Sprints 13-17) : écrit les
     /// modifications en attente (annotations, formulaires, pages...) dans le
     /// fichier réellement ouvert, par sauvegarde incrémentale
@@ -283,6 +525,62 @@ impl ViewerApp {
         if let Err(e) = session.save_edits_in_place() {
             self.error = Some(format!("Échec de l'enregistrement : {e}"));
         }
+    }
+
+    /// "Fichier > Imprimer…" (`⌘P`, Sprint 21, #48) : écrit le document
+    /// courant (éditions en attente incluses, `Session::current_bytes`) dans
+    /// un fichier temporaire, puis délègue l'impression à Aperçu via
+    /// AppleScript (`osascript`) — donne gratuitement l'aperçu et la
+    /// sélection de pages du système, sans construire un pipeline
+    /// `NSPrintOperation` maison (cette app n'a pas de vraie `NSView` de
+    /// contenu, tout passe par une texture `egui`/`wgpu`). Le fichier
+    /// temporaire n'est jamais nettoyé explicitement : `TMPDIR` est vidé par
+    /// le système, et Aperçu garde le descripteur ouvert le temps de
+    /// l'utiliser.
+    fn print_document(&mut self) {
+        let Some(session) = &self.session else {
+            self.error = Some("Aucun document ouvert à imprimer.".to_string());
+            return;
+        };
+        let bytes = match session.current_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.error = Some(format!("Impossible de préparer l'impression : {e}"));
+                return;
+            }
+        };
+        let temp_path = std::env::temp_dir().join(format!(
+            "papyruspdf_print_{}_{}.pdf",
+            std::process::id(),
+            self.print_request_count()
+        ));
+        if let Err(e) = std::fs::write(&temp_path, bytes) {
+            self.error = Some(format!("Impossible de préparer l'impression : {e}"));
+            return;
+        }
+        let path_str = temp_path.display().to_string();
+        let script = format!(
+            "tell application \"Preview\"\n\
+             activate\n\
+             open POSIX file \"{path_str}\"\n\
+             print (POSIX file \"{path_str}\") with properties {{print dialog:true}}\n\
+             end tell"
+        );
+        if let Err(e) = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+        {
+            self.error = Some(format!("Impossible de lancer l'impression : {e}"));
+        }
+    }
+
+    /// Suffixe unique pour le nom du fichier temporaire d'impression — sinon
+    /// deux impressions successives dans le même onglet réutiliseraient le
+    /// même chemin, d'où un fichier périmé si Aperçu l'a encore ouvert.
+    fn print_request_count(&mut self) -> u64 {
+        self.print_requests += 1;
+        self.print_requests
     }
 
     /// Défait la dernière opération d'édition et invalide tout ce qui
@@ -316,8 +614,54 @@ impl ViewerApp {
     /// seule page (voir la limitation connue : pas de sélection en mode
     /// défilement continu).
     fn highlight_selection(&mut self) {
-        if self.selection_rects.is_empty() {
+        let Some(rect) = self.selection_bbox() else {
             return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.add_highlight_on_current_page(rect, (1.0, 1.0, 0.0)) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de surligner : {e}")),
+        }
+    }
+
+    /// Souligne la sélection de texte courante (Sprint 20, #26).
+    fn underline_selection(&mut self) {
+        let Some(rect) = self.selection_bbox() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.add_underline_on_current_page(rect, (1.0, 0.0, 0.0)) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de souligner : {e}")),
+        }
+    }
+
+    /// Barre la sélection de texte courante (Sprint 20, #26).
+    fn strikeout_selection(&mut self) {
+        let Some(rect) = self.selection_bbox() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.add_strikeout_on_current_page(rect, (1.0, 0.0, 0.0)) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de barrer : {e}")),
+        }
+    }
+
+    /// Boîte englobante (espace page PDF) de `self.selection_rects` — partagé
+    /// par le surlignage, le soulignement et le barré, qui n'ont besoin que
+    /// d'un seul rectangle couvrant la sélection plutôt que d'un par ligne
+    /// (voir la limitation connue : pas de sélection en mode défilement
+    /// continu, donc toujours une seule page).
+    fn selection_bbox(&self) -> Option<[f64; 4]> {
+        if self.selection_rects.is_empty() {
+            return None;
         }
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for rect in &self.selection_rects {
@@ -326,12 +670,198 @@ impl ViewerApp {
             x1 = x1.max(rect.x1);
             y1 = y1.max(rect.y1);
         }
+        Some([x0, y0, x1, y1])
+    }
+
+    /// Ouvre la boîte de dialogue de saisie pour remplacer (superposition,
+    /// #40) la sélection de texte courante par un nouveau texte — préremplit
+    /// le champ avec le texte actuellement sélectionné, à éditer sur place.
+    fn open_replace_text_modal(&mut self) {
+        let Some(rect) = self.selection_bbox() else {
+            return;
+        };
+        self.text_modal = Some(TextInputModal {
+            action: PendingTextAction::ReplaceText { rect },
+            input: self.selection_text.clone(),
+        });
+    }
+
+    /// Confirme `self.text_modal` (bouton "OK"/`Enter`) : ajoute le texte
+    /// libre (#30) ou remplace le texte de la sélection (#40) selon
+    /// `PendingTextAction`, puis ferme la boîte de dialogue.
+    fn confirm_text_modal(&mut self) {
+        let Some(modal) = self.text_modal.take() else {
+            return;
+        };
+        if modal.input.trim().is_empty() {
+            return;
+        }
         let Some(session) = &mut self.session else {
             return;
         };
-        match session.add_highlight_on_current_page([x0, y0, x1, y1], (1.0, 1.0, 0.0)) {
+        let result = match modal.action {
+            PendingTextAction::AddFreeText { rect } => session.add_free_text_on_current_page(
+                rect,
+                &modal.input,
+                DEFAULT_TEXT_FONT_SIZE,
+                (0.0, 0.0, 0.0),
+            ),
+            PendingTextAction::ReplaceText { rect } => session.replace_text_on_current_page(
+                rect,
+                &modal.input,
+                DEFAULT_TEXT_FONT_SIZE,
+                (0.0, 0.0, 0.0),
+                (1.0, 1.0, 1.0),
+            ),
+        };
+        match result {
             Ok(()) => self.invalidate_after_edit(),
-            Err(e) => self.error = Some(format!("Impossible de surligner : {e}")),
+            Err(e) => self.error = Some(format!("Impossible d'appliquer le texte : {e}")),
+        }
+    }
+
+    /// Recalcule `self.annotations` si la page affichée a changé depuis le
+    /// dernier appel (Sprint 20, #32) — même schéma que `ensure_highlights`.
+    fn ensure_annotations(&mut self) {
+        let Some(session) = &self.session else {
+            self.annotations.clear();
+            return;
+        };
+        let page_index = session.page_index();
+        if self.annotations_state == Some(page_index) {
+            return;
+        }
+        self.annotations = session.annotations_on_current_page().unwrap_or_default();
+        self.annotations_state = Some(page_index);
+    }
+
+    /// Supprime l'annotation actuellement sélectionnée (`self.selected_annotation`,
+    /// bouton "🗑 Supprimer l'annotation", #32).
+    fn delete_selected_annotation(&mut self) {
+        let Some(index) = self.selected_annotation.take() else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.remove_annotation_on_current_page(index) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de supprimer l'annotation : {e}")),
+        }
+    }
+
+    /// Insère une page blanche à `at_index` (bouton "＋ Page", panneau
+    /// miniatures, Sprint 19).
+    fn insert_blank_page(&mut self, at_index: usize) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.insert_blank_page_at(at_index) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible d'insérer la page : {e}")),
+        }
+    }
+
+    /// Ouvre un sélecteur de fichier JPEG et l'insère comme nouvelle page à
+    /// `at_index` (bouton "🖼 Image…", Sprint 19 — voir la limitation connue
+    /// de `pdf_edit::EditSession::insert_image_page` : JPEG seulement).
+    fn insert_image_page_dialog(&mut self, at_index: usize) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .pick_file()
+        else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.error = Some(format!("Impossible de lire l'image : {e}"));
+                return;
+            }
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.insert_image_page_at(at_index, &bytes) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible d'insérer l'image : {e}")),
+        }
+    }
+
+    /// Supprime la page `index` (bouton 🗑 par miniature, Sprint 19).
+    fn delete_page(&mut self, index: usize) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.delete_page_at(index) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de supprimer la page : {e}")),
+        }
+    }
+
+    /// Pivote la page `index` de 90° (bouton ↻ par miniature, Sprint 19) —
+    /// rotation persistée (`/Rotate`), distincte d'une rotation de vue.
+    fn rotate_page(&mut self, index: usize) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.rotate_page_at(index, 90) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de pivoter la page : {e}")),
+        }
+    }
+
+    /// Déplace la page `from` vers la position `to` (glisser-déposer des
+    /// miniatures, Sprint 19).
+    fn move_page(&mut self, from: usize, to: usize) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.move_page(from, to) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de déplacer la page : {e}")),
+        }
+    }
+
+    /// Ouvre un sélecteur de fichier PDF et le fusionne à la fin du document
+    /// courant (bouton "📎 PDF…", Sprint 19).
+    fn merge_pdf_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .pick_file()
+        else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.merge_document_from_path(&path) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de fusionner le PDF : {e}")),
+        }
+    }
+
+    /// Extrait les pages cochées (`self.thumbnail_selection`) vers un
+    /// nouveau fichier autonome choisi via `NSSavePanel` (bouton
+    /// "✂ Extraire…", Sprint 19) — ne modifie pas la session en cours.
+    fn extract_selection_dialog(&mut self) {
+        if self.thumbnail_selection.is_empty() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let mut indices: Vec<usize> = self.thumbnail_selection.iter().copied().collect();
+        indices.sort_unstable();
+        let Some(dest) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name("extrait.pdf")
+            .save_file()
+        else {
+            return;
+        };
+        if let Err(e) = session.extract_pages_to_file(&indices, &dest) {
+            self.error = Some(format!("Impossible d'extraire les pages : {e}"));
         }
     }
 
@@ -345,12 +875,70 @@ impl ViewerApp {
         self.texture_state = None;
         self.texture_logical_size = None;
         self.thumbnails.clear();
+        // Une insertion/suppression/déplacement de page rend les indices
+        // précédemment cochés périmés (Sprint 19) — plus sûr de tout vider
+        // que de tenter de les faire suivre.
+        self.thumbnail_selection.clear();
         self.page_textures.clear();
         self.highlight_state = None;
         self.selection_anchor = None;
         self.selection_cursor = None;
         self.selection_rects.clear();
         self.selection_text.clear();
+        // Les indices d'annotation (`self.annotations`, indexés dans
+        // `/Annots`) peuvent changer après n'importe quelle édition — plus
+        // sûr de forcer un recalcul (`ensure_annotations`) que de les faire
+        // suivre.
+        self.annotations_state = None;
+        self.selected_annotation = None;
+        self.refresh_render_worker_document();
+    }
+
+    /// Envoie les octets à jour du document (éditions en attente incluses)
+    /// au thread de rendu en arrière-plan (Sprint 21, #20), avec une
+    /// nouvelle génération — à appeler à l'ouverture d'un fichier et après
+    /// toute édition, jamais pendant une simple navigation/zoom (qui ne
+    /// change pas le contenu du document).
+    fn refresh_render_worker_document(&mut self) {
+        self.render_generation += 1;
+        self.background_requested.clear();
+        if let Some(session) = &self.session {
+            if let Ok(bytes) = session.current_bytes() {
+                self.render_worker
+                    .set_document(bytes, self.render_generation);
+            }
+        }
+    }
+
+    /// Récupère les pages rastérisées en arrière-plan depuis la dernière
+    /// frame (Sprint 21, #20) et les installe dans le cache correspondant
+    /// (`thumbnails` ou `page_textures` selon `RenderKind`) — à appeler une
+    /// fois par frame, avant de dessiner miniatures/défilement continu.
+    /// Ignore silencieusement tout résultat d'une génération périmée (déjà
+    /// remplacée par une édition depuis l'envoi de la requête).
+    fn drain_background_renders(&mut self, ctx: &egui::Context) {
+        for page in self.render_worker.drain_results() {
+            if page.generation != self.render_generation {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [page.width as usize, page.height as usize],
+                &page.rgba,
+            );
+            let texture = ctx.load_texture(
+                format!("bg-{:?}-{}-{}", page.kind, page.page_index, page.scale_key),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            match page.kind {
+                RenderKind::Thumbnail => {
+                    self.thumbnails.insert(page.page_index, texture);
+                }
+                RenderKind::ContinuousPage => {
+                    self.page_textures.insert(page.page_index, texture);
+                }
+            }
+        }
     }
 
     /// Lance une recherche plein document et saute directement à la première
@@ -372,6 +960,24 @@ impl ViewerApp {
             }
             Err(e) => self.error = Some(format!("Erreur de recherche : {e}")),
         }
+    }
+
+    /// Interprète `self.goto_page_input` comme un numéro de page 1-based et
+    /// y saute (`Session::goto_page` est déjà bornée : une valeur hors
+    /// document est simplement ignorée). Un contenu non numérique est
+    /// silencieusement ignoré plutôt que de faire planter la saisie.
+    fn goto_page_from_input(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Ok(page_number) = self.goto_page_input.trim().parse::<usize>() else {
+            return;
+        };
+        let Some(index) = page_number.checked_sub(1) else {
+            return;
+        };
+        session.goto_page(index);
+        self.scroll_to_page = Some(session.page_index());
     }
 
     fn set_zoom(&mut self, zoom: f32) {
@@ -399,6 +1005,27 @@ impl ViewerApp {
         self.set_zoom((available_width - 4.0) / page_width as f32);
     }
 
+    /// "↕ Ajuster à la page" (Sprint 21, #10) : comme `fit_to_width`, mais
+    /// prend le zoom le plus petit des deux dimensions pour que la page
+    /// entière (largeur **et** hauteur) tienne dans la zone disponible,
+    /// plutôt que seulement sa largeur.
+    fn fit_to_page(&mut self, available: egui::Vec2) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Ok(media_box) = session.current_page_media_box() else {
+            return;
+        };
+        let page_width = media_box[2] - media_box[0];
+        let page_height = media_box[3] - media_box[1];
+        if page_width <= 0.0 || page_height <= 0.0 {
+            return;
+        }
+        let zoom_for_width = (available.x - 4.0) / page_width as f32;
+        let zoom_for_height = (available.y - 4.0) / page_height as f32;
+        self.set_zoom(zoom_for_width.min(zoom_for_height));
+    }
+
     /// Raccourcis clavier globaux : `⌘F` donne le focus au champ de
     /// recherche, `⌘+`/`⌘-`/`⌘0` zooment/réinitialisent, flèches
     /// gauche/droite et Page Haut/Bas changent de page — ces derniers
@@ -409,9 +1036,10 @@ impl ViewerApp {
             return;
         }
 
-        let (focus_search, zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
+        let (focus_search, focus_goto_page, zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(egui::Key::F),
+                i.modifiers.command && i.key_pressed(egui::Key::G),
                 i.modifiers.command
                     && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)),
                 i.modifiers.command && i.key_pressed(egui::Key::Minus),
@@ -421,6 +1049,11 @@ impl ViewerApp {
         if focus_search {
             ctx.memory_mut(|m| {
                 m.request_focus(egui::Id::new(SEARCH_FIELD_ID));
+            });
+        }
+        if focus_goto_page {
+            ctx.memory_mut(|m| {
+                m.request_focus(egui::Id::new(GOTO_PAGE_FIELD_ID));
             });
         }
         if zoom_in {
@@ -489,12 +1122,11 @@ impl ViewerApp {
         // cause du bruit en virgule flottante des sliders.
         let zoom_key = (self.zoom * 1000.0).round() as u32;
         let page_index = session.page_index();
-        // Densité de pixels de l'écran courant (2.0 sur Retina, 1.0 sinon) :
-        // sans elle, la page serait rastérisée à 1 pixel bitmap par point
-        // `egui` puis agrandie par le sampler de texture pour remplir les 2
-        // pixels physiques par point d'un écran Retina — d'où un rendu
-        // flou, en particulier visible sur du texte en gras à petite taille.
-        let pixel_ratio = ctx.pixels_per_point();
+        // Densité de rendu (au moins `MIN_RENDER_DENSITY`, voir sa doc) :
+        // sans elle, sur un écran non-Retina la page serait rastérisée à
+        // 1 pixel bitmap par point, d'où un rendu flou/crénelé — en
+        // particulier visible sur du texte en gras à petite taille.
+        let pixel_ratio = render_density(ctx);
         let pixel_ratio_key = (pixel_ratio * 1000.0).round() as u32;
         if self.texture_state == Some((page_index, zoom_key, pixel_ratio_key)) {
             return; // déjà à jour.
@@ -557,66 +1189,254 @@ impl ViewerApp {
     /// taille d'affichage logique est renvoyée pour que l'appelant
     /// (`show_thumbnail_panel`) l'utilise avec `fit_to_exact_size`.
     fn ensure_thumbnail(&mut self, index: usize, ctx: &egui::Context) -> Option<egui::Vec2> {
-        let pixel_ratio = ctx.pixels_per_point();
+        let pixel_ratio = render_density(ctx);
         if let Some(texture) = self.thumbnails.get(&index) {
             let [w, h] = texture.size();
             return Some(egui::vec2(w as f32 / pixel_ratio, h as f32 / pixel_ratio));
         }
-        let session = self.session.as_ref()?;
-        let rendered = session
-            .render_page(index, THUMBNAIL_SCALE * pixel_ratio as f64)
-            .ok()?;
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [rendered.width as usize, rendered.height as usize],
-            &rendered.rgba,
-        );
-        let logical_size = egui::vec2(
-            rendered.width as f32 / pixel_ratio,
-            rendered.height as f32 / pixel_ratio,
-        );
-        let texture = ctx.load_texture(
-            format!("thumb-{index}"),
-            image,
-            egui::TextureOptions::LINEAR,
-        );
-        self.thumbnails.insert(index, texture);
-        Some(logical_size)
+        self.session.as_ref()?;
+        // Pas encore en cache : demande le rendu au thread d'arrière-plan
+        // (Sprint 21, #20) plutôt que de bloquer cette frame sur
+        // `Session::render_page` — le résultat sera livré par
+        // `drain_background_renders` à une frame suivante. `None` ici
+        // signifie juste "pas encore prêt", pas une erreur.
+        let scale = THUMBNAIL_SCALE * pixel_ratio as f64;
+        let scale_key = (scale * 1000.0).round() as u32;
+        let key = (RenderKind::Thumbnail, index, scale_key);
+        if self.background_requested.insert(key) {
+            self.render_worker.request_render(
+                RenderKind::Thumbnail,
+                index,
+                scale,
+                scale_key,
+                self.render_generation,
+            );
+            ctx.request_repaint();
+        }
+        None
     }
 
     /// Dessine le panneau de miniatures et retourne l'index de page cliqué,
     /// le cas échéant (la navigation elle-même est faite par l'appelant pour
     /// éviter d'emprunter `self.session` en même temps que `self.thumbnails`).
+    ///
+    /// Sprint 19 (manipulation de pages) : chaque miniature est une source de
+    /// glisser-déposer (`egui::Ui::dnd_drag_source`/`dnd_drop_zone`, API
+    /// intégrée depuis `egui` 0.24) pour réordonner les pages, porte une case
+    /// à cocher pour la sélection multiple (utilisée par "✂ Extraire…") et
+    /// deux boutons 🗑/↻ (supprimer/pivoter). La barre au-dessus du panneau
+    /// donne accès à l'insertion (page vierge, image, autre PDF).
     fn show_thumbnail_panel(&mut self, ctx: &egui::Context) -> Option<usize> {
         let page_count = self.session.as_ref()?.page_count();
         let current = self.session.as_ref()?.page_index();
         let mut clicked = None;
+        let mut reorder: Option<(usize, usize)> = None;
+        let mut delete_requested: Option<usize> = None;
+        let mut rotate_requested: Option<usize> = None;
 
         egui::SidePanel::left("thumbnails")
             .resizable(true)
-            .default_width(140.0)
+            .default_width(170.0)
             .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("＋ Page")
+                        .on_hover_text("Insérer une page vierge après la page courante")
+                        .clicked()
+                    {
+                        self.insert_blank_page(current + 1);
+                    }
+                    if ui
+                        .button("🖼 Image…")
+                        .on_hover_text("Insérer une image JPEG comme nouvelle page")
+                        .clicked()
+                    {
+                        self.insert_image_page_dialog(current + 1);
+                    }
+                    if ui
+                        .button("📎 PDF…")
+                        .on_hover_text("Fusionner un autre PDF à la fin du document")
+                        .clicked()
+                    {
+                        self.merge_pdf_dialog();
+                    }
+                });
+                if !self.thumbnail_selection.is_empty()
+                    && ui
+                        .button(format!("✂ Extraire ({})…", self.thumbnail_selection.len()))
+                        .clicked()
+                {
+                    self.extract_selection_dialog();
+                }
+                ui.separator();
+
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for index in 0..page_count {
                         let Some(logical_size) = self.ensure_thumbnail(index, ctx) else {
                             continue;
                         };
-                        let Some(texture) = self.thumbnails.get(&index) else {
+                        let Some(texture) = self.thumbnails.get(&index).cloned() else {
                             continue;
                         };
-                        ui.vertical_centered(|ui| {
-                            let image = egui::Image::new(texture).fit_to_exact_size(logical_size);
-                            let response =
-                                ui.add(egui::ImageButton::new(image).selected(index == current));
-                            if response.clicked() {
-                                clicked = Some(index);
-                            }
-                            ui.label(format!("{}", index + 1));
-                        });
+                        let mut selected = self.thumbnail_selection.contains(&index);
+
+                        let frame = egui::Frame::default().inner_margin(4.0);
+                        let (_drop_area, dragged_from) =
+                            ui.dnd_drop_zone::<usize, _>(frame, |ui| {
+                                ui.dnd_drag_source(
+                                    egui::Id::new("thumb_drag").with(index),
+                                    index,
+                                    |ui| {
+                                        ui.vertical_centered(|ui| {
+                                            if ui.checkbox(&mut selected, "").changed() {
+                                                if selected {
+                                                    self.thumbnail_selection.insert(index);
+                                                } else {
+                                                    self.thumbnail_selection.remove(&index);
+                                                }
+                                            }
+                                            let image = egui::Image::new(&texture)
+                                                .fit_to_exact_size(logical_size);
+                                            let response = ui.add(
+                                                egui::ImageButton::new(image)
+                                                    .selected(index == current),
+                                            );
+                                            if response.clicked() {
+                                                clicked = Some(index);
+                                            }
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("{}", index + 1));
+                                                if ui
+                                                    .small_button("🗑")
+                                                    .on_hover_text("Supprimer cette page")
+                                                    .clicked()
+                                                {
+                                                    delete_requested = Some(index);
+                                                }
+                                                if ui
+                                                    .small_button("↻")
+                                                    .on_hover_text("Pivoter de 90°")
+                                                    .clicked()
+                                                {
+                                                    rotate_requested = Some(index);
+                                                }
+                                            });
+                                        });
+                                    },
+                                );
+                            });
+                        if let Some(&from) = dragged_from.as_deref() {
+                            reorder = Some((from, index));
+                        }
                     }
                 });
             });
 
+        if let Some((from, to)) = reorder {
+            if from != to {
+                self.move_page(from, to);
+            }
+        }
+        if let Some(index) = delete_requested {
+            self.delete_page(index);
+        }
+        if let Some(index) = rotate_requested {
+            self.rotate_page(index);
+        }
+
         clicked
+    }
+
+    /// Consomme le prochain simple clic sur la page pendant que
+    /// `self.add_text_mode` est armé (#30) : ouvre `text_modal` pour saisir
+    /// le texte à ajouter, positionné à l'endroit cliqué (boîte de taille
+    /// fixe `NEW_TEXT_BOX_SIZE`, l'utilisateur ne la redimensionne pas
+    /// encore), puis désarme le mode.
+    fn handle_add_text_click(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) {
+        if !response.clicked() {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
+        let rect = [px, py - NEW_TEXT_BOX_SIZE.1, px + NEW_TEXT_BOX_SIZE.0, py];
+        self.text_modal = Some(TextInputModal {
+            action: PendingTextAction::AddFreeText { rect },
+            input: String::new(),
+        });
+        self.add_text_mode = false;
+    }
+
+    /// Sélectionne (`self.selected_annotation`) l'annotation de
+    /// `self.annotations` dont le rectangle contient le point cliqué, ou
+    /// efface la sélection si le clic tombe en dehors de toute annotation
+    /// (#32) — appelé uniquement hors du mode "📝 Ajouter texte", voir
+    /// l'appelant.
+    fn handle_annotation_click(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) {
+        if !response.clicked() {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
+        self.selected_annotation = self
+            .annotations
+            .iter()
+            .find(|a| px >= a.rect[0] && px <= a.rect[2] && py >= a.rect[1] && py <= a.rect[3])
+            .map(|a| a.index);
+    }
+
+    /// Affiche la boîte de dialogue de saisie de texte (#30/#40), le cas
+    /// échéant — une fenêtre flottante `egui::Window` plutôt qu'un panneau
+    /// fixe, pour rester au-dessus du contenu de la page sans en changer la
+    /// disposition.
+    fn show_text_modal(&mut self, ctx: &egui::Context) {
+        let Some(modal) = &mut self.text_modal else {
+            return;
+        };
+        let title = match modal.action {
+            PendingTextAction::AddFreeText { .. } => "Ajouter du texte",
+            PendingTextAction::ReplaceText { .. } => "Remplacer le texte sélectionné",
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut modal.input)
+                        .id(egui::Id::new("text_modal_input")),
+                );
+                response.request_focus();
+                let submitted =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() || submitted {
+                        confirmed = true;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if confirmed {
+            self.confirm_text_modal();
+        } else if cancelled {
+            self.text_modal = None;
+        }
     }
 
     /// Met à jour la sélection de texte à partir du glissement de souris sur
@@ -640,7 +1460,41 @@ impl ViewerApp {
             self.selection_page = Some(page_index);
         }
 
-        if response.drag_started() {
+        // Triple-clic (ligne) et double-clic (mot) avant le glissement : un
+        // double/triple-clic est aussi rapporté comme `clicked()`/parfois
+        // `drag_started()` par `egui` selon la plateforme, donc l'ordre des
+        // branches ci-dessous importe — les cas les plus spécifiques
+        // d'abord.
+        let word_or_line_click = if response.triple_clicked() {
+            Some(false) // false = ligne
+        } else if response.double_clicked() {
+            Some(true) // true = mot
+        } else {
+            None
+        };
+
+        if let Some(is_word) = word_or_line_click {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let point = screen_to_page(pos, response.rect, media_box, scale);
+                let index = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.char_index_at_on_current_page(point).ok().flatten());
+                if let Some(index) = index {
+                    let range = self.session.as_ref().and_then(|s| {
+                        if is_word {
+                            s.word_range_at_on_current_page(index).ok()
+                        } else {
+                            s.line_range_at_on_current_page(index).ok()
+                        }
+                    });
+                    if let Some(range) = range.filter(|r| r.end > r.start) {
+                        self.selection_anchor = Some(range.start);
+                        self.selection_cursor = Some(range.end - 1);
+                    }
+                }
+            }
+        } else if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let point = screen_to_page(pos, response.rect, media_box, scale);
                 self.selection_anchor = self
@@ -663,8 +1517,12 @@ impl ViewerApp {
             self.selection_cursor = None;
         }
 
+        // Pas de garde `a != b` : un double/triple-clic sur un mot/une ligne
+        // d'un seul caractère doit tout de même produire une sélection d'un
+        // caractère (voir ci-dessus) ; un simple clic sans glissement est
+        // géré séparément (`response.clicked()`, efface déjà la sélection).
         let range = match (self.selection_anchor, self.selection_cursor) {
-            (Some(a), Some(b)) if a != b => Some(a.min(b)..a.max(b) + 1),
+            (Some(a), Some(b)) => Some(a.min(b)..a.max(b) + 1),
             _ => None,
         };
         match range {
@@ -710,42 +1568,18 @@ impl ViewerApp {
             });
         clicked
     }
-}
 
-/// Affiche récursivement une table des matières, avec une indentation par
-/// niveau de profondeur. Les entrées sans page résolue (voir
-/// `pdf_app::OutlineItem::page_index`, ex. destination nommée non gérée)
-/// restent affichées mais ne naviguent nulle part au clic.
-fn render_outline_items(
-    ui: &mut egui::Ui,
-    items: &[pdf_app::OutlineItem],
-    depth: usize,
-    clicked: &mut Option<usize>,
-) {
-    for item in items {
-        ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 12.0);
-            if ui.selectable_label(false, &item.title).clicked() {
-                if let Some(page) = item.page_index {
-                    *clicked = Some(page);
-                }
-            }
-        });
-        render_outline_items(ui, &item.children, depth + 1, clicked);
-    }
-}
-
-impl ViewerApp {
     /// Affiche toutes les pages du document empilées verticalement dans une
     /// seule zone de défilement. Virtualisé via `ScrollArea::show_rows` :
     /// seules les pages dont la ligne tombe dans (ou près de) la zone
     /// visible sont rastérisées/chargées en texture, ce qui reste praticable
     /// sur un document de plusieurs centaines de pages.
     fn show_continuous_scroll(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Densité de pixels de l'écran (voir `ensure_texture` pour le même
-        // souci en mode page unique) : sans elle, les pages du défilement
-        // continu seraient floues sur un écran Retina.
-        let pixel_ratio = ctx.pixels_per_point();
+        // Densité de rendu (voir `ensure_texture`/`render_density` pour le
+        // même souci en mode page unique) : sans elle, les pages du
+        // défilement continu seraient floues/crénelées sur un écran
+        // non-Retina.
+        let pixel_ratio = render_density(ctx);
         let zoom_key = (self.zoom * 1000.0).round() as u32;
         let pixel_ratio_key = (pixel_ratio * 1000.0).round() as u32;
         if self.page_textures_zoom_key != Some((zoom_key, pixel_ratio_key)) {
@@ -777,219 +1611,272 @@ impl ViewerApp {
             scroll_area = scroll_area.vertical_scroll_offset(target as f32 * row_height);
         }
 
+        // Sprint 21 (#20) : les pages manquantes sont demandées au thread de
+        // rendu en arrière-plan plutôt que rastérisées ici de façon
+        // bloquante — c'est justement ce qui pouvait geler l'UI sur un gros
+        // document en défilement continu. Le résultat, s'il n'est pas
+        // encore prêt, laisse simplement un espace réservé (`add_space`)
+        // pour ne pas faire sauter le défilement une fois la page arrivée.
         let page_textures = &mut self.page_textures;
+        let background_requested = &mut self.background_requested;
+        let render_worker = &self.render_worker;
+        let render_generation = self.render_generation;
         scroll_area.show_rows(ui, row_height, page_count, |ui, row_range| {
             for index in row_range {
-                if let std::collections::hash_map::Entry::Vacant(entry) = page_textures.entry(index)
-                {
-                    if let Ok(rendered) = session.render_page(index, zoom * pixel_ratio as f64) {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [rendered.width as usize, rendered.height as usize],
-                            &rendered.rgba,
+                if !page_textures.contains_key(&index) {
+                    let scale = zoom * pixel_ratio as f64;
+                    let scale_key = (scale * 1000.0).round() as u32;
+                    let key = (RenderKind::ContinuousPage, index, scale_key);
+                    if background_requested.insert(key) {
+                        render_worker.request_render(
+                            RenderKind::ContinuousPage,
+                            index,
+                            scale,
+                            scale_key,
+                            render_generation,
                         );
-                        let texture = ctx.load_texture(
-                            format!("page-{index}"),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        entry.insert(texture);
+                        ctx.request_repaint();
                     }
                 }
                 if let Some(texture) = page_textures.get(&index) {
                     ui.vertical_centered(|ui| {
                         ui.add(egui::Image::new(texture).fit_to_exact_size(page_logical_size));
                     });
+                } else {
+                    ui.add_space(page_logical_size.y);
                 }
                 ui.add_space(8.0);
             }
         });
     }
-}
 
-impl eframe::App for ViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Installée ici (première frame seulement) plutôt que dans le
-        // callback de création de `main` : à ce stade, la boucle
-        // d'événements `winit`/AppKit a fini son propre démarrage (qui
-        // installe un menu par défaut), donc la nôtre ne se fait plus
-        // écraser — voir la doc de `main` et `NativeMenu::install`.
-        if self.native_menu.is_none() {
-            if let Some(mtm) = objc2::MainThreadMarker::new() {
-                self.native_menu = Some(NativeMenu::install(mtm));
-            }
-        }
+    /// Cœur du rendu de cet onglet pour la frame courante — tout ce que
+    /// faisait `ViewerApp::update` avant l'introduction des onglets
+    /// multi-documents (Sprint 49), à l'exception de la barre de menus
+    /// native et de la barre d'onglets elle-même (globales à l'application,
+    /// gérées par `ViewerApp::update`). Retourne les actions qui doivent
+    /// remonter au niveau de l'application (voir `DocumentTabOutcome`).
+    fn update_content(&mut self, ctx: &egui::Context) -> DocumentTabOutcome {
+        let mut outcome = DocumentTabOutcome::default();
 
-        // Commandes émises par la barre de menus native depuis la dernière
-        // frame (voir `native_menu.rs`) — traitées ici plutôt que dans le
-        // callback Objective-C lui-même, pour ne coupler `MenuTarget` qu'à
-        // un canal MPSC plutôt qu'à l'état `egui`.
-        if let Some(menu) = &self.native_menu {
-            for cmd in menu.drain_commands() {
-                match cmd {
-                    MenuCommand::OpenDocument => self.open_file_dialog(),
-                    MenuCommand::ExportCopyAs => self.export_copy_as(),
-                    MenuCommand::ToggleDarkMode => {
-                        if let Some(mtm) = objc2::MainThreadMarker::new() {
-                            let dark = native_menu::toggle_dark_mode(mtm);
-                            ctx.set_visuals(if dark {
-                                egui::Visuals::dark()
-                            } else {
-                                egui::Visuals::light()
-                            });
-                        }
-                    }
-                    MenuCommand::Save => self.save_in_place(),
-                    MenuCommand::Undo => self.undo_edit(),
-                    MenuCommand::Redo => self.redo_edit(),
-                }
-            }
-        }
-
-        // Glisser-déposer un fichier PDF sur la fenêtre (`egui` expose déjà
-        // les fichiers déposés via l'événement natif `NSWindow`/`winit` sans
-        // code Objective-C supplémentaire).
-        let dropped_path = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
-        if let Some(path) = dropped_path {
-            self.open_path(path);
-        }
+        // Récupère les miniatures/pages rastérisées en arrière-plan depuis
+        // la frame précédente (Sprint 21, #20) — non bloquant, avant tout
+        // dessin qui pourrait en avoir besoin cette frame.
+        self.drain_background_renders(ctx);
 
         self.handle_keyboard_shortcuts(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Ouvrir…").clicked() {
-                    self.open_file_dialog();
-                }
-
-                ui.separator();
-
-                let (page_index, page_count) = self
-                    .session
-                    .as_ref()
-                    .map(|s| (s.page_index(), s.page_count()))
-                    .unwrap_or((0, 0));
-                let has_doc = self.session.is_some();
-
-                ui.add_enabled_ui(has_doc, |ui| {
-                    ui.toggle_value(&mut self.show_thumbnails, "🖼 Miniatures");
-                    ui.toggle_value(&mut self.show_outline, "📑 Signets");
-                    ui.toggle_value(&mut self.continuous_scroll, "📜 Continu");
-                });
-
-                ui.separator();
-
-                ui.add_enabled_ui(has_doc && page_index > 0, |ui| {
-                    if ui.button("◀ Précédente").clicked() {
-                        if let Some(session) = &mut self.session {
-                            session.prev_page();
-                            self.scroll_to_page = Some(session.page_index());
+            // Défilement horizontal plutôt que retour à la ligne
+            // (`horizontal_wrapped`) : avec beaucoup de boutons (page, zoom,
+            // sélection, undo/redo...), le retour à la ligne réorganisait le
+            // groupement visuel de façon imprévisible selon la largeur
+            // (boutons isolés, grands espaces vides). Un simple défilement
+            // horizontal garde l'ordre et le regroupement stables — on
+            // molette/glisse pour voir la suite si la fenêtre est étroite,
+            // plutôt que de voir la barre se réarranger.
+            egui::ScrollArea::horizontal()
+                .id_salt("toolbar_row_main")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // "Ouvrir…" ouvre toujours un **nouvel onglet**
+                        // (Sprint 49) plutôt que de remplacer le document de
+                        // cet onglet — voir `DocumentTabOutcome`.
+                        if ui.button("Ouvrir…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PDF", &["pdf"])
+                                .pick_file()
+                            {
+                                outcome.open_in_new_tab = Some(path);
+                            }
                         }
-                    }
-                });
-                ui.label(if has_doc {
-                    format!("Page {} / {}", page_index + 1, page_count.max(1))
-                } else {
-                    "Aucun document".to_string()
-                });
-                ui.add_enabled_ui(has_doc && page_index + 1 < page_count, |ui| {
-                    if ui.button("Suivante ▶").clicked() {
-                        if let Some(session) = &mut self.session {
-                            session.next_page();
-                            self.scroll_to_page = Some(session.page_index());
+                        ui.add_enabled_ui(self.session.is_some(), |ui| {
+                            if ui.button("📄 Exporter le texte…").clicked() {
+                                self.export_text_dialog();
+                            }
+                        });
+
+                        ui.separator();
+
+                        let (page_index, page_count) = self
+                            .session
+                            .as_ref()
+                            .map(|s| (s.page_index(), s.page_count()))
+                            .unwrap_or((0, 0));
+                        let has_doc = self.session.is_some();
+
+                        ui.add_enabled_ui(has_doc, |ui| {
+                            ui.toggle_value(&mut self.show_thumbnails, "🖼 Miniatures");
+                            ui.toggle_value(&mut self.show_outline, "📑 Signets");
+                            ui.toggle_value(&mut self.continuous_scroll, "📜 Continu");
+                        });
+
+                        ui.separator();
+
+                        ui.add_enabled_ui(has_doc && page_index > 0, |ui| {
+                            if ui.button("◀ Précédente").clicked() {
+                                if let Some(session) = &mut self.session {
+                                    session.prev_page();
+                                    self.scroll_to_page = Some(session.page_index());
+                                }
+                            }
+                        });
+                        if has_doc {
+                            ui.label("Page");
+                            let response = ui.add_sized(
+                                [40.0, ui.available_height().min(20.0)],
+                                egui::TextEdit::singleline(&mut self.goto_page_input)
+                                    .id(egui::Id::new(GOTO_PAGE_FIELD_ID))
+                                    .hint_text((page_index + 1).to_string()),
+                            );
+                            let submitted = response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if submitted {
+                                self.goto_page_from_input();
+                                self.goto_page_input.clear();
+                            }
+                            ui.label(format!("/ {}", page_count.max(1)));
+                        } else {
+                            ui.label("Aucun document");
                         }
-                    }
-                });
+                        ui.add_enabled_ui(has_doc && page_index + 1 < page_count, |ui| {
+                            if ui.button("Suivante ▶").clicked() {
+                                if let Some(session) = &mut self.session {
+                                    session.next_page();
+                                    self.scroll_to_page = Some(session.page_index());
+                                }
+                            }
+                        });
 
-                ui.separator();
+                        ui.separator();
 
-                ui.add_enabled_ui(has_doc, |ui| {
-                    if ui.button("－").clicked() {
-                        self.set_zoom(self.zoom - 0.25);
-                    }
-                    ui.label(format!("{:.0}%", self.zoom * 100.0));
-                    if ui.button("＋").clicked() {
-                        self.set_zoom(self.zoom + 0.25);
-                    }
-                    if ui.button("Réinitialiser").clicked() {
-                        self.set_zoom(1.0);
-                    }
-                    if ui.button("↔ Ajuster à la largeur").clicked() {
-                        self.fit_width_requested = true;
-                    }
-                });
+                        ui.add_enabled_ui(has_doc, |ui| {
+                            if ui.button("－").clicked() {
+                                self.set_zoom(self.zoom - 0.25);
+                            }
+                            ui.label(format!("{:.0}%", self.zoom * 100.0));
+                            if ui.button("＋").clicked() {
+                                self.set_zoom(self.zoom + 0.25);
+                            }
+                            if ui
+                                .button("Réinitialiser")
+                                .on_hover_text("Taille réelle (100 %)")
+                                .clicked()
+                            {
+                                self.set_zoom(1.0);
+                            }
+                            if ui.button("↔ Ajuster à la largeur").clicked() {
+                                self.fit_width_requested = true;
+                            }
+                            if ui.button("↕ Ajuster à la page").clicked() {
+                                self.fit_page_requested = true;
+                            }
+                        });
 
-                if !self.selection_text.is_empty() {
-                    ui.separator();
-                    if ui.button("📋 Copier").clicked() {
-                        ui.output_mut(|o| o.copied_text = self.selection_text.clone());
-                    }
-                    if ui.button("🖍 Surligner").clicked() {
-                        self.highlight_selection();
-                    }
-                }
+                        if !self.selection_text.is_empty() {
+                            ui.separator();
+                            if ui.button("📋 Copier").clicked() {
+                                ui.output_mut(|o| o.copied_text = self.selection_text.clone());
+                            }
+                            if ui.button("🖍 Surligner").clicked() {
+                                self.highlight_selection();
+                            }
+                            if ui.button("Souligner").clicked() {
+                                self.underline_selection();
+                            }
+                            if ui.button("Barrer").clicked() {
+                                self.strikeout_selection();
+                            }
+                            if ui.button("✏ Remplacer…").clicked() {
+                                self.open_replace_text_modal();
+                            }
+                        }
 
-                if let Some(session) = &self.session {
-                    ui.separator();
-                    let (can_undo, can_redo) = (session.can_undo_edit(), session.can_redo_edit());
-                    ui.add_enabled_ui(can_undo, |ui| {
-                        if ui.button("↶ Annuler").clicked() {
-                            self.undo_edit();
+                        ui.add_enabled_ui(has_doc, |ui| {
+                            ui.separator();
+                            ui.toggle_value(&mut self.add_text_mode, "📝 Ajouter texte")
+                                .on_hover_text("Cliquer sur la page pour placer un nouveau texte");
+                            if self.selected_annotation.is_some()
+                                && ui.button("🗑 Supprimer l'annotation").clicked()
+                            {
+                                self.delete_selected_annotation();
+                            }
+                        });
+
+                        if let Some(session) = &self.session {
+                            ui.separator();
+                            let (can_undo, can_redo) =
+                                (session.can_undo_edit(), session.can_redo_edit());
+                            ui.add_enabled_ui(can_undo, |ui| {
+                                if ui.button("↶ Annuler").clicked() {
+                                    self.undo_edit();
+                                }
+                            });
+                            ui.add_enabled_ui(can_redo, |ui| {
+                                if ui.button("↷ Rétablir").clicked() {
+                                    self.redo_edit();
+                                }
+                            });
+                            if ui.button("💾 Enregistrer").clicked() {
+                                self.save_in_place();
+                            }
+                            if ui.button("🖨 Imprimer…").clicked() {
+                                self.print_document();
+                            }
+                            if ui.button("🗜 Optimiser…").clicked() {
+                                self.export_optimized_dialog();
+                            }
+                        }
+
+                        if let Some(session) = &self.session {
+                            ui.separator();
+                            ui.label(
+                                session
+                                    .path()
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy(),
+                            );
                         }
                     });
-                    ui.add_enabled_ui(can_redo, |ui| {
-                        if ui.button("↷ Rétablir").clicked() {
-                            self.redo_edit();
-                        }
-                    });
-                    if ui.button("💾 Enregistrer").clicked() {
-                        self.save_in_place();
-                    }
-                }
-
-                if let Some(session) = &self.session {
-                    ui.separator();
-                    ui.label(
-                        session
-                            .path()
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
-                    );
-                }
-            });
-
-            ui.horizontal(|ui| {
-                let has_doc = self.session.is_some();
-                ui.add_enabled_ui(has_doc, |ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .id(egui::Id::new(SEARCH_FIELD_ID)),
-                    );
-                    let submitted =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("🔍 Rechercher").clicked() || submitted {
-                        self.run_search();
-                    }
                 });
 
-                if let Some(results) = &self.search_results {
-                    if results.is_empty() {
-                        ui.label("Aucun résultat");
-                    } else {
-                        ui.label(format!(
-                            "{}/{} pages",
-                            self.search_cursor + 1,
-                            results.len()
-                        ));
-                        if ui.button("◀ Précédent").clicked() {
-                            self.jump_to_match(-1);
+            egui::ScrollArea::horizontal()
+                .id_salt("toolbar_row_search")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let has_doc = self.session.is_some();
+                        ui.add_enabled_ui(has_doc, |ui| {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.search_query)
+                                    .id(egui::Id::new(SEARCH_FIELD_ID)),
+                            );
+                            let submitted = response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.button("🔍 Rechercher").clicked() || submitted {
+                                self.run_search();
+                            }
+                        });
+
+                        if let Some(results) = &self.search_results {
+                            if results.is_empty() {
+                                ui.label("Aucun résultat");
+                            } else {
+                                ui.label(format!(
+                                    "{}/{} pages",
+                                    self.search_cursor + 1,
+                                    results.len()
+                                ));
+                                if ui.button("◀ Précédent").clicked() {
+                                    self.jump_to_match(-1);
+                                }
+                                if ui.button("Suivant ▶").clicked() {
+                                    self.jump_to_match(1);
+                                }
+                            }
                         }
-                        if ui.button("Suivant ▶").clicked() {
-                            self.jump_to_match(1);
-                        }
-                    }
-                }
-            });
+                    });
+                });
         });
 
         if self.show_thumbnails {
@@ -1024,9 +1911,31 @@ impl eframe::App for ViewerApp {
 
             // Molette+Ctrl ou pincement trackpad : `zoom_delta` vaut 1.0 en
             // l'absence de tel geste (simple scroll de la molette, laissé au
-            // `ScrollArea` ci-dessous pour le défilement).
+            // `ScrollArea` ci-dessous pour le défilement). Sprint 21 (#9) :
+            // recentre le défilement autour du curseur plutôt que de laisser
+            // le zoom dériver vers le coin haut-gauche — calcule le nouveau
+            // décalage de défilement à partir du dernier connu
+            // (`last_scroll_offset`/`last_scroll_viewport`, mis à jour à
+            // chaque frame par la `ScrollArea` plus bas) et le fait consommer
+            // par cette même `ScrollArea` au prochain rendu.
             let zoom_delta = ctx.input(|i| i.zoom_delta());
-            if zoom_delta != 1.0 {
+            if zoom_delta != 1.0 && !self.continuous_scroll {
+                let old_zoom = self.zoom;
+                self.set_zoom(self.zoom * zoom_delta);
+                let new_zoom = self.zoom;
+                if let (Some(viewport), Some(hover)) = (
+                    self.last_scroll_viewport,
+                    ctx.input(|i| i.pointer.hover_pos()),
+                ) {
+                    if viewport.contains(hover) && old_zoom > 0.0 {
+                        let cursor_in_viewport = hover - viewport.min;
+                        let content_point_old = self.last_scroll_offset + cursor_in_viewport;
+                        let ratio = new_zoom / old_zoom;
+                        let new_offset = content_point_old * ratio - cursor_in_viewport;
+                        self.pending_scroll_offset = Some(new_offset);
+                    }
+                }
+            } else if zoom_delta != 1.0 {
                 self.set_zoom(self.zoom * zoom_delta);
             }
 
@@ -1048,9 +1957,14 @@ impl eframe::App for ViewerApp {
                 self.fit_width_requested = false;
                 self.fit_to_width(ui.available_width());
             }
+            if self.fit_page_requested {
+                self.fit_page_requested = false;
+                self.fit_to_page(ui.available_size());
+            }
 
             self.ensure_texture(ctx);
             self.ensure_highlights();
+            self.ensure_annotations();
 
             // Clonée (bon marché : `TextureHandle` est un handle partagé)
             // pour ne pas garder de prêt sur `self.texture` pendant qu'on
@@ -1062,7 +1976,12 @@ impl eframe::App for ViewerApp {
                     .and_then(|s| s.current_page_media_box().ok());
                 let scale = self.zoom as f64;
 
-                egui::ScrollArea::both().show(ui, |ui| {
+                let mut scroll_area = egui::ScrollArea::both();
+                if let Some(offset) = self.pending_scroll_offset.take() {
+                    scroll_area =
+                        scroll_area.scroll_offset(egui::vec2(offset.x.max(0.0), offset.y.max(0.0)));
+                }
+                let scroll_output = scroll_area.show(ui, |ui| {
                     // `fit_to_exact_size` : la texture est rendue à
                     // `zoom * pixels_per_point` pixels (voir `ensure_texture`)
                     // pour rester nette sur écran Retina, donc affichée plus
@@ -1086,7 +2005,28 @@ impl eframe::App for ViewerApp {
                             );
                         }
 
-                        self.handle_text_selection(&response, media_box, scale);
+                        if !self.annotations.is_empty() {
+                            draw_annotation_outlines(
+                                ui,
+                                &response,
+                                &self.annotations,
+                                media_box,
+                                scale,
+                                self.selected_annotation,
+                            );
+                        }
+
+                        // Le mode "📝 Ajouter texte" (#30) intercepte le
+                        // simple clic à la place de la sélection/l'annotation
+                        // (voir la doc de `handle_add_text_click`) — les deux
+                        // usages ne doivent jamais se marcher dessus sur le
+                        // même clic.
+                        if self.add_text_mode {
+                            self.handle_add_text_click(&response, media_box, scale);
+                        } else {
+                            self.handle_annotation_click(&response, media_box, scale);
+                            self.handle_text_selection(&response, media_box, scale);
+                        }
                         if !self.selection_rects.is_empty() {
                             draw_highlights(
                                 ui,
@@ -1099,8 +2039,37 @@ impl eframe::App for ViewerApp {
                         }
                     }
                 });
+                self.last_scroll_offset = scroll_output.state.offset;
+                self.last_scroll_viewport = Some(scroll_output.inner_rect);
             }
         });
+
+        self.show_text_modal(ctx);
+
+        outcome
+    }
+}
+
+/// Affiche récursivement une table des matières, avec une indentation par
+/// niveau de profondeur. Les entrées sans page résolue (voir
+/// `pdf_app::OutlineItem::page_index`, ex. destination nommée non gérée)
+/// restent affichées mais ne naviguent nulle part au clic.
+fn render_outline_items(
+    ui: &mut egui::Ui,
+    items: &[pdf_app::OutlineItem],
+    depth: usize,
+    clicked: &mut Option<usize>,
+) {
+    for item in items {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            if ui.selectable_label(false, &item.title).clicked() {
+                if let Some(page) = item.page_index {
+                    *clicked = Some(page);
+                }
+            }
+        });
+        render_outline_items(ui, &item.children, depth + 1, clicked);
     }
 }
 
@@ -1134,6 +2103,44 @@ fn draw_highlights(
     }
 }
 
+/// Dessine un contour (pas un remplissage, contrairement à `draw_highlights`)
+/// par annotation de `annotations` (Sprint 20, #32) — l'annotation
+/// `selected` (le cas échéant) a un trait plus épais pour rester
+/// identifiable avant de cliquer "🗑 Supprimer l'annotation".
+fn draw_annotation_outlines(
+    ui: &egui::Ui,
+    image_response: &egui::Response,
+    annotations: &[pdf_app::AnnotationInfo],
+    media_box: [f64; 4],
+    scale: f64,
+    selected: Option<usize>,
+) {
+    let origin_x = media_box[0];
+    let origin_top = media_box[3];
+    let painter = ui.painter();
+    for annot in annotations {
+        let rect = annot.rect;
+        let min = egui::pos2(
+            image_response.rect.min.x + ((rect[0] - origin_x) * scale) as f32,
+            image_response.rect.min.y + ((origin_top - rect[3]) * scale) as f32,
+        );
+        let max = egui::pos2(
+            image_response.rect.min.x + ((rect[2] - origin_x) * scale) as f32,
+            image_response.rect.min.y + ((origin_top - rect[1]) * scale) as f32,
+        );
+        let width = if selected == Some(annot.index) {
+            2.5
+        } else {
+            1.0
+        };
+        painter.rect_stroke(
+            egui::Rect::from_min_max(min, max),
+            0.0,
+            egui::Stroke::new(width, ANNOTATION_OUTLINE_COLOR),
+        );
+    }
+}
+
 /// Convertit une position écran (dans le repère de `image_rect`, le
 /// rectangle occupé par l'image de la page) en point d'espace page PDF —
 /// inverse de la transformation appliquée par `draw_highlights`.
@@ -1148,4 +2155,197 @@ fn screen_to_page(
     let page_x = origin_x + (pos.x - image_rect.min.x) as f64 / scale;
     let page_y = origin_top - (pos.y - image_rect.min.y) as f64 / scale;
     (page_x, page_y)
+}
+
+/// Application complète — Sprint 49 : porte la liste des onglets ouverts
+/// plutôt qu'un unique document (voir `DocumentTab`), ainsi que ce qui est
+/// réellement global à l'application : le backend GPU partagé (un seul
+/// `Device`/`Queue` `wgpu`, cloné dans chaque onglet à sa création) et la
+/// barre de menus native (une seule pour toute l'application, ses commandes
+/// sont routées vers l'onglet actif).
+struct ViewerApp {
+    tabs: Vec<DocumentTab>,
+    /// Indice de l'onglet actuellement affiché dans `tabs` — toujours valide
+    /// (`tabs` n'est jamais vide, voir `close_active_tab`).
+    active: usize,
+    gpu: Option<pdf_render_gpu::GpuRenderer>,
+    /// Barre de menus native macOS (Sprint 11-12, sprint.md) — `None` sur
+    /// les plateformes non macOS ou si l'installation a échoué, auquel cas
+    /// seuls la barre d'outils `egui` et le glisser-déposer restent
+    /// utilisables pour ouvrir un fichier.
+    native_menu: Option<NativeMenu>,
+}
+
+impl ViewerApp {
+    fn new(initial_path: Option<PathBuf>, gpu: Option<pdf_render_gpu::GpuRenderer>) -> Self {
+        Self {
+            tabs: vec![DocumentTab::new(initial_path, gpu.clone())],
+            active: 0,
+            gpu,
+            native_menu: None,
+        }
+    }
+
+    /// Ouvre `path` dans un **nouvel** onglet et le rend actif — jamais dans
+    /// l'onglet actuellement affiché (voir la doc de module sur
+    /// `DocumentTabOutcome`).
+    fn open_new_tab(&mut self, path: PathBuf) {
+        let tab = DocumentTab::new(Some(path), self.gpu.clone());
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// "Fichier > Fermer l'onglet" (`⌘W`, Sprint 49) : ferme l'onglet actif.
+    /// Si c'était le dernier, le remplace par un onglet vide plutôt que de
+    /// fermer la fenêtre — `tabs` ne doit jamais être vide (simplification
+    /// délibérée : fermer la fenêtre elle-même reste possible via `⇧⌘W`,
+    /// "Fermer la fenêtre", `performClose:`).
+    fn close_active_tab(&mut self) {
+        self.tabs.remove(self.active);
+        if self.tabs.is_empty() {
+            self.tabs.push(DocumentTab::new(None, self.gpu.clone()));
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+    }
+
+    /// Ferme l'onglet `index` (bouton "×" de la barre d'onglets) — même
+    /// logique que `close_active_tab`, mais ajuste `active` pour continuer
+    /// à pointer sur le même onglet visuellement quand celui fermé était
+    /// avant lui dans la liste.
+    fn close_tab(&mut self, index: usize) {
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.tabs.push(DocumentTab::new(None, self.gpu.clone()));
+            self.active = 0;
+        } else if index < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+    }
+
+    /// Barre d'onglets (Sprint 49) : un onglet par document ouvert (titre =
+    /// nom de fichier), un bouton "×" pour le fermer, et un bouton "+" pour
+    /// en ouvrir un nouveau. Toujours affichée, même avec un seul onglet —
+    /// évite un changement de disposition surprenant dès qu'un deuxième
+    /// onglet s'ouvre.
+    fn show_tab_bar(&mut self, ctx: &egui::Context) {
+        let mut switch_to = None;
+        let mut close_index = None;
+        let mut new_tab_path = None;
+
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("tab_bar_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, tab) in self.tabs.iter().enumerate() {
+                            ui.group(|ui| {
+                                if ui
+                                    .selectable_label(index == self.active, tab.title())
+                                    .clicked()
+                                {
+                                    switch_to = Some(index);
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Fermer l'onglet")
+                                    .clicked()
+                                {
+                                    close_index = Some(index);
+                                }
+                            });
+                        }
+                        if ui.button("+").on_hover_text("Nouvel onglet").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PDF", &["pdf"])
+                                .pick_file()
+                            {
+                                new_tab_path = Some(path);
+                            }
+                        }
+                    });
+                });
+        });
+
+        if let Some(index) = switch_to {
+            self.active = index;
+        }
+        if let Some(index) = close_index {
+            self.close_tab(index);
+        }
+        if let Some(path) = new_tab_path {
+            self.open_new_tab(path);
+        }
+    }
+}
+
+impl eframe::App for ViewerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Installée ici (première frame seulement) plutôt que dans le
+        // callback de création de `main` : à ce stade, la boucle
+        // d'événements `winit`/AppKit a fini son propre démarrage (qui
+        // installe un menu par défaut), donc la nôtre ne se fait plus
+        // écraser — voir la doc de `main` et `NativeMenu::install`.
+        if self.native_menu.is_none() {
+            if let Some(mtm) = objc2::MainThreadMarker::new() {
+                self.native_menu = Some(NativeMenu::install(mtm));
+            }
+        }
+
+        // Commandes émises par la barre de menus native depuis la dernière
+        // frame (voir `native_menu.rs`) — traitées ici plutôt que dans le
+        // callback Objective-C lui-même, pour ne coupler `MenuTarget` qu'à
+        // un canal MPSC plutôt qu'à l'état `egui`. Routées vers l'onglet
+        // actif, sauf `OpenDocument`/`CloseTab` qui agissent sur la liste
+        // d'onglets elle-même (Sprint 49).
+        if let Some(menu) = &self.native_menu {
+            for cmd in menu.drain_commands() {
+                match cmd {
+                    MenuCommand::OpenDocument => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PDF", &["pdf"])
+                            .pick_file()
+                        {
+                            self.open_new_tab(path);
+                        }
+                    }
+                    MenuCommand::CloseTab => self.close_active_tab(),
+                    MenuCommand::ExportCopyAs => self.tabs[self.active].export_copy_as(),
+                    MenuCommand::ToggleDarkMode => {
+                        if let Some(mtm) = objc2::MainThreadMarker::new() {
+                            let dark = native_menu::toggle_dark_mode(mtm);
+                            ctx.set_visuals(if dark {
+                                egui::Visuals::dark()
+                            } else {
+                                egui::Visuals::light()
+                            });
+                        }
+                    }
+                    MenuCommand::Save => self.tabs[self.active].save_in_place(),
+                    MenuCommand::Undo => self.tabs[self.active].undo_edit(),
+                    MenuCommand::Redo => self.tabs[self.active].redo_edit(),
+                    MenuCommand::Print => self.tabs[self.active].print_document(),
+                }
+            }
+        }
+
+        // Glisser-déposer un fichier PDF sur la fenêtre (`egui` expose déjà
+        // les fichiers déposés via l'événement natif `NSWindow`/`winit` sans
+        // code Objective-C supplémentaire) : ouvre un nouvel onglet, comme
+        // "Ouvrir…" (Sprint 49) plutôt que de remplacer l'onglet actif.
+        let dropped_path = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
+        if let Some(path) = dropped_path {
+            self.open_new_tab(path);
+        }
+
+        self.show_tab_bar(ctx);
+
+        let outcome = self.tabs[self.active].update_content(ctx);
+        if let Some(path) = outcome.open_in_new_tab {
+            self.open_new_tab(path);
+        }
+    }
 }

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2c5aa0"/>
+      <stop offset="100%" stop-color="#122f5c"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fbf3e1"/>
+      <stop offset="100%" stop-color="#eaddb8"/>
+    </linearGradient>
+    <linearGradient id="rollShade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#d9c79a"/>
+      <stop offset="100%" stop-color="#c4ac76"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App icon background: rounded square, macOS style -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- Papyrus scroll -->
+  <g>
+    <!-- main sheet -->
+    <rect x="292" y="238" width="440" height="548" rx="10" fill="url(#paper)"/>
+
+    <!-- top roll -->
+    <rect x="272" y="206" width="480" height="72" rx="36" fill="url(#rollShade)"/>
+    <circle cx="292" cy="242" r="36" fill="#c4ac76"/>
+    <circle cx="732" cy="242" r="36" fill="#c4ac76"/>
+
+    <!-- bottom roll -->
+    <rect x="272" y="746" width="480" height="72" rx="36" fill="url(#rollShade)"/>
+    <circle cx="292" cy="782" r="36" fill="#c4ac76"/>
+    <circle cx="732" cy="782" r="36" fill="#c4ac76"/>
+
+    <!-- text lines on the sheet -->
+    <g stroke="#8a6d3b" stroke-width="14" stroke-linecap="round" opacity="0.75">
+      <line x1="344" y1="340" x2="680" y2="340"/>
+      <line x1="344" y1="404" x2="680" y2="404"/>
+      <line x1="344" y1="468" x2="600" y2="468"/>
+      <line x1="344" y1="532" x2="680" y2="532"/>
+      <line x1="344" y1="596" x2="680" y2="596"/>
+      <line x1="344" y1="660" x2="540" y2="660"/>
+    </g>
+  </g>
+</svg>

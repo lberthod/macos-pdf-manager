@@ -20,6 +20,18 @@
 //! "Enregistrer" (écrit dans le fichier ouvert) ; "Exporter une copie…" est
 //! resté, déplacé sur `⇧⌘S`.
 //!
+//! `⌘P` (Imprimer…, Sprint 21, #48) délègue à Aperçu via AppleScript
+//! (`ViewerApp::print_document`, `main.rs`) plutôt qu'un pipeline
+//! `NSPrintOperation` maison — cette app n'a pas de vraie `NSView` de
+//! contenu à imprimer (tout passe par une texture `egui`/`wgpu`), et cette
+//! approche donne gratuitement l'aperçu et la sélection de pages du système.
+//!
+//! `⌘T` (Nouvel onglet) et `⌘W` (Fermer l'onglet, Sprint 49) : onglets
+//! multi-documents dans une seule fenêtre (`ViewerApp` porte `Vec<DocumentTab>`,
+//! voir `main.rs`) — `⌘W` ferme l'onglet actif, pas la fenêtre entière,
+//! contrairement à la sémantique standard AppKit de `performClose:`
+//! (toujours disponible, mais déplacée sur `⇧⌘W`).
+//!
 //! **Non fait** (voir sprint.md) : Quick Look — nécessiterait une extension
 //! d'application séparée (`.qlgenerator`/`appex`, bundle et cible de build
 //! distincts d'Xcode), hors périmètre d'un simple binaire `cargo`.
@@ -48,6 +60,13 @@ pub enum MenuCommand {
     Save,
     Undo,
     Redo,
+    Print,
+    /// "Fermer l'onglet" (Sprint 49, `⌘W`) — remplace `performClose:` comme
+    /// action par défaut de `⌘W` puisque l'app gère désormais plusieurs
+    /// documents en onglets dans une seule fenêtre : fermer *la fenêtre*
+    /// n'a plus le même sens que fermer *l'onglet actif*. `performClose:`
+    /// reste disponible sur `⇧⌘W` pour fermer réellement la fenêtre.
+    CloseTab,
 }
 
 struct MenuTargetIvars {
@@ -91,6 +110,16 @@ define_class!(
         #[unsafe(method(redoEdit:))]
         fn redo_edit(&self, _sender: Option<&AnyObject>) {
             let _ = self.ivars().sender.send(MenuCommand::Redo);
+        }
+
+        #[unsafe(method(printDocument:))]
+        fn print_document(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().sender.send(MenuCommand::Print);
+        }
+
+        #[unsafe(method(closeTab:))]
+        fn close_tab(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().sender.send(MenuCommand::CloseTab);
         }
     }
 );
@@ -180,7 +209,7 @@ fn app_menu_item(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     // répondeurs, `NSApplication` (en bout de chaîne) l'implémente déjà.
     submenu.addItem(&item_with_action(
         mtm,
-        "Quitter PDF Manager",
+        "Quitter PapyrusPDF",
         sel!(terminate:),
         "q",
         None,
@@ -197,6 +226,16 @@ fn file_menu_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuI
         "Ouvrir…",
         sel!(openDocument:),
         "o",
+        Some(target),
+    ));
+    // "Nouvel onglet" (Sprint 49) : même action qu'"Ouvrir…" — les deux
+    // ouvrent un fichier dans un nouvel onglet, seul le raccourci diffère
+    // (convention macOS `⌘T` pour un nouvel onglet).
+    submenu.addItem(&item_with_action(
+        mtm,
+        "Nouvel onglet",
+        sel!(openDocument:),
+        "t",
         Some(target),
     ));
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -218,14 +257,28 @@ fn file_menu_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuI
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
     submenu.addItem(&export_copy);
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
-    // `performClose:` : implémenté par `NSWindow` lui-même, cible `None`.
     submenu.addItem(&item_with_action(
         mtm,
-        "Fermer la fenêtre",
-        sel!(performClose:),
-        "w",
-        None,
+        "Imprimer…",
+        sel!(printDocument:),
+        "p",
+        Some(target),
     ));
+    submenu.addItem(&NSMenuItem::separatorItem(mtm));
+    submenu.addItem(&item_with_action(
+        mtm,
+        "Fermer l'onglet",
+        sel!(closeTab:),
+        "w",
+        Some(target),
+    ));
+    // `performClose:` (ferme réellement la fenêtre) : implémenté par
+    // `NSWindow` lui-même, cible `None` — déplacé sur `⇧⌘W` puisque `⌘W`
+    // ferme maintenant l'onglet actif (voir `MenuCommand::CloseTab`).
+    let close_window = item_with_action(mtm, "Fermer la fenêtre", sel!(performClose:), "w", None);
+    close_window
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    submenu.addItem(&close_window);
     let item = NSMenuItem::new(mtm);
     item.setTitle(ns_string!("Fichier"));
     item.setSubmenu(Some(&submenu));

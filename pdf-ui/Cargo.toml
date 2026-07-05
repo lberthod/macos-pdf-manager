@@ -5,11 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pdf-ui"
+name = "PapyrusPDF"
 path = "src/main.rs"
 
 [dependencies]
 pdf-app = { workspace = true }
+pdf-core = { workspace = true }
+pdf-render = { workspace = true }
 pdf-render-gpu = { workspace = true }
 eframe = { version = "0.29", features = ["wgpu"] }
 egui = "0.29"
@@ -26,8 +28,16 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 # notarisation réelles sans un compte Apple Developer, non disponible dans
 # cet environnement de développement).
 [package.metadata.bundle]
-name = "PDF Manager"
-identifier = "com.lberthod.pdfmanager"
+name = "PapyrusPDF"
+identifier = "com.lberthod.papyruspdf"
 short_description = "Visionneuse et éditeur PDF natif macOS (moteur maison)"
 category = "public.app-category.productivity"
 copyright = "Copyright 2026 Loïc Berthod"
+icon = ["pdf-ui/icons/icon.icns"]
+# Sprint 22 (#1, audit50quest.md) : déclare la capacité à ouvrir des PDF
+# (`CFBundleDocumentTypes`, "Alternate" pour apparaître dans "Ouvrir avec…"
+# sans devenir le gestionnaire par défaut sans consentement explicite de
+# l'utilisateur) — `cargo-bundle` n'a pas de champ dédié pour ça, mais fusionne
+# tel quel le contenu de tout fichier listé ici dans l'`Info.plist` généré
+# (voir `osx_bundle.rs::create_info_plist`).
+osx_info_plist_exts = ["pdf-ui/document_types.plist.xml"]

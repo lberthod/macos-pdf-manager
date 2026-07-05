@@ -1,4 +1,4 @@
-# macOS PDF Manager
+# PapyrusPDF
 
 Éditeur / visionneuse PDF **natif macOS**, écrit en **Rust**, distribué en `.dmg`, avec un **moteur PDF maison** (parsing et rendu écrits from scratch, sans dépendre de pdfium/MuPDF).
 

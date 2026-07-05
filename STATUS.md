@@ -85,9 +85,10 @@ cargo run --bin pdf-cli -- render pdf-core/tests/fixtures/rotated_page.pdf /tmp/
 produit un PNG **792×612** (dimensions permutées par rapport au 612×792 non pivoté) avec le texte lisible pivoté verticalement, comme un lecteur PDF standard afficherait une page `/Rotate 90` — avant `render_page_rotated`, cette rotation était parsée (`Page::rotate`) mais silencieusement ignorée au rendu.
 
 ```bash
-cargo run --bin pdf-cli -- dump pdf-core/tests/fixtures/encrypted_rc4.pdf
+cargo run --bin pdf-cli -- render-info pdf-core/tests/fixtures/encrypted_rc4.pdf 0
+cargo run --bin pdf-cli -- render-info pdf-core/tests/fixtures/encrypted_aes256.pdf 0
 ```
-échoue avec `error: encrypted PDF documents are not supported (/Encrypt present in trailer)` — un message clair, là où l'ouverture échouait auparavant plus loin dans le pipeline avec une erreur `FlateDecode: corrupt deflate stream` trompeuse (les chaînes/flux restaient chiffrés).
+(Sprint 22, déchiffrement `/Encrypt` — voir `pdf-core::crypt`) affichent chacun `Recovered text: "..."` avec le texte réel du PDF (`"Encrypted PDF test - if you can read this, decryption worked"` et `"AES-256 encrypted PDF test"`) : le premier fixture est en réalité chiffré AES-128 (`/V 4 /R 4`, malgré son nom — pikepdf choisit AES par défaut pour `R=4`), le second AES-256 (`/V 5 /R 6`, hachage "renforcé" ISO 32000-2 Annexe C). Mot de passe utilisateur vide géré (Algorithme 2 classique pour R2-4, Algorithme 2.A/2.B pour R5/R6) ; un vrai mot de passe utilisateur non vide reste non géré (pas d'UI de saisie).
 
 ```bash
 cargo run --bin pdf-cli -- text pdf-core/tests/fixtures/cjk_text.pdf 0
@@ -174,7 +175,7 @@ affiche `Recovered text: "Page 1 - Hello, PDF Manager!Nouvelle noteTitre remplac
 | Récupération d'erreur | Reconstruction par balayage d'octets si xref corrompue/absente, avec repli sur recherche d'un `/Type /Catalog` | Testé sur un seul fichier corrompu artificiellement, pas sur un corpus de corruptions variées |
 | Filtres de flux | FlateDecode, ASCIIHex, ASCII85, LZWDecode, DCTDecode (JPEG, `zune-jpeg`), prédicteurs PNG (types 0-4) et TIFF | Pas de CCITTFaxDecode, JBIG2Decode, JPXDecode |
 | Arbre des pages | Parcours récursif `/Pages`→`/Kids`, héritage Resources/MediaBox/Rotate, garde anti-cycle. `/Rotate` est **appliqué au rendu** (`pdf-render::render_page_rotated`, dimensions du pixmap permutées pour 90°/270°) | — |
-| Chiffrement | `/Encrypt` détecté à l'ouverture (`Document::open` échoue avec `PdfError::Encrypted`, message clair) | Pas de déchiffrement RC4/AES réel : un PDF chiffré ne peut pas être lu, même avec le bon mot de passe |
+| Chiffrement (`pdf-core::crypt`, Sprint 22) | Gestionnaire de sécurité standard (`/Filter /Standard`) déchiffré pour un mot de passe utilisateur **vide** : RC4 (R2-4), AES-128 (R4, `/CFM AESV2`), AES-256 (R5/R6, `/CFM AESV3`, hachage "renforcé" ISO 32000-2 Annexe C pour R6). Chaînes et flux déchiffrés à la résolution de chaque objet (`Document::resolve`), avant application des filtres (`FlateDecode` etc.) | Primitives déléguées à des crates auditées (`md-5`/`sha2`/`aes`/`cbc`), RC4 implémenté à la main (algorithme trivial, chiffrement de toute façon obsolète). **Mot de passe utilisateur non vide non géré** (pas d'UI de saisie côté `pdf-app`/`pdf-ui`) : un PDF avec un vrai mot de passe produit un contenu corrompu plutôt qu'une erreur explicite. Gestionnaires de sécurité non standard (`/Filter` autre que `/Standard`) toujours rejetés avec `PdfError::Encrypted`. |
 | Contenu | ~40 opérateurs : état graphique, chemins, texte, couleur, Form XObjects (récursif, garde de profondeur), **clip (`W`/`W*`) suivi et appliqué** (intersection des clips imbriqués, restauré par `Q`) | Patterns/shadings ignorés ; contenu marqué ignoré |
 | Police — largeurs | `/Widths`+`/FirstChar` ; repli sur table AFM Helvetica intégrée si absent | Les 13 autres polices standard (Times, Courier...) n'ont pas de table dédiée, retombent sur une largeur par défaut arbitraire (500/1000 em) |
 | Police — encodage | `WinAnsiEncoding`/`StandardEncoding` complets (256 codes) + `/Differences` via un sous-ensemble de l'Adobe Glyph List. **`/ToUnicode` lu et prioritaire** pour les polices simples (`font.rs::parse_to_unicode_cmap`) **et composites** (`parse_to_unicode_cmap_wide`, codes source 2 octets non bornés à 256) : `beginbfchar`/`beginbfrange`, formes base+décalage et tableau explicite | `MacRomanEncoding` est approximé par WinAnsi au-delà de l'ASCII |
@@ -227,7 +228,7 @@ Cette grille sert de repère pour prioriser : le projet est solidement niveau 1 
 - **Linéarisation** (réordonnancement des objets pour l'affichage progressif/streaming) : non faite, chantier distinct.
 - **Extraction de texte par blocs/colonnes** (façon `pdftotext -layout`) : `pdf-text` fait maintenant une reconstruction linéaire avec sauts de ligne heuristiques et des rectangles de position par caractère (voir §2), mais pas de détection de colonnes/tableaux.
 - **Décodage d'images** : CCITT, JBIG2, JPX — aucun (JPEG fait, voir §2).
-- **Déchiffrement PDF** (`/Encrypt` RC4/AES) : détecté proprement à l'ouverture (voir §2) mais pas déchiffré — aucun PDF chiffré n'est lisible, même avec le bon mot de passe. Signatures numériques, PDF/A : aucun.
+- **Signatures numériques** : aucune. (Déchiffrement `/Encrypt` : fait pour un mot de passe utilisateur vide depuis le Sprint 22, voir §2 — un vrai mot de passe reste non géré.)
 - **Packaging macOS** : pas de `.app`, pas de `.dmg`, pas de signature/notarisation.
 
 ---

@@ -1,115 +1,139 @@
-# PapyrusPDF
+<p align="center">
+  <img src="pdf-ui/icons/icon_512.png" width="128" height="128" alt="Icône PapyrusPDF">
+</p>
 
-Éditeur / visionneuse PDF **natif macOS**, écrit en **Rust**, distribué en `.dmg`, avec un **moteur PDF maison** (parsing et rendu écrits from scratch, sans dépendre de pdfium/MuPDF).
+<h1 align="center">PapyrusPDF</h1>
 
-## Fonctionnalités visées
+<p align="center">
+  Éditeur / visionneuse PDF <strong>natif macOS</strong>, écrit en <strong>Rust</strong>,<br>
+  avec un <strong>moteur PDF maison</strong> (parsing et rendu écrits from scratch, sans pdfium/MuPDF).
+</p>
 
-1. **Visualiser** des PDF (rendu fidèle, zoom, navigation, recherche texte).
-2. **Annoter** (surlignage, notes, formes, signatures, remplissage de formulaires).
-3. **Manipuler les pages** (réorganiser, supprimer, pivoter, fusionner, découper, insérer).
-4. **Éditer le contenu**, y compris le texte existant et les objets vectoriels (périmètre progressif, voir plus bas).
+<p align="center">
+  <a href="https://github.com/lberthod/macos-pdf-manager/releases/latest">⬇️ Télécharger la dernière version (.dmg)</a>
+</p>
 
-> ⚠️ L'édition complète du texte d'un PDF avec un moteur écrit de zéro est un projet difficile : un PDF est une description de rendu (glyphes positionnés), pas un format éditable. Le périmètre réaliste et l'approche par phases sont détaillés dans [architecture.md](./architecture.md).
+---
 
-## État actuel (voir [STATUS.md](./STATUS.md) pour le détail précis)
+## Installation
 
-Le projet a un **moteur PDF fonctionnel de bout en bout** sur un sous-ensemble réel de PDF : ouverture d'un fichier → xref (classique et streams PDF 1.5+) → arbre des pages → interprétation du flux de contenu (chemins, texte, couleur, clip, Form XObjects) → rendu **CPU** (`tiny-skia`) **et GPU** (`wgpu`, en parité fonctionnelle) en PNG ou à l'écran, avec de vraies métriques de police et de vrais contours de glyphes — polices TrueType et CFF/Type1C **intégrées** (simples **et composites** `/Type0`/CID, `CIDFontType0` et `CIDFontType2`), polices standard **non intégrées** (substituées par les polices système macOS : Helvetica, Times, Courier..., gras/italique), images JPEG (RGB et CMYK) avec canal alpha (`/SMask`).
+1. Télécharger le `.dmg` le plus récent depuis [Releases](https://github.com/lberthod/macos-pdf-manager/releases).
+2. L'ouvrir, glisser **PapyrusPDF.app** dans le dossier `Applications`.
+3. Lancer l'app depuis `Applications` ou Spotlight.
 
-Un premier **prototype de viewer graphique** (`pdf-ui`, `egui`/`eframe`) est fonctionnel : navigation, zoom, recherche texte avec surlignage, miniatures, panneau de signets, défilement continu, sélection de texte à la souris.
+Le `.dmg` et l'app qu'il contient sont **signés (Developer ID Application) et notarisés par Apple** : macOS les ouvre normalement, sans l'avertissement "développeur non identifié" habituel pour une app non distribuée via l'App Store. Voir [Distribution & notarisation](#distribution--notarisation) pour le détail du processus, si tu veux produire ton propre `.dmg` signé.
 
-L'application a désormais un vrai **chrome natif macOS** : barre de menus système (`NSMenu` via `objc2`/`objc2-app-kit`, pas dessinée par `egui`), ouverture/export de fichier natifs, glisser-déposer, plein écran, mode sombre — packagée en `.app`/`.dmg` via `cargo-bundle`/`hdiutil`.
+## Fonctionnalités
 
-Ce qui **ne fonctionne pas encore** : l'édition, l'annotation, la manipulation de pages, Quick Look, la signature/notarisation Apple réelle (identifiants Developer non disponibles dans cet environnement), Type1 historique (police pré-CFF), les images CCITT/JBIG2/JPX, le déchiffrement PDF (un PDF chiffré est détecté proprement mais jamais lu). Voir [STATUS.md](./STATUS.md) pour la liste précise, fichier par fichier, de ce qui est fait et de ce qui manque, et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour comprendre précisément comment le moteur fonctionne en interne.
+- **Visualiser** : rendu fidèle (CPU et GPU), zoom (boutons, molette, pincement trackpad centré sur le curseur, ajuster à la largeur/à la page), navigation (page à page, aller à une page, recherche plein texte insensible à la casse/aux accents avec surlignage), miniatures, signets, défilement continu, sélection de texte (glisser, double/triple-clic) et copie, export du texte en `.txt`, mode sombre, plein écran.
+- **Annoter** : surligner/souligner/barrer une sélection, ajouter du texte libre, remplacer un texte existant (superposition), annuler/rétablir illimité, enregistrer en place ou exporter une copie/version optimisée.
+- **Manipuler les pages** : réordonner par glisser-déposer, supprimer, pivoter, insérer (page vierge, image JPEG, autre PDF), fusionner un document, extraire une sélection de pages vers un nouveau fichier.
+- **Imprimer** : délégation à Aperçu (dialogue système, aperçu, sélection de pages).
+- **Onglets multi-documents** : plusieurs PDF ouverts dans une seule fenêtre.
+- **Ouvrir des PDF chiffrés** (mot de passe utilisateur vide) : RC4, AES-128 et AES-256 gérés.
+
+> ⚠️ L'édition chirurgicale du texte existant (modifier un glyphe déjà présent dans le flux de contenu, plutôt que le masquer et le redessiner par superposition) reste hors périmètre : un PDF est une description de rendu (glyphes positionnés), pas un format éditable — voir [architecture.md](./architecture.md#73-édition-du-texte-existant--le-vrai-défi) pour le détail de cette limite et l'approche par phases retenue.
+
+Ce qui ne fonctionne pas encore : Quick Look, formes/notes/signatures, remplissage de formulaire au clic (le moteur le sait faire, pas encore câblé dans l'interface), Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, PDF chiffré avec un vrai mot de passe (pas de dialogue de saisie), accessibilité VoiceOver. Voir [STATUS.md](./STATUS.md) et [audit50quest.md](./audit50quest.md) pour le détail précis, fonctionnalité par fonctionnalité.
 
 ## Structure du projet
 
 Workspace Cargo multi-crates :
 
-| Crate | Rôle | État |
-|---|---|---|
-| `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices (simples et composites), filtres | Fonctionnel sur un sous-ensemble réel (voir STATUS.md) |
-| `pdf-render` | Rasterisation CPU (`tiny-skia`) : chemins vectoriels, glyphes (TrueType/CFF intégrés et substitués système), images (JPEG + échantillons bruts, canal alpha `/SMask`), clip, rotation | Fonctionnel, comparé pixel par pixel à un corpus de référence |
-| `pdf-render-gpu` | Rasterisation GPU (`wgpu` + `lyon`) : parité fonctionnelle avec `pdf-render`, branché dans `pdf-ui` avec repli automatique sur le CPU | Fonctionnel |
-| `pdf-text` | Extraction de texte avec position par caractère, recherche, sélection | Fonctionnel |
-| `pdf-app` | État de session (ouverture, navigation, rendu, recherche, cache) partagé entre `pdf-ui` et les futurs fronts | Fonctionnel |
-| `pdf-cli` | Outil ligne de commande (`dump`, `render-info`, `render`, `text`) | Fonctionnel |
-| `pdf-ui` | Viewer (`egui`/`eframe`) avec chrome natif macOS : menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre ; navigation, zoom, recherche, miniatures, signets, défilement continu, sélection de texte | Fonctionnel, packagé en `.app`/`.dmg` (voir STATUS.md) |
-| `pdf-edit` | Annotations (`/Highlight`, `/FreeText`), remplissage de champs AcroForm, ajout/remplacement de texte (superposition), journal `EditOp` + undo/redo, sauvegarde incrémentale, manipulation de pages (insérer/supprimer/déplacer/pivoter, fusion/découpage de documents, insertion d'image, export optimisé) | Fonctionnel au niveau moteur (pas encore d'interface `pdf-ui`) |
+| Crate | Rôle |
+|---|---|
+| `pdf-core` | Moteur : lexer, objets COS, xref, arbre des pages, interpréteur de contenu, polices (simples et composites), filtres, déchiffrement `/Encrypt` |
+| `pdf-render` | Rasterisation CPU (`tiny-skia`) |
+| `pdf-render-gpu` | Rasterisation GPU (`wgpu` + `lyon`), parité fonctionnelle avec `pdf-render` |
+| `pdf-text` | Extraction de texte avec position par caractère, recherche, sélection |
+| `pdf-edit` | Annotations, remplissage de formulaires, édition de texte (superposition), manipulation de pages, undo/redo, sauvegarde incrémentale |
+| `pdf-app` | État de session partagé entre `pdf-ui` et les futurs fronts |
+| `pdf-ui` | Application graphique (`egui`/`eframe`) avec chrome natif macOS — c'est elle qui est packagée en `.app`/`.dmg` |
+| `pdf-cli` | Outil ligne de commande pour inspecter/manipuler un PDF sans interface graphique |
 
-## Essayer
+## Distribution & notarisation
 
-```bash
-cargo build
-cargo test --workspace
-
-# Inspecter la structure d'un PDF
-cargo run --bin pdf-cli -- dump chemin/vers/fichier.pdf
-
-# Voir ce que l'interpréteur de contenu a produit pour une page
-cargo run --bin pdf-cli -- render-info chemin/vers/fichier.pdf 0
-
-# Rasteriser une page en PNG
-cargo run --bin pdf-cli -- render chemin/vers/fichier.pdf sortie.png 0
-
-# Extraire le texte d'une page
-cargo run --bin pdf-cli -- text chemin/vers/fichier.pdf 0
-
-# Ajouter une annotation de surlignage et sauvegarder incrémentalement
-cargo run --bin pdf-cli -- highlight in.pdf out.pdf 0 100 600 300 630 1 1 0
-
-# Remplir un champ de formulaire AcroForm
-cargo run --bin pdf-cli -- fill-form in.pdf out.pdf nom_du_champ "valeur"
-
-# Manipuler des pages (insérer, supprimer, déplacer, pivoter, fusionner, découper, optimiser)
-cargo run --bin pdf-cli -- delete-page in.pdf out.pdf 2
-cargo run --bin pdf-cli -- merge base.pdf autre.pdf out.pdf
-cargo run --bin pdf-cli -- split in.pdf out.pdf 0 2 4
-
-# Ajouter du texte / remplacer un texte existant par superposition
-cargo run --bin pdf-cli -- add-text in.pdf out.pdf 0 50 50 250 80 14 Nouvelle note
-cargo run --bin pdf-cli -- replace-text in.pdf out.pdf 0 72 715 400 735 18 Titre remplace
-
-# Ouvrir le prototype de viewer graphique
-cargo run --bin pdf-ui -- chemin/vers/fichier.pdf
-```
-
-Fixtures de test disponibles dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)) : 25 PDF réels et structurellement variés (rotation, chiffrement RC4/AES-256, CJK avec polices composites, formulaires, corruptions diverses, JPEG RGB/CMYK, PDF/A-like...).
-
-## Tests de rendu (comparaison pixel)
-
-En plus des tests unitaires classiques, deux suites comparent le rendu à une image de référence sous seuil de tolérance :
+Le `.dmg` publié dans les [Releases](https://github.com/lberthod/macos-pdf-manager/releases) est produit ainsi :
 
 ```bash
-# Compare le rendu CPU (pdf-render) à une image de référence par fixture
-cargo test -p pdf-render --test golden
+# 1. Compiler et empaqueter en .app (cargo-bundle lit [package.metadata.bundle] dans pdf-ui/Cargo.toml)
+cargo bundle --release -p pdf-ui --format osx
 
-# Compare le rendu CPU et le rendu GPU entre eux, sur les mêmes fixtures
-cargo test -p pdf-render-gpu --test cross_backend
+# 2. Signer avec une identité Developer ID Application + hardened runtime
+#    (requis par la notarisation)
+codesign --force --deep --options runtime --timestamp \
+  --sign "Developer ID Application: <Nom> (<Team ID>)" \
+  "target/release/bundle/osx/PapyrusPDF.app"
+
+# 3. Soumettre à Apple pour notarisation et attendre le verdict
+ditto -c -k --keepParent "target/release/bundle/osx/PapyrusPDF.app" PapyrusPDF.zip
+xcrun notarytool submit PapyrusPDF.zip --keychain-profile "papyruspdf-notary" --wait
+
+# 4. Agrafer le ticket de notarisation à l'app
+xcrun stapler staple "target/release/bundle/osx/PapyrusPDF.app"
+
+# 5. Construire le .dmg (app + lien symbolique vers /Applications)
+mkdir -p /tmp/dmg_staging
+cp -R "target/release/bundle/osx/PapyrusPDF.app" /tmp/dmg_staging/
+ln -s /Applications /tmp/dmg_staging/Applications
+hdiutil create -volname "PapyrusPDF" -srcfolder /tmp/dmg_staging -ov -format UDZO PapyrusPDF.dmg
+
+# 6. Signer le .dmg lui-même (sinon Gatekeeper le rejette une fois téléchargé,
+#    même si l'app qu'il contient est signée), puis le notariser et l'agrafer à son tour
+codesign --force --timestamp --sign "Developer ID Application: <Nom> (<Team ID>)" PapyrusPDF.dmg
+xcrun notarytool submit PapyrusPDF.dmg --keychain-profile "papyruspdf-notary" --wait
+xcrun stapler staple PapyrusPDF.dmg
 ```
 
-Pour régénérer volontairement les images de référence après un changement de rendu voulu : `UPDATE_GOLDEN=1 cargo test -p pdf-render --test golden`.
+Point important découvert en le faisant : la notarisation du `.dmg` ne suffit pas si le `.dmg` lui-même n'est pas signé — Gatekeeper vérifie la signature du fichier réellement téléchargé (le conteneur `.dmg`), pas seulement celle de l'app qu'il contient. D'où l'étape 6, en plus de l'étape 2/3/4 sur l'`.app`.
+
+Les identifiants de notarisation (Apple ID, Team ID, mot de passe d'application) ne sont jamais committés : `xcrun notarytool store-credentials` les enregistre une fois dans le Trousseau macOS, référencés ensuite par un simple nom de profil (`--keychain-profile`).
+
+Vérification après coup :
+
+```bash
+spctl -a -vv --type execute PapyrusPDF.app   # doit répondre "accepted", source=Notarized Developer ID
+hdiutil verify PapyrusPDF.dmg                 # intégrité du disque image
+```
 
 ## Documentation
 
-- [architecture.md](./architecture.md) — document d'architecture cible complet : principes, découpage en couches du moteur PDF, choix techniques, modèle de données, risques.
-- [sprint.md](./sprint.md) — plan de sprints dérivé de la roadmap par phases, coché sprint par sprint avec le statut réel de chaque item.
+- [architecture.md](./architecture.md) — document d'architecture cible : principes, découpage en couches du moteur PDF, choix techniques, modèle de données, risques.
+- [sprint.md](./sprint.md) — plan de sprints, coché sprint par sprint avec le statut réel de chaque item.
 - [STATUS.md](./STATUS.md) — état précis du projet à date : ce qui marche, ce qui est simulé/placeholder, ce qui manque, avec pointeurs vers le code.
+- [audit50quest.md](./audit50quest.md) — audit ligne par ligne contre une grille de 50 fonctionnalités attendues d'un viewer/éditeur PDF, avec score de couverture.
+- [analyse_sprint.md](./analyse_sprint.md) — plan d'action dérivé de cet audit.
 - [docs/EXPLICATION.md](./docs/EXPLICATION.md) — explication détaillée du fonctionnement interne du moteur, couche par couche.
+
+## Développement
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets
+cargo fmt --check
+
+# Lancer le viewer directement (sans passer par le .dmg)
+cargo run -p pdf-ui -- chemin/vers/fichier.pdf
+
+# Outil en ligne de commande (dump, render, text, fill-form, merge, split, highlight...)
+cargo run --bin pdf-cli -- dump chemin/vers/fichier.pdf
+```
+
+Fixtures de test dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)) : 25 PDF réels et structurellement variés (rotation, chiffrement RC4/AES-256, CJK avec polices composites, formulaires, corruptions diverses, JPEG RGB/CMYK, PDF/A-like...).
+
+Deux suites comparent le rendu à une image de référence sous seuil de tolérance :
+
+```bash
+cargo test -p pdf-render --test golden          # CPU vs image de référence
+cargo test -p pdf-render-gpu --test cross_backend  # CPU vs GPU
+```
 
 ## Choix techniques clés
 
 - **Rust natif**, workspace Cargo.
 - Codecs génériques implémentés : `flate2` (Flate), `zune-jpeg` (DCTDecode/JPEG, RGB et CMYK), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison. Contours de glyphes via `ttf-parser` (TrueType et CFF/Type1C, polices simples et composites `/Type0`/CID). Rendu CPU via `tiny-skia`, rendu GPU via `wgpu`+`lyon` en parité fonctionnelle.
+- Déchiffrement `/Encrypt` via des primitives cryptographiques auditées (`md-5`, `sha2`, `aes`, `cbc`) plutôt que réimplémentées à la main, sauf RC4 (algorithme trivial, chiffrement obsolète, validé contre le vecteur de test RFC officiel).
 - Codecs pas encore implémentés : CCITT, JBIG2, JPX. Police pas encore supportée : Type1 historique (`/FontFile`, pré-CFF).
-- UI : prototype `egui`/`eframe` avec chrome natif macOS (`objc2`/`objc2-app-kit` : `NSMenu`, `NSApplication.appearance`).
-- Packaging : `cargo-bundle` produit un `.app` valide, empaqueté en `.dmg` via `hdiutil` — signature/notarisation Apple réelles pas encore faites (nécessitent un compte Apple Developer, non disponible dans cet environnement).
-
-## Statut
-
-Phases 0 à 3 (fondations, parsing, rendu CPU/GPU, UX viewer, chrome natif & packaging) fonctionnellement complètes : rendu vectoriel, texte (intégré + substitué système + composites CJK) et images (JPEG RGB/CMYK, `/SMask`) tous validés visuellement **et** par comparaison pixel automatisée ; back-end GPU en parité fonctionnelle avec le CPU ; viewer `pdf-ui` avec navigation, recherche, miniatures, signets, défilement continu, sélection de texte **et** chrome natif macOS (menus système, ouverture/export natifs, glisser-déposer, plein écran, mode sombre), packagé en `.app`/`.dmg`.
-
-Phases 4, 5 et 6a/6b (annotations & formulaires, manipulation de pages, édition de texte) ont un socle moteur fonctionnel : `pdf-edit` sait ajouter une annotation `/Highlight` ou `/FreeText`, remplir un champ de formulaire texte (avec régénération de l'apparence visible au rendu), ajouter du nouveau texte ou remplacer un texte existant par superposition (masquer l'ancien + redessiner, sans jamais toucher le flux de contenu original), proposer un vrai historique undo/redo, insérer/supprimer/déplacer/pivoter des pages, fusionner ou découper des documents (copie récursive de l'objet-graphe avec renumérotation), insérer une image JPEG comme page, et exporter une version optimisée (garbage collection par reconstruction) — le tout persisté par sauvegarde incrémentale (`pdf-core::writer` + `Document::save_incremental`) et vérifié bout en bout (sauvegarde, réouverture, rendu réel). L'édition chirurgicale du flux de contenu existant (6c) est volontairement hors périmètre, traitée comme un projet de recherche séparé.
-
-Un premier câblage `pdf-ui` de cette édition existe désormais : surligner la sélection de texte courante (bouton "🖍 Surligner"), annuler/rétablir (boutons **et** `⌘Z`/`⌘⇧Z` natifs), enregistrer en place (bouton "💾 Enregistrer" **et** `⌘S`, qui fait maintenant un vrai "Save" — "Exporter une copie…" est déplacé sur `⇧⌘S`). Le rendu reflète chaque édition immédiatement, avant même une sauvegarde. Le reste de l'interface d'édition (ajouter une annotation `/FreeText`, remplir un champ de formulaire au clic, manipuler des pages depuis `pdf-ui`) reste à câbler — voir [sprint.md](./sprint.md) Sprints 13-14, 15-16 et 17+.
-
-Voir [sprint.md](./sprint.md) pour le détail sprint par sprint et [STATUS.md](./STATUS.md) pour une vue d'ensemble synthétique et à jour.
+- UI : `egui`/`eframe` avec chrome natif macOS (`objc2`/`objc2-app-kit` : `NSMenu`, `NSApplication.appearance`), thread de rendu en arrière-plan dédié pour les miniatures/le défilement continu.
+- Packaging : `cargo-bundle` + `hdiutil`, signé (Developer ID Application, hardened runtime) et notarisé par Apple — voir [Distribution & notarisation](#distribution--notarisation).

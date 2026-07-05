@@ -1,5 +1,6 @@
 //! Modèle document (arbre logique) — architecture.md §4.4.
 
+use crate::crypt::Decryptor;
 use crate::error::{PdfError, Result};
 use crate::filters::decode_stream;
 use crate::object::{Dictionary, ObjRef, Object};
@@ -14,25 +15,54 @@ pub struct Document {
     xref: XrefTable,
     trailer: Dictionary,
     cache: RefCell<BTreeMap<u32, Object>>,
+    /// Contexte de déchiffrement (`/Encrypt`, Sprint 22, voir `crypt.rs`) —
+    /// `None` pour un document non chiffré. Suppose un mot de passe
+    /// utilisateur vide (voir la doc de module de `crypt`) ; un document
+    /// avec un vrai mot de passe reste illisible (contenu corrompu plutôt
+    /// qu'une erreur explicite, limitation connue et documentée).
+    decryption: Option<Decryptor>,
 }
 
 impl Document {
     pub fn open(data: Vec<u8>) -> Result<Self> {
         let (xref, trailer) = parse_xref_chain(&data)?;
-        // `/Encrypt` (RC4/AES, ISO 32000-1 §7.6) n'est pas implémenté : sans
-        // ce contrôle explicite, les flux/chaînes restent chiffrés et
-        // échouent plus loin avec des erreurs de bas niveau trompeuses
-        // (ex. "FlateDecode: corrupt deflate stream" au lieu de la vraie
-        // cause). Voir sprint.md Sprint 18+ (chiffrement).
-        if trailer.get("Encrypt").is_some() {
-            return Err(PdfError::Encrypted);
-        }
-        Ok(Self {
+        let mut doc = Self {
             data,
             xref,
             trailer,
             cache: RefCell::new(BTreeMap::new()),
-        })
+            decryption: None,
+        };
+
+        if let Some(encrypt_obj) = doc.trailer.get("Encrypt").cloned() {
+            // Résolu avant que `decryption` ne soit renseigné : correct,
+            // le dictionnaire `/Encrypt` lui-même n'est jamais chiffré.
+            let encrypt_dict = doc
+                .get(&encrypt_obj)?
+                .as_dict()
+                .cloned()
+                .ok_or(PdfError::UnexpectedType("Dictionary"))?;
+            let encrypt_obj_num = encrypt_obj.as_reference().map(|r| r.num);
+            let id0 = doc
+                .trailer
+                .get("ID")
+                .and_then(|o| o.as_array())
+                .and_then(|a| a.first())
+                .and_then(|o| match o {
+                    Object::String(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[]);
+            match Decryptor::new(&encrypt_dict, id0, encrypt_obj_num) {
+                Some(decryptor) => doc.decryption = Some(decryptor),
+                // Gestionnaire de sécurité non standard, ou révision non
+                // reconnue : on ne peut pas déchiffrer, message clair plutôt
+                // que des erreurs de bas niveau trompeuses plus loin.
+                None => return Err(PdfError::Encrypted),
+            }
+        }
+
+        Ok(doc)
     }
 
     pub fn object_count(&self) -> usize {
@@ -58,7 +88,7 @@ impl Document {
             .get(&r.num)
             .ok_or(PdfError::ObjectNotFound(r.num, r.gen))?;
 
-        let object = match entry {
+        let mut object = match entry {
             XrefEntry::Offset(offset) => {
                 let mut parser = Parser::with_pos(&self.data, offset);
                 let (_num, _gen, object) = parser.parse_indirect_object()?;
@@ -68,6 +98,17 @@ impl Document {
                 self.resolve_compressed(stream_num, index)?
             }
         };
+
+        // Déchiffrement (Sprint 22, `crypt.rs`) : seulement pour les objets à
+        // offset direct — un objet compressé dans un `/ObjStm` a déjà été
+        // déchiffré en tant que flux quand ce dernier a lui-même été résolu
+        // (voir `resolve_compressed`), il ne doit pas l'être une seconde
+        // fois. Le dictionnaire `/Encrypt` lui-même n'est jamais déchiffré.
+        if let Some(decryptor) = &self.decryption {
+            if matches!(entry, XrefEntry::Offset(_)) && Some(r.num) != decryptor.encrypt_obj_num() {
+                decryptor.decrypt_object(&mut object, r.num, r.gen);
+            }
+        }
 
         self.cache.borrow_mut().insert(r.num, object.clone());
         Ok(object)
@@ -221,6 +262,21 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concatène les glyphes résolus en Unicode d'une `DisplayList`, dans
+    /// l'ordre d'émission — même technique que `pdf-cli render-info`
+    /// ("Recovered text"), en local pour ne pas faire dépendre `pdf-core`
+    /// de `pdf-text` (qui dépend déjà de `pdf-core`, pas l'inverse).
+    fn recovered_text_for_test(display: &crate::display::DisplayList) -> String {
+        display
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::display::DisplayItem::Glyph { unicode, .. } => *unicode,
+                _ => None,
+            })
+            .collect()
+    }
 
     /// PDF minimal valide (une page vide) construit à la main pour les tests
     /// end-to-end. Offsets calculés pour correspondre à la xref ci-dessous.
@@ -386,28 +442,45 @@ mod tests {
     /// message de bas niveau trompeur comme une erreur `FlateDecode` sur du
     /// contenu resté chiffré.
     #[test]
-    fn rejects_encrypted_pdf_with_a_clear_error() {
+    fn opens_and_decrypts_an_aes128_encrypted_pdf_with_empty_user_password() {
+        // Malgré son nom (`pdf-core/tests/fixtures/README.md` documentait
+        // l'intention "RC4 40 bits", voir sa note de correction), ce fixture
+        // est en réalité chiffré `/V 4 /R 4` avec un filtre de chiffrement
+        // `/CFM /AESV2` (AES-128-CBC) — pikepdf choisit AES par défaut pour
+        // `R=4` sans `aes=False` explicite. Sert malgré tout de test de
+        // bout en bout pour la dérivation de clé Algorithme 2 (ISO 32000-1
+        // §7.6.3.3) + AES-128, avec mot de passe utilisateur vide.
         let bytes = include_bytes!("../tests/fixtures/encrypted_rc4.pdf").to_vec();
-        match Document::open(bytes) {
-            Err(PdfError::Encrypted) => {}
-            Err(other) => panic!("expected PdfError::Encrypted, got {other:?}"),
-            Ok(_) => panic!("expected an error, encrypted PDF opened successfully"),
-        }
+        let doc = Document::open(bytes).expect("should decrypt with the empty user password");
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display =
+            crate::interp::Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+        let text = recovered_text_for_test(&display);
+        assert_eq!(
+            text, "Encrypted PDF test - if you can read this, decryption worked",
+            "decrypted content stream must produce the original plaintext"
+        );
     }
 
-    /// Symétrique de `rejects_encrypted_pdf_with_a_clear_error` pour un
-    /// filtre de chiffrement différent (AES-256/R=6, `pikepdf.Encryption(...,
-    /// aes=True)`) plutôt que le seul RC4 40 bits déjà couvert : les deux
-    /// doivent échouer de la même façon claire, pas seulement le premier
-    /// chemin de code de déchiffrement rencontré.
+    /// Symétrique pour la révision 6 (AES-256, "hardened hash" ISO 32000-2
+    /// Annexe C) plutôt que la révision 4 (AES-128) déjà couverte : les deux
+    /// chemins de dérivation de clé (Algorithme 2 classique vs Algorithme
+    /// 2.A/2.B) doivent produire un déchiffrement correct, pas seulement le
+    /// premier rencontré.
     #[test]
-    fn rejects_aes256_encrypted_pdf_with_a_clear_error() {
+    fn opens_and_decrypts_an_aes256_r6_encrypted_pdf_with_empty_user_password() {
         let bytes = include_bytes!("../tests/fixtures/encrypted_aes256.pdf").to_vec();
-        match Document::open(bytes) {
-            Err(PdfError::Encrypted) => {}
-            Err(other) => panic!("expected PdfError::Encrypted, got {other:?}"),
-            Ok(_) => panic!("expected an error, encrypted PDF opened successfully"),
-        }
+        let doc = Document::open(bytes).expect("should decrypt with the empty user password");
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display =
+            crate::interp::Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+        let text = recovered_text_for_test(&display);
+        assert_eq!(
+            text, "AES-256 encrypted PDF test",
+            "decrypted content stream must produce the original plaintext"
+        );
     }
 
     /// Trois mises à jour incrémentales chaînées (`/Prev -> /Prev -> /Prev`),

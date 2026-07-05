@@ -11,11 +11,37 @@
 //! (pas de reconstruction de blocs/colonnes façon `pdftotext -layout`).
 
 use pdf_core::display::{DisplayItem, DisplayList};
+use unicode_normalization::UnicodeNormalization;
 
 /// Fraction de la hauteur de police au-delà de laquelle un déplacement
 /// vertical de la ligne de base est interprété comme un changement de ligne
 /// plutôt qu'un exposant/indice ou du crénage fin.
 const LINE_BREAK_THRESHOLD: f64 = 0.5;
+
+/// Replie un caractère pour une comparaison de recherche insensible à la
+/// casse **et** aux accents : décomposition canonique (NFD, ex. 'é' ->
+/// 'e'+U+0301) puis on ne garde que le premier caractère produit (le
+/// caractère de base, les marques diacritiques qui suivraient sont
+/// abandonnées) avant de le mettre en minuscule. Suffisant pour les
+/// diacritiques latins précomposés courants (é/à/ç/ü/ñ...) sans dépendre
+/// d'une table de catégories Unicode complète — repli caractère par
+/// caractère comme le reste de ce module (voir `find_matches`), donc pas
+/// correct pour les scripts non latins à casse multi-caractères.
+fn fold_char_for_search(c: char) -> char {
+    c.nfd().next().unwrap_or(c).to_ascii_lowercase()
+}
+
+/// Normalise une chaîne entière avec `fold_char_for_search`, caractère par
+/// caractère (pas de recomposition) — utilisé pour une comparaison "insensible
+/// à la casse et aux accents" en dehors du chemin `PageText::find_matches`
+/// (qui a besoin de garder l'alignement 1:1 avec `rects`).
+pub fn normalize_for_search(s: &str) -> String {
+    s.chars().map(fold_char_for_search).collect()
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
 
 /// Rectangle englobant d'un glyphe (ou d'une occurrence de recherche, voir
 /// `PageText::find_matches`), en espace page PDF (origine bas-gauche, comme
@@ -88,6 +114,51 @@ impl PageText {
             .collect()
     }
 
+    /// Étend `index` en avant/arrière tant que les caractères sont
+    /// alphanumériques (ou `_`), pour sélectionner le "mot" contenant
+    /// `index` — double-clic dans `pdf-ui`. Un `index` hors bornes ou sur un
+    /// caractère non alphanumérique (espace, ponctuation) renvoie une plage
+    /// d'un seul caractère plutôt que de paniquer.
+    pub fn word_range_at(&self, index: usize) -> std::ops::Range<usize> {
+        let chars: Vec<char> = self.text.chars().collect();
+        if index >= chars.len() {
+            return index..index;
+        }
+        if !is_word_char(chars[index]) {
+            return index..index + 1;
+        }
+        let mut start = index;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        start..end
+    }
+
+    /// Étend `index` en avant/arrière jusqu'à un saut de ligne (ou les bornes
+    /// du texte), pour sélectionner la "ligne" contenant `index` —
+    /// triple-clic dans `pdf-ui`. `index` est ramené dans les bornes plutôt
+    /// que de paniquer si la page est vide ou l'index hors plage.
+    pub fn line_range_at(&self, index: usize) -> std::ops::Range<usize> {
+        let chars: Vec<char> = self.text.chars().collect();
+        if chars.is_empty() {
+            return 0..0;
+        }
+        let index = index.min(chars.len() - 1);
+        let mut start = index;
+        while start > 0 && chars[start - 1] != '\n' {
+            start -= 1;
+        }
+        let mut end = index;
+        while end < chars.len() && chars[end] != '\n' {
+            end += 1;
+        }
+        start..end
+    }
+
     /// Rectangles (un par caractère positionné, non fusionnés — contrairement
     /// à `find_matches` — pour rester corrects même si la plage traverse
     /// plusieurs lignes) de `range`.
@@ -105,17 +176,19 @@ impl PageText {
 
     /// Rectangles englobants (un par occurrence, fusion des rectangles de
     /// chaque caractère de l'occurrence) de `query` dans le texte de la
-    /// page, comparaison insensible à la casse. La casse est repliée
-    /// caractère par caractère via `to_ascii_lowercase` : les scripts non
-    /// latins avec des règles de casse multi-caractères ne sont pas gérés
-    /// correctement (limitation connue, acceptable pour un premier
-    /// surlignage — voir STATUS.md).
+    /// page, comparaison insensible à la casse **et aux accents**
+    /// (`fold_char_for_search`, repliement caractère par caractère — un
+    /// caractère replié pour un caractère du texte original, l'alignement
+    /// avec `rects` est donc préservé). Les scripts non latins avec des
+    /// règles de casse multi-caractères ne sont pas gérés correctement
+    /// (limitation connue, acceptable pour un premier surlignage — voir
+    /// STATUS.md).
     pub fn find_matches(&self, query: &str) -> Vec<GlyphRect> {
         if query.is_empty() {
             return Vec::new();
         }
-        let haystack: Vec<char> = self.text.chars().map(|c| c.to_ascii_lowercase()).collect();
-        let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let haystack: Vec<char> = self.text.chars().map(fold_char_for_search).collect();
+        let needle: Vec<char> = query.chars().map(fold_char_for_search).collect();
         if needle.len() > haystack.len() {
             return Vec::new();
         }
@@ -340,6 +413,58 @@ mod tests {
         assert_eq!(page_text.text(), "A\nB");
         let matches = page_text.find_matches("a\nb");
         assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn find_matches_ignores_accents() {
+        // "Etudie" doit retrouver "Étudié" (accents précomposés) : le
+        // repliement caractère par caractère décompose (NFD) puis ne garde
+        // que le caractère de base.
+        let display = DisplayList {
+            items: vec![
+                glyph_at('É', 0.0, 700.0, 12.0),
+                glyph_at('t', 8.0, 700.0, 12.0),
+                glyph_at('é', 16.0, 700.0, 12.0),
+            ],
+        };
+        let page_text = extract_page_text(&display);
+        assert_eq!(page_text.find_matches("ete").len(), 1);
+        assert_eq!(page_text.find_matches("ÉTé").len(), 1);
+    }
+
+    #[test]
+    fn word_range_at_expands_to_word_boundaries() {
+        let display = DisplayList {
+            items: vec![
+                glyph_at('H', 0.0, 700.0, 12.0),
+                glyph_at('i', 8.0, 700.0, 12.0),
+                glyph_at(' ', 16.0, 700.0, 12.0),
+                glyph_at('y', 24.0, 700.0, 12.0),
+                glyph_at('o', 32.0, 700.0, 12.0),
+                glyph_at('u', 40.0, 700.0, 12.0),
+            ],
+        };
+        let page_text = extract_page_text(&display);
+        assert_eq!(page_text.word_range_at(0), 0..2); // "Hi"
+        assert_eq!(page_text.word_range_at(1), 0..2); // "Hi" depuis le 'i'
+        assert_eq!(page_text.word_range_at(2), 2..3); // l'espace lui-même
+        assert_eq!(page_text.word_range_at(4), 3..6); // "you"
+    }
+
+    #[test]
+    fn line_range_at_expands_to_newlines() {
+        let display = DisplayList {
+            items: vec![
+                glyph_at('A', 0.0, 700.0, 12.0),
+                glyph_at('B', 0.0, 680.0, 12.0), // nouvelle ligne
+                glyph_at('C', 8.0, 680.0, 12.0),
+            ],
+        };
+        let page_text = extract_page_text(&display);
+        assert_eq!(page_text.text(), "A\nBC");
+        assert_eq!(page_text.line_range_at(0), 0..1); // "A"
+        assert_eq!(page_text.line_range_at(2), 2..4); // "BC"
+        assert_eq!(page_text.line_range_at(3), 2..4); // "BC" depuis 'C'
     }
 
     #[test]

@@ -333,7 +333,7 @@ fn append_cached_glyph(
     out.indices.extend(indices.iter().map(|i| i + base));
 }
 
-fn to_rgba(color: Color) -> [f32; 4] {
+fn to_rgba(color: Color, alpha: f64) -> [f32; 4] {
     let (r, g, b) = match color {
         Color::Gray(g) => (g, g, g),
         Color::Rgb(r, g, b) => (r, g, b),
@@ -347,7 +347,7 @@ fn to_rgba(color: Color) -> [f32; 4] {
         r.clamp(0.0, 1.0) as f32,
         g.clamp(0.0, 1.0) as f32,
         b.clamp(0.0, 1.0) as f32,
-        1.0,
+        alpha.clamp(0.0, 1.0) as f32,
     ]
 }
 
@@ -510,12 +510,18 @@ struct Group {
 /// correct dans tous les cas, simplement pas optimal si la même pile
 /// alterne souvent avec une autre (non observé en pratique, le clip PDF
 /// change rarement item par item).
-fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
+fn group_items(display: &DisplayList, mapper: &PageToNdc, device_scale: f64) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     let mut current_key: Option<Option<*const Vec<pdf_core::display::ClipPath>>> = None;
     let mut fill_tessellator = FillTessellator::new();
     let mut stroke_tessellator = StrokeTessellator::new();
     let mut glyph_cache: GlyphCache = GlyphCache::new();
+
+    // Chemins de page (`Path`/`ClipPath`) : segments en espace page (points
+    // PDF). Une tolérance lyon par défaut (0.1) est en unités de cet espace,
+    // donc grossière une fois mise à l'échelle device — vise ~1/4 de pixel
+    // device plutôt qu'une fraction fixe de point.
+    let path_tolerance = (0.25 / device_scale.max(0.01)).clamp(0.001, 0.25) as f32;
 
     let clip_key = |clip: &Option<ClipStack>| clip.as_ref().map(Rc::as_ptr);
 
@@ -536,7 +542,7 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                         .filter_map(|clip_path| {
                             let path = build_lyon_path(&clip_path.segments)?;
                             let mut geometry: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-                            let options = FillOptions::default()
+                            let options = FillOptions::tolerance(path_tolerance)
                                 .with_fill_rule(to_lyon_fill_rule(clip_path.fill_rule));
                             let _ = fill_tessellator.tessellate_path(
                                 &path,
@@ -579,6 +585,8 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                 fill_rule,
                 fill_color,
                 stroke_color,
+                fill_alpha,
+                stroke_alpha,
                 line_width,
                 ..
             } => {
@@ -586,15 +594,15 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                     continue;
                 };
                 if matches!(paint, PaintOp::Fill | PaintOp::FillStroke) {
-                    let options =
-                        FillOptions::default().with_fill_rule(to_lyon_fill_rule(*fill_rule));
+                    let options = FillOptions::tolerance(path_tolerance)
+                        .with_fill_rule(to_lyon_fill_rule(*fill_rule));
                     let _ = fill_tessellator.tessellate_path(
                         &path,
                         &options,
                         &mut BuffersBuilder::new(
                             pending,
                             WithColor {
-                                color: to_rgba(*fill_color),
+                                color: to_rgba(*fill_color, *fill_alpha),
                                 mapper: *mapper,
                             },
                         ),
@@ -609,7 +617,7 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                         &mut BuffersBuilder::new(
                             pending,
                             WithColor {
-                                color: to_rgba(*stroke_color),
+                                color: to_rgba(*stroke_color, *stroke_alpha),
                                 mapper: *mapper,
                             },
                         ),
@@ -629,7 +637,16 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                     let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
                     let _ = fill_tessellator.tessellate_path(
                         &path,
-                        &FillOptions::default(), // nonzero, correct pour des glyphes.
+                        // Contours normalisés en espace em 0..1 (voir
+                        // `OutlineCollector`/`units_per_em` dans
+                        // `pdf-core/src/font.rs`) : la tolérance par défaut
+                        // (0.1) y vaut 10% de la hauteur d'un caractère,
+                        // aplatissant les Béziers en quelques segments
+                        // (lettres visiblement polygonales). Le cache glyphe
+                        // étant indépendant de la taille d'affichage, une
+                        // tolérance fixe et conservatrice reste invisible
+                        // même à fort zoom.
+                        &FillOptions::tolerance(0.0005).with_fill_rule(LyonFillRule::NonZero),
                         &mut BuffersBuilder::new(&mut geometry, RawPosition),
                     );
                     if geometry.indices.is_empty() {
@@ -639,7 +656,7 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc) -> Vec<Group> {
                     }
                 });
                 if let Some(geometry) = cached.as_ref() {
-                    append_cached_glyph(geometry, transform, to_rgba(*color), mapper, pending);
+                    append_cached_glyph(geometry, transform, to_rgba(*color, 1.0), mapper, pending);
                 }
             }
             DisplayItem::Glyph { outline: None, .. } => {}
@@ -707,20 +724,32 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Option<RenderedPage> {
+        let width_pts = (media_box[2] - media_box[0]).max(1e-6);
         let mapper = PageToNdc {
             origin_x: media_box[0],
             origin_y: media_box[1],
-            width_pts: (media_box[2] - media_box[0]).max(1e-6),
+            width_pts,
             height_pts: (media_box[3] - media_box[1]).max(1e-6),
             rotate,
         };
+        let device_scale = width as f64 / width_pts;
 
-        let groups = group_items(display, &mapper);
+        let groups = group_items(display, &mapper, device_scale);
         self.rasterize(&groups, width, height)
     }
 
     fn rasterize(&self, groups: &[Group], width: u32, height: u32) -> Option<RenderedPage> {
         use wgpu::util::DeviceExt;
+
+        // Nombre d'échantillons MSAA : sans lui, les triangles lyon (bords
+        // durs, contrairement à l'AA analytique de tiny-skia côté CPU) sont
+        // rastérisés avec des arêtes en escalier. `texture` reste
+        // mono-échantillon (c'est elle qu'on relit en sortie via
+        // `copy_texture_to_buffer`, une texture multi-échantillonnée ne le
+        // permettant pas) ; `msaa_texture` est la cible réelle des passes de
+        // rendu, résolue (`resolve_target`) dans `texture` à la fin de
+        // chaque passe.
+        const SAMPLE_COUNT: u32 = 4;
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pdf-render-gpu-target"),
@@ -738,11 +767,29 @@ impl GpuContext {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pdf-render-gpu-target-msaa"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         // Stencil dédié au clip (voir la doc de module) : recréé pour
         // chaque appel comme le reste de ce contexte headless, remis à zéro
         // (`LoadOp::Clear`) à chaque frontière de groupe plutôt qu'une seule
         // fois, pour ne jamais mélanger l'accumulation d'intersection de
-        // deux piles de clip différentes.
+        // deux piles de clip différentes. Même nombre d'échantillons que
+        // `msaa_texture` : requis par wgpu pour un attachement stencil
+        // combiné à un attachement couleur multi-échantillonné.
         let stencil = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pdf-render-gpu-stencil"),
             size: wgpu::Extent3d {
@@ -751,7 +798,7 @@ impl GpuContext {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: SAMPLE_COUNT,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Stencil8,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -938,7 +985,10 @@ impl GpuContext {
                         }),
                         primitive: wgpu::PrimitiveState::default(),
                         depth_stencil: Some(depth_stencil),
-                        multisample: wgpu::MultisampleState::default(),
+                        multisample: wgpu::MultisampleState {
+                            count: SAMPLE_COUNT,
+                            ..Default::default()
+                        },
                         multiview: None,
                         cache: None,
                     })
@@ -982,7 +1032,10 @@ impl GpuContext {
                     }),
                     primitive: wgpu::PrimitiveState::default(),
                     depth_stencil: Some(depth_stencil),
-                    multisample: wgpu::MultisampleState::default(),
+                    multisample: wgpu::MultisampleState {
+                        count: SAMPLE_COUNT,
+                        ..Default::default()
+                    },
                     multiview: None,
                     cache: None,
                 })
@@ -1017,8 +1070,8 @@ impl GpuContext {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pdf-render-gpu-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         load: color_load,
                         store: wgpu::StoreOp::Store,
@@ -1259,6 +1312,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: fill,
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip: None,
@@ -1339,6 +1394,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: Color::Gray(0.0),
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip: None,
@@ -1468,6 +1525,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: Color::Gray(0.0),
                 stroke_color: Color::Rgb(0.0, 0.0, 1.0),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 4.0,
                 sets_clip: false,
                 clip: None,
@@ -1538,6 +1597,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: Color::Gray(0.0),
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip: None,
@@ -1681,6 +1742,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: Color::Gray(0.0),
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip,
@@ -1745,6 +1808,8 @@ mod tests {
             fill_rule: FillRule::NonZero,
             fill_color: Color::Gray(0.0),
             stroke_color: Color::default(),
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
             line_width: 1.0,
             sets_clip: false,
             clip,

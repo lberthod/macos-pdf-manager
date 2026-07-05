@@ -120,6 +120,12 @@ pub enum DisplayItem {
         fill_color: Color,
         stroke_color: Color,
         line_width: f64,
+        /// Alpha non-traçant (`ca` d'un `ExtGState`, ISO 32000-1 §8.4.5),
+        /// 1.0 = opaque. Seul `/ca`/`/CA` sont gérés (voir `interp::gs`) ;
+        /// pas de groupes de transparence ni de modes de fusion.
+        fill_alpha: f64,
+        /// Alpha traçant (`CA` d'un `ExtGState`) — voir `fill_alpha`.
+        stroke_alpha: f64,
         /// Le chemin délimite aussi la zone de clip courante (opérateur
         /// `W`/`W*`) — n'affecte que les items *suivants* (voir `clip`),
         /// pas ce chemin lui-même (sémantique PDF : le nouveau clip prend

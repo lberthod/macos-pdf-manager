@@ -5,9 +5,12 @@
 //! assertion "ça n'a pas planté". Voir `tests/support/mod.rs` pour le
 //! mécanisme de diff/seuil et `tests/golden/` pour les images de référence.
 //!
-//! `encrypted_rc4.pdf` n'est pas couvert ici : `Document::open` doit y
-//! échouer par construction (voir les tests dédiés dans `pdf-core`), il n'y
-//! a donc rien à rendre.
+//! `encrypted_rc4.pdf`/`encrypted_aes256.pdf` **sont** couverts depuis le
+//! Sprint 22 (déchiffrement `/Encrypt`, mot de passe utilisateur vide —
+//! voir `pdf-core::crypt`) : ils s'ouvrent et se rendent normalement,
+//! preuve par le rendu (pas seulement par le texte recomposé, déjà vérifié
+//! dans les tests dédiés de `pdf-core::document`) que le contenu déchiffré
+//! est bien exploitable de bout en bout.
 
 mod support;
 
@@ -56,3 +59,5 @@ golden_test!(golden_malformed_wrong_length, "malformed_wrong_length.pdf");
 golden_test!(golden_indexed_color_image, "indexed_color_image.pdf");
 golden_test!(golden_scanned_page_like, "scanned_page_like.pdf");
 golden_test!(golden_pdfa_like_minimal, "pdfa_like_minimal.pdf");
+golden_test!(golden_encrypted_rc4, "encrypted_rc4.pdf");
+golden_test!(golden_encrypted_aes256, "encrypted_aes256.pdf");

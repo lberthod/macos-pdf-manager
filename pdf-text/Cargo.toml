@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 pdf-core = { workspace = true }
+unicode-normalization = "0.1"

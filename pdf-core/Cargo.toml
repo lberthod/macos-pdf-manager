@@ -9,5 +9,14 @@ flate2 = "1"
 thiserror = "1"
 ttf-parser = "0.24"
 zune-jpeg = "0.5"
+# Sprint 22 (#50, audit50quest.md) : déchiffrement `/Encrypt` (ISO 32000-1
+# §7.6 / ISO 32000-2 §7.6.4) — primitives cryptographiques auditées plutôt
+# que réimplémentées à la main (RC4/MD5/AES/SHA-2 sont des briques
+# standard, pas la valeur ajoutée d'un moteur PDF "from scratch" — voir
+# `zune-jpeg` déjà utilisé pour le même raisonnement côté JPEG).
+md-5 = "0.10"
+sha2 = "0.10"
+aes = "0.8"
+cbc = "0.1"
 
 [dev-dependencies]

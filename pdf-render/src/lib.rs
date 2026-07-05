@@ -148,6 +148,8 @@ fn render_to_pixmap(
             fill_rule,
             fill_color,
             stroke_color,
+            fill_alpha,
+            stroke_alpha,
             line_width,
             clip,
             ..
@@ -160,7 +162,7 @@ fn render_to_pixmap(
 
             if matches!(paint, PaintOp::Fill | PaintOp::FillStroke) {
                 let mut paint_fill = Paint::default();
-                paint_fill.set_color(to_skia_color(*fill_color));
+                paint_fill.set_color(to_skia_color(*fill_color, *fill_alpha));
                 paint_fill.anti_alias = true;
                 let rule = match fill_rule {
                     FillRule::NonZero => SkiaFillRule::Winding,
@@ -177,7 +179,7 @@ fn render_to_pixmap(
 
             if matches!(paint, PaintOp::Stroke | PaintOp::FillStroke) {
                 let mut paint_stroke = Paint::default();
-                paint_stroke.set_color(to_skia_color(*stroke_color));
+                paint_stroke.set_color(to_skia_color(*stroke_color, *stroke_alpha));
                 paint_stroke.anti_alias = true;
                 let stroke = Stroke {
                     width: ((*line_width).max(0.1) * scale) as f32,
@@ -204,7 +206,7 @@ fn render_to_pixmap(
             };
             let mask = mask_for(clip);
             let mut paint_fill = Paint::default();
-            paint_fill.set_color(to_skia_color(*color));
+            paint_fill.set_color(to_skia_color(*color, 1.0));
             paint_fill.anti_alias = true;
             pixmap.fill_path(
                 &path,
@@ -416,7 +418,7 @@ fn build_glyph_path(segments: &[PathSegment], transform: &Matrix, device: &Matri
     pb.finish()
 }
 
-fn to_skia_color(color: Color) -> SkiaColor {
+fn to_skia_color(color: Color, alpha: f64) -> SkiaColor {
     let (r, g, b) = match color {
         Color::Gray(g) => (g, g, g),
         Color::Rgb(r, g, b) => (r, g, b),
@@ -430,7 +432,7 @@ fn to_skia_color(color: Color) -> SkiaColor {
         r.clamp(0.0, 1.0) as f32,
         g.clamp(0.0, 1.0) as f32,
         b.clamp(0.0, 1.0) as f32,
-        1.0,
+        alpha.clamp(0.0, 1.0) as f32,
     )
     .unwrap_or(SkiaColor::BLACK)
 }
@@ -459,6 +461,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: fill,
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip: None,
@@ -593,6 +597,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: Color::Gray(0.0),
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip,
@@ -816,6 +822,8 @@ mod tests {
                 fill_rule: FillRule::NonZero,
                 fill_color: Color::Gray(0.0),
                 stroke_color: Color::default(),
+                fill_alpha: 1.0,
+                stroke_alpha: 1.0,
                 line_width: 1.0,
                 sets_clip: false,
                 clip: None,

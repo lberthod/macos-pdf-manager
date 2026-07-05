@@ -8,6 +8,7 @@
 //! interpréteur de flux de contenu, rendu, polices, édition.
 
 pub mod content;
+pub mod crypt;
 pub mod display;
 pub mod document;
 pub mod encoding;

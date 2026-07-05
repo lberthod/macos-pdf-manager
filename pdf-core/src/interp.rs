@@ -34,6 +34,8 @@ struct GraphicsState {
     ctm: Matrix,
     fill_color: Color,
     stroke_color: Color,
+    fill_alpha: f64,
+    stroke_alpha: f64,
     line_width: f64,
     char_spacing: f64,
     word_spacing: f64,
@@ -54,6 +56,8 @@ impl Default for GraphicsState {
             ctm: Matrix::IDENTITY,
             fill_color: Color::default(),
             stroke_color: Color::default(),
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
             line_width: 1.0,
             char_spacing: 0.0,
             word_spacing: 0.0,
@@ -574,6 +578,8 @@ impl<'a> Interpreter<'a> {
                 fill_rule,
                 fill_color: self.gs.fill_color,
                 stroke_color: self.gs.stroke_color,
+                fill_alpha: self.gs.fill_alpha,
+                stroke_alpha: self.gs.stroke_alpha,
                 line_width: self.gs.line_width,
                 sets_clip,
                 clip: clip_before,
@@ -701,9 +707,20 @@ impl<'a> Interpreter<'a> {
         let Some(ext_gstate) = self.lookup_resource("ExtGState", name)? else {
             return Ok(());
         };
+        let as_f64 = |o: &Object| match o {
+            Object::Integer(n) => Some(*n as f64),
+            Object::Real(f) => Some(*f),
+            _ => None,
+        };
         if let Some(dict) = ext_gstate.as_dict() {
             if let Some(lw) = dict.get("LW").and_then(|o| o.as_int()) {
                 self.gs.line_width = lw as f64;
+            }
+            if let Some(ca) = dict.get("ca").and_then(as_f64) {
+                self.gs.fill_alpha = ca.clamp(0.0, 1.0);
+            }
+            if let Some(ca_stroke) = dict.get("CA").and_then(as_f64) {
+                self.gs.stroke_alpha = ca_stroke.clamp(0.0, 1.0);
             }
         }
         Ok(())

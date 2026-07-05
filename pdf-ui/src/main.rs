@@ -79,10 +79,20 @@ struct ViewerApp {
     session: Option<Session>,
     zoom: f32,
     texture: Option<egui::TextureHandle>,
-    /// (page affichée, zoom affiché) par la texture courante — sert à
-    /// détecter qu'un nouveau rendu est nécessaire sans re-rasteriser à
-    /// chaque frame.
-    texture_state: Option<(usize, u32)>,
+    /// (page affichée, zoom affiché, densité de pixels affichée) par la
+    /// texture courante — sert à détecter qu'un nouveau rendu est
+    /// nécessaire sans re-rasteriser à chaque frame. La densité
+    /// (`ctx.pixels_per_point()`) fait partie de la clé : sans elle, une
+    /// page déjà rendue à 1x resterait floue si la fenêtre passe sur un
+    /// écran Retina (2x) sans que rien d'autre n'ait changé.
+    texture_state: Option<(usize, u32, u32)>,
+    /// Taille d'affichage (points logiques `egui`, PAS pixels de texture)
+    /// de `texture` — nécessaire parce que la texture est désormais rendue
+    /// à `zoom * pixels_per_point` pixels physiques pour rester nette sur
+    /// écran Retina ; sans forcer explicitement la taille d'affichage,
+    /// `egui::Image` afficherait la texture à sa taille en pixels
+    /// interprétée comme des points, deux fois trop grande sur un écran 2x.
+    texture_logical_size: Option<egui::Vec2>,
     error: Option<String>,
     search_query: String,
     /// Index des pages (0-based) contenant `search_query`, dans l'ordre du
@@ -104,9 +114,10 @@ struct ViewerApp {
     continuous_scroll: bool,
     /// Textures du mode défilement continu, indépendantes de `texture`
     /// (mode page unique) : une par page déjà rastérisée à l'échelle
-    /// courante. Vidées quand le zoom change (voir `page_textures_zoom_key`).
+    /// courante. Vidées quand le zoom ou la densité de pixels de l'écran
+    /// change (voir `page_textures_zoom_key`).
     page_textures: HashMap<usize, egui::TextureHandle>,
-    page_textures_zoom_key: Option<u32>,
+    page_textures_zoom_key: Option<(u32, u32)>,
     /// Page à faire défiler jusqu'à l'écran au prochain rendu du mode
     /// continu (navigation depuis la recherche/miniatures/signets/boutons) ;
     /// consommé (mis à `None`) une fois appliqué pour ne pas entraver le
@@ -144,6 +155,7 @@ impl ViewerApp {
             zoom: 1.0,
             texture: None,
             texture_state: None,
+            texture_logical_size: None,
             error: None,
             search_query: String::new(),
             search_results: None,
@@ -174,6 +186,7 @@ impl ViewerApp {
         self.error = None;
         self.texture = None;
         self.texture_state = None;
+        self.texture_logical_size = None;
         self.search_results = None;
         self.search_cursor = 0;
         self.highlighted_query.clear();
@@ -312,6 +325,7 @@ impl ViewerApp {
     /// insérée/supprimée avant la page courante).
     fn invalidate_after_edit(&mut self) {
         self.texture_state = None;
+        self.texture_logical_size = None;
         self.thumbnails.clear();
         self.page_textures.clear();
         self.highlight_state = None;
@@ -379,18 +393,34 @@ impl ViewerApp {
         // cause du bruit en virgule flottante des sliders.
         let zoom_key = (self.zoom * 1000.0).round() as u32;
         let page_index = session.page_index();
-        if self.texture_state == Some((page_index, zoom_key)) {
+        // Densité de pixels de l'écran courant (2.0 sur Retina, 1.0 sinon) :
+        // sans elle, la page serait rastérisée à 1 pixel bitmap par point
+        // `egui` puis agrandie par le sampler de texture pour remplir les 2
+        // pixels physiques par point d'un écran Retina — d'où un rendu
+        // flou, en particulier visible sur du texte en gras à petite taille.
+        let pixel_ratio = ctx.pixels_per_point();
+        let pixel_ratio_key = (pixel_ratio * 1000.0).round() as u32;
+        if self.texture_state == Some((page_index, zoom_key, pixel_ratio_key)) {
             return; // déjà à jour.
         }
 
-        match session.render_current_page(self.zoom as f64) {
+        match session.render_current_page(self.zoom as f64 * pixel_ratio as f64) {
             Ok(rendered) => {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [rendered.width as usize, rendered.height as usize],
                     &rendered.rgba,
                 );
                 self.texture = Some(ctx.load_texture("page", image, egui::TextureOptions::LINEAR));
-                self.texture_state = Some((page_index, zoom_key));
+                // Taille d'affichage en points logiques : la texture a été
+                // rendue `pixel_ratio` fois plus grande que ça exprès (voir
+                // ci-dessus), donc on divise pour revenir à la taille voulue
+                // à l'écran plutôt que de laisser `egui::Image` utiliser la
+                // taille de texture telle quelle.
+                self.texture_logical_size = Some(egui::vec2(
+                    rendered.width as f32 / pixel_ratio,
+                    rendered.height as f32 / pixel_ratio,
+                ));
+                self.texture_state = Some((page_index, zoom_key, pixel_ratio_key));
                 self.error = None;
             }
             Err(e) => {
@@ -426,26 +456,35 @@ impl ViewerApp {
     }
 
     /// Charge (et met en cache) la texture de la miniature de `index`, si ce
-    /// n'est pas déjà fait.
-    fn ensure_thumbnail(&mut self, index: usize, ctx: &egui::Context) {
-        if self.thumbnails.contains_key(&index) {
-            return;
+    /// n'est pas déjà fait. Rendue à `THUMBNAIL_SCALE * pixels_per_point`
+    /// pour rester nette sur écran Retina (voir `ensure_texture`) ; la
+    /// taille d'affichage logique est renvoyée pour que l'appelant
+    /// (`show_thumbnail_panel`) l'utilise avec `fit_to_exact_size`.
+    fn ensure_thumbnail(&mut self, index: usize, ctx: &egui::Context) -> Option<egui::Vec2> {
+        let pixel_ratio = ctx.pixels_per_point();
+        if let Some(texture) = self.thumbnails.get(&index) {
+            let [w, h] = texture.size();
+            return Some(egui::vec2(w as f32 / pixel_ratio, h as f32 / pixel_ratio));
         }
-        let Some(session) = &self.session else {
-            return;
-        };
-        if let Ok(rendered) = session.render_page(index, THUMBNAIL_SCALE) {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [rendered.width as usize, rendered.height as usize],
-                &rendered.rgba,
-            );
-            let texture = ctx.load_texture(
-                format!("thumb-{index}"),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.thumbnails.insert(index, texture);
-        }
+        let session = self.session.as_ref()?;
+        let rendered = session
+            .render_page(index, THUMBNAIL_SCALE * pixel_ratio as f64)
+            .ok()?;
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [rendered.width as usize, rendered.height as usize],
+            &rendered.rgba,
+        );
+        let logical_size = egui::vec2(
+            rendered.width as f32 / pixel_ratio,
+            rendered.height as f32 / pixel_ratio,
+        );
+        let texture = ctx.load_texture(
+            format!("thumb-{index}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.thumbnails.insert(index, texture);
+        Some(logical_size)
     }
 
     /// Dessine le panneau de miniatures et retourne l'index de page cliqué,
@@ -462,13 +501,16 @@ impl ViewerApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for index in 0..page_count {
-                        self.ensure_thumbnail(index, ctx);
+                        let Some(logical_size) = self.ensure_thumbnail(index, ctx) else {
+                            continue;
+                        };
                         let Some(texture) = self.thumbnails.get(&index) else {
                             continue;
                         };
                         ui.vertical_centered(|ui| {
+                            let image = egui::Image::new(texture).fit_to_exact_size(logical_size);
                             let response =
-                                ui.add(egui::ImageButton::new(texture).selected(index == current));
+                                ui.add(egui::ImageButton::new(image).selected(index == current));
                             if response.clicked() {
                                 clicked = Some(index);
                             }
@@ -604,10 +646,15 @@ impl ViewerApp {
     /// visible sont rastérisées/chargées en texture, ce qui reste praticable
     /// sur un document de plusieurs centaines de pages.
     fn show_continuous_scroll(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Densité de pixels de l'écran (voir `ensure_texture` pour le même
+        // souci en mode page unique) : sans elle, les pages du défilement
+        // continu seraient floues sur un écran Retina.
+        let pixel_ratio = ctx.pixels_per_point();
         let zoom_key = (self.zoom * 1000.0).round() as u32;
-        if self.page_textures_zoom_key != Some(zoom_key) {
+        let pixel_ratio_key = (pixel_ratio * 1000.0).round() as u32;
+        if self.page_textures_zoom_key != Some((zoom_key, pixel_ratio_key)) {
             self.page_textures.clear();
-            self.page_textures_zoom_key = Some(zoom_key);
+            self.page_textures_zoom_key = Some((zoom_key, pixel_ratio_key));
         }
 
         let zoom = self.zoom as f64;
@@ -623,7 +670,11 @@ impl ViewerApp {
         let Ok(media_box) = session.page_media_box(0) else {
             return;
         };
-        let row_height = ((media_box[3] - media_box[1]) * zoom) as f32 + 8.0;
+        let page_logical_size = egui::vec2(
+            ((media_box[2] - media_box[0]) * zoom) as f32,
+            ((media_box[3] - media_box[1]) * zoom) as f32,
+        );
+        let row_height = page_logical_size.y + 8.0;
 
         let mut scroll_area = egui::ScrollArea::vertical();
         if let Some(target) = self.scroll_to_page.take() {
@@ -635,7 +686,7 @@ impl ViewerApp {
             for index in row_range {
                 if let std::collections::hash_map::Entry::Vacant(entry) = page_textures.entry(index)
                 {
-                    if let Ok(rendered) = session.render_page(index, zoom) {
+                    if let Ok(rendered) = session.render_page(index, zoom * pixel_ratio as f64) {
                         let image = egui::ColorImage::from_rgba_unmultiplied(
                             [rendered.width as usize, rendered.height as usize],
                             &rendered.rgba,
@@ -650,7 +701,7 @@ impl ViewerApp {
                 }
                 if let Some(texture) = page_textures.get(&index) {
                     ui.vertical_centered(|ui| {
-                        ui.image(texture);
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(page_logical_size));
                     });
                 }
                 ui.add_space(8.0);
@@ -903,8 +954,16 @@ impl eframe::App for ViewerApp {
                 let scale = self.zoom as f64;
 
                 egui::ScrollArea::both().show(ui, |ui| {
-                    let response =
-                        ui.add(egui::Image::new(&texture).sense(egui::Sense::click_and_drag()));
+                    // `fit_to_exact_size` : la texture est rendue à
+                    // `zoom * pixels_per_point` pixels (voir `ensure_texture`)
+                    // pour rester nette sur écran Retina, donc affichée plus
+                    // grande que sa taille logique voulue si on laissait
+                    // `egui` déduire la taille d'affichage de la texture.
+                    let mut image = egui::Image::new(&texture).sense(egui::Sense::click_and_drag());
+                    if let Some(size) = self.texture_logical_size {
+                        image = image.fit_to_exact_size(size);
+                    }
+                    let response = ui.add(image);
 
                     if let Some(media_box) = media_box {
                         if !self.highlight_rects.is_empty() {

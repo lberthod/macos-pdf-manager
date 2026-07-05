@@ -931,6 +931,21 @@ fn standard_width_fallback(base_font: &str) -> fn(u8) -> Option<f64> {
             (false, true) => times_italic_width,
             (false, false) => times_roman_width,
         }
+    } else if lower.contains("helvetica") || lower.contains("arial") {
+        // Contrairement à Times, l'oblique d'Helvetica **partage** les
+        // largeurs du romain dans les métriques Adobe Core 14 (l'oblique
+        // n'est qu'un cisaillement géométrique, pas un dessin différent) —
+        // seul le gras a de vraies largeurs différentes (glyphes plus
+        // larges). Les confondre produit exactement le même symptôme que
+        // pour Times/Courier ci-dessus : dérive cumulative de l'espacement
+        // au sein des mots en gras, plus visible sur un titre entier en
+        // gras (repéré sur un vrai document, largeurs Bold jusque-là
+        // confondues avec le Roman).
+        if lower.contains("bold") {
+            helvetica_bold_width
+        } else {
+            helvetica_width
+        }
     } else {
         helvetica_width
     }
@@ -938,12 +953,86 @@ fn standard_width_fallback(base_font: &str) -> fn(u8) -> Option<f64> {
 
 /// Largeurs Courier (Adobe Core 14 AFM) : chasse fixe, communes aux 4
 /// variantes (Roman/Bold/Italique/BoldItalique).
+/// Lettre ASCII de base dont un code `WinAnsiEncoding` accentué (0xC0-0xFF,
+/// lettres latines composées — À, é, ï, ñ, ø...) partage la largeur dans
+/// les métriques Adobe Core 14 : l'accent ne change pas l'empattement du
+/// glyphe de base pour ces polices, seul son dessin diffère. Trouvé en
+/// pratique sur un vrai document (français, donc plein d'accents) : les
+/// codes au-delà de 126 retombaient sur `DEFAULT_WIDTH` (500), très
+/// différent de la vraie largeur (ex. 278 pour "ï", comme "i") — d'où des
+/// espaces parasites au milieu de mots comme "Loïc" ("Loï c"). Ligatures et
+/// lettres sans équivalent ASCII simple (Æ, Ð, ß, Þ, Œ) n'ont pas de base
+/// et retombent sur `winansi_symbol_width`.
+fn winansi_accent_base(code: u8) -> Option<u8> {
+    Some(match code {
+        0xC0..=0xC5 => b'A',
+        0xC7 => b'C',
+        0xC8..=0xCB => b'E',
+        0xCC..=0xCF => b'I',
+        0xD1 => b'N',
+        0xD2..=0xD6 | 0xD8 => b'O',
+        0xD9..=0xDC => b'U',
+        0xDD => b'Y',
+        0xE0..=0xE5 => b'a',
+        0xE7 => b'c',
+        0xE8..=0xEB => b'e',
+        0xEC..=0xEF => b'i',
+        0xF1 => b'n',
+        0xF2..=0xF6 | 0xF8 => b'o',
+        0xF9..=0xFC => b'u',
+        0xFD | 0xFF => b'y',
+        _ => return None,
+    })
+}
+
+/// Largeurs approximatives (métriques Helvetica, appliquées telles quelles
+/// aux autres polices standard par simplicité — l'écart entre familles pour
+/// ces symboles est faible comparé à l'écart avec `DEFAULT_WIDTH`) pour la
+/// ponctuation/les symboles `WinAnsiEncoding` sans lettre de base
+/// (tirets cadratin/demi-cadratin, guillemets typographiques, points de
+/// suspension, puce, œ/Œ...) — le reste des codes hauts non couverts ici
+/// retombe sur `DEFAULT_WIDTH`, un dernier repli plus rare en pratique.
+fn winansi_symbol_width(code: u8) -> Option<f64> {
+    Some(match code {
+        0x80 => 556.0,        // euro
+        0x82 => 222.0,        // quotesinglbase
+        0x83 => 556.0,        // florin
+        0x84 => 333.0,        // quotedblbase
+        0x85 => 1000.0,       // ellipsis
+        0x86 => 556.0,        // dagger
+        0x87 => 556.0,        // daggerdbl
+        0x88 => 333.0,        // circumflex
+        0x89 => 1000.0,       // perthousand
+        0x8B => 333.0,        // guilsinglleft
+        0x8C => 1000.0,       // OE
+        0x91 | 0x92 => 222.0, // quoteleft/quoteright
+        0x93 | 0x94 => 333.0, // quotedblleft/quotedblright
+        0x95 => 350.0,        // bullet
+        0x96 => 556.0,        // endash
+        0x97 => 1000.0,       // emdash
+        0x98 => 333.0,        // tilde
+        0x99 => 1000.0,       // trademark
+        0x9B => 333.0,        // guilsinglright
+        0x9C => 944.0,        // oe
+        0xA0 => 278.0,        // espace insécable, comme l'espace normale
+        0xA1 => 333.0,        // exclamdown
+        0xA9 => 760.0,        // copyright
+        0xAB => 556.0,        // guillemotleft
+        0xAE => 760.0,        // registered
+        0xBB => 556.0,        // guillemotright
+        0xBF => 611.0,        // questiondown
+        0xC6 => 1000.0,       // AE
+        0xE6 => 722.0,        // ae
+        0xDF => 611.0,        // germandbls
+        _ => return None,
+    })
+}
+
 fn courier_width(code: u8) -> Option<f64> {
-    if (32..=126).contains(&code) {
-        Some(600.0)
-    } else {
-        None
-    }
+    let printable = (32..=126).contains(&code)
+        || winansi_accent_base(code).is_some()
+        || winansi_symbol_width(code).is_some();
+    printable.then_some(600.0)
 }
 
 /// Largeurs Times-Roman (Adobe Core 14 AFM), millièmes d'em, codes ASCII
@@ -1036,7 +1125,11 @@ fn times_roman_width(code: u8) -> Option<f64> {
         124 => 200.0,
         125 => 480.0,
         126 => 541.0,
-        _ => return None,
+        _ => {
+            return winansi_accent_base(code)
+                .and_then(times_roman_width)
+                .or_else(|| winansi_symbol_width(code))
+        }
     })
 }
 
@@ -1130,7 +1223,11 @@ fn times_bold_width(code: u8) -> Option<f64> {
         124 => 220.0,
         125 => 394.0,
         126 => 520.0,
-        _ => return None,
+        _ => {
+            return winansi_accent_base(code)
+                .and_then(times_bold_width)
+                .or_else(|| winansi_symbol_width(code))
+        }
     })
 }
 
@@ -1224,7 +1321,11 @@ fn times_italic_width(code: u8) -> Option<f64> {
         124 => 275.0,
         125 => 400.0,
         126 => 541.0,
-        _ => return None,
+        _ => {
+            return winansi_accent_base(code)
+                .and_then(times_italic_width)
+                .or_else(|| winansi_symbol_width(code))
+        }
     })
 }
 
@@ -1318,7 +1419,11 @@ fn times_bold_italic_width(code: u8) -> Option<f64> {
         124 => 220.0,
         125 => 348.0,
         126 => 570.0,
-        _ => return None,
+        _ => {
+            return winansi_accent_base(code)
+                .and_then(times_bold_italic_width)
+                .or_else(|| winansi_symbol_width(code))
+        }
     })
 }
 
@@ -1414,7 +1519,110 @@ fn helvetica_width(code: u8) -> Option<f64> {
         124 => 260.0,
         125 => 334.0,
         126 => 584.0,
-        _ => return None,
+        _ => {
+            return winansi_accent_base(code)
+                .and_then(helvetica_width)
+                .or_else(|| winansi_symbol_width(code))
+        }
+    })
+}
+
+/// Largeurs Helvetica-Bold (Adobe Core 14 AFM), millièmes d'em, codes ASCII
+/// imprimables 32-126 — partagées avec Helvetica-BoldOblique (voir
+/// `standard_width_fallback`).
+fn helvetica_bold_width(code: u8) -> Option<f64> {
+    Some(match code {
+        32 => 278.0,
+        33 => 333.0,
+        34 => 474.0,
+        35 => 556.0,
+        36 => 556.0,
+        37 => 889.0,
+        38 => 722.0,
+        39 => 238.0,
+        40 => 333.0,
+        41 => 333.0,
+        42 => 389.0,
+        43 => 584.0,
+        44 => 278.0,
+        45 => 333.0,
+        46 => 278.0,
+        47 => 278.0,
+        48..=57 => 556.0,
+        58 => 333.0,
+        59 => 333.0,
+        60 => 584.0,
+        61 => 584.0,
+        62 => 584.0,
+        63 => 611.0,
+        64 => 975.0,
+        65 => 722.0,
+        66 => 722.0,
+        67 => 722.0,
+        68 => 722.0,
+        69 => 667.0,
+        70 => 611.0,
+        71 => 778.0,
+        72 => 722.0,
+        73 => 278.0,
+        74 => 556.0,
+        75 => 722.0,
+        76 => 611.0,
+        77 => 833.0,
+        78 => 722.0,
+        79 => 778.0,
+        80 => 667.0,
+        81 => 778.0,
+        82 => 722.0,
+        83 => 667.0,
+        84 => 611.0,
+        85 => 722.0,
+        86 => 667.0,
+        87 => 944.0,
+        88 => 667.0,
+        89 => 667.0,
+        90 => 611.0,
+        91 => 333.0,
+        92 => 278.0,
+        93 => 333.0,
+        94 => 584.0,
+        95 => 556.0,
+        96 => 333.0,
+        97 => 556.0,
+        98 => 611.0,
+        99 => 556.0,
+        100 => 611.0,
+        101 => 556.0,
+        102 => 333.0,
+        103 => 611.0,
+        104 => 611.0,
+        105 => 278.0,
+        106 => 278.0,
+        107 => 556.0,
+        108 => 278.0,
+        109 => 889.0,
+        110 => 611.0,
+        111 => 611.0,
+        112 => 611.0,
+        113 => 611.0,
+        114 => 389.0,
+        115 => 556.0,
+        116 => 333.0,
+        117 => 611.0,
+        118 => 556.0,
+        119 => 778.0,
+        120 => 556.0,
+        121 => 556.0,
+        122 => 500.0,
+        123 => 389.0,
+        124 => 280.0,
+        125 => 389.0,
+        126 => 584.0,
+        _ => {
+            return winansi_accent_base(code)
+                .and_then(helvetica_bold_width)
+                .or_else(|| winansi_symbol_width(code))
+        }
     })
 }
 
@@ -1461,6 +1669,76 @@ mod tests {
         let (unicode, width) = font.decode_simple(b'A');
         assert_eq!(unicode, Some('A'));
         assert_eq!(width, 667.0);
+    }
+
+    /// Un vrai document (généré par ReportLab, sans `/Widths` — cas courant
+    /// pour les 14 polices standard) mélangeant `/Helvetica` et
+    /// `/Helvetica-Bold` sans `/Widths` a mis en évidence que les deux
+    /// utilisaient la même table de largeurs (celle du romain), alors que
+    /// les glyphes gras réels sont plus larges — la dérive cumulative en
+    /// résultant à l'intérieur des mots en gras produisait un espacement
+    /// visiblement trop large. `Helvetica-Bold` doit désormais utiliser sa
+    /// propre table (`helvetica_bold_width`), distincte de `Helvetica`.
+    #[test]
+    fn helvetica_bold_fallback_uses_wider_bold_metrics_not_roman() {
+        let doc = dummy_doc();
+        let regular = font_dict(&[
+            ("Subtype", Object::Name("Type1".into())),
+            ("BaseFont", Object::Name("Helvetica".into())),
+            ("Encoding", Object::Name("WinAnsiEncoding".into())),
+        ]);
+        let bold = font_dict(&[
+            ("Subtype", Object::Name("Type1".into())),
+            ("BaseFont", Object::Name("Helvetica-Bold".into())),
+            ("Encoding", Object::Name("WinAnsiEncoding".into())),
+        ]);
+        let regular_font = Font::load(&doc, &regular).unwrap();
+        let bold_font = Font::load(&doc, &bold).unwrap();
+
+        let (_, regular_width) = regular_font.decode_simple(b'A');
+        let (_, bold_width) = bold_font.decode_simple(b'A');
+        assert_eq!(regular_width, 667.0);
+        assert_eq!(
+            bold_width, 722.0,
+            "Helvetica-Bold 'A' should use its own (wider) AFM width"
+        );
+        assert_ne!(
+            regular_width, bold_width,
+            "bold and roman must not silently share the same width table"
+        );
+    }
+
+    /// Trouvé sur un vrai document français (beaucoup d'accents et de
+    /// tirets cadratin) : les codes `WinAnsiEncoding` au-delà de 126
+    /// (lettres accentuées, ponctuation typographique) retombaient sur
+    /// `DEFAULT_WIDTH` (500), très différent de la vraie largeur — d'où des
+    /// espaces parasites (ex. "Loïc" rendu "Loï c") ou des mots collés
+    /// (après un tiret cadratin, dont la vraie largeur est 1000, pas 500).
+    #[test]
+    fn helvetica_fallback_resolves_accented_and_punctuation_codes_correctly() {
+        let doc = dummy_doc();
+        let dict = font_dict(&[
+            ("Subtype", Object::Name("Type1".into())),
+            ("BaseFont", Object::Name("Helvetica".into())),
+            ("Encoding", Object::Name("WinAnsiEncoding".into())),
+        ]);
+        let font = Font::load(&doc, &dict).unwrap();
+
+        // "ï" (idieresis, 0xEF) doit partager la largeur de "i" (222), pas
+        // retomber sur le placeholder 500.
+        let (unicode, width) = font.decode_simple(0xEF);
+        assert_eq!(unicode, Some('\u{00EF}'));
+        assert_eq!(width, 222.0);
+
+        // "é" (eacute, 0xE9) doit partager la largeur de "e" (556).
+        let (_, width) = font.decode_simple(0xE9);
+        assert_eq!(width, 556.0);
+
+        // Tiret cadratin ("—", emdash, 0x97) : vraie largeur 1000, pas le
+        // placeholder 500 (qui collerait le mot suivant contre le tiret).
+        let (unicode, width) = font.decode_simple(0x97);
+        assert_eq!(unicode, Some('\u{2014}'));
+        assert_eq!(width, 1000.0);
     }
 
     #[test]

@@ -280,7 +280,8 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 - [x] Fuzzing du parser (`cargo-fuzz`) — voir Sprint 56 ci-dessous.
 - [x] Optimisation performance sur gros fichiers — voir Sprint 57 ci-dessous.
-- [ ] Accessibilité, conformité PDF/A.
+- [x] Accessibilité du chrome natif — voir Sprint 60 ci-dessous (déjà fournie par `eframe`/`egui`, pas un développement fait ici, mais une erreur de documentation corrigée). Contenu de page PDF non accessible : hors périmètre (projet distinct).
+- [ ] Conformité PDF/A.
 - [x] Chiffrement (`/Encrypt`, RC4/AES) — fait au Sprint 22, voir `analyse_sprint.md`.
 - [x] Signatures numériques — vérification (lecture seule, intégrité pas confiance) faite au Sprint 59 ci-dessous ; production de signature non faite.
 
@@ -473,6 +474,23 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 - **PKCS#1 PSS, ECDSA** : seul PKCS#1 v1.5 est géré ; PSS et les clés non-RSA renvoient `UnsupportedAlgorithm`.
 
 **Critère de sortie :** `cargo test --workspace` vert (238 tests, +4 `pdf-core`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre, vérifié manuellement en ligne de commande sur 3 scénarios réels (signature intacte, document non signé, document falsifié). **Statut réel : atteint.** Dernier point tractable du Sprint 23+ fermé ; validé end-to-end avec un vrai outil de signature tiers (`pyhanko`), pas seulement des données synthétiques.
+
+---
+
+## Sprint 60 — Correction : le chrome natif a déjà un pont `NSAccessibility`/VoiceOver
+
+**Objectif :** avant d'engager l'accessibilité comme un chantier architectural (ce que les Sprints 58/59 annonçaient — "demanderait une intégration `AccessKit`/pont `NSAccessibility` manuel... un chantier architectural bien plus large"), vérifier cette hypothèse par lecture de code plutôt que la tenir pour acquise. Elle était fausse.
+
+- [x] **`eframe`/`egui` (déjà en usage depuis le Sprint 9-10, voir sprint.md) embarquent `accesskit` en fonctionnalité Cargo par défaut**, jamais désactivée par `pdf-ui/Cargo.toml` (`eframe = { version = "0.29", features = ["wgpu"] }` — ajoute `"wgpu"` aux fonctionnalités par défaut, ne les remplace pas). `accesskit_macos` (le pont `NSAccessibility` concret) apparaît déjà dans `Cargo.lock`. Confirmé en lisant le code source d'`eframe` (`eframe-0.29.1/src/native/wgpu_integration.rs`) : le chemin de rendu réellement sélectionné par `pdf-ui` (`NativeOptions::renderer = Renderer::Wgpu`, voir `main()`) appelle `egui_winit.init_accesskit(&window, event_loop_proxy)` **automatiquement à chaque frame**, sans aucun code applicatif à écrire — `egui` dérive déjà un arbre d'accessibilité pour tous ses widgets natifs (boutons, menus, curseurs, champs de texte, cases à cocher) à partir de leur texte visible.
+- [x] **Correction de l'erreur de documentation** (`audit50quest.md` #50, et les mentions correspondantes dans `sprint.md`/`STATUS.md`) : "aucune trace d'accessibilité dans le code" était faux, et l'était déjà avant cette session — personne n'avait vérifié par lecture de code, l'affirmation se contentait de reprendre l'absence de code applicatif *explicite* pour l'accessibilité, sans tenir compte de ce que la bibliothèque graphique fournit déjà par défaut.
+- [x] **Ce qui reste réellement absent, distinct du chrome** : le **contenu de page PDF** lui-même est rendu comme une texture opaque (`egui::Image`) — aucun texte, aucune structure sémantique n'est exposé à VoiceOver au-delà de "ceci est une image". Rendre le contenu du document accessible (pas seulement l'interface autour) demanderait un arbre de texte accessible synchronisé avec le rendu, construit à partir de `pdf-text::extract_page_text` (déjà disponible, voir Sprint 9-10) mais jamais branché à `accesskit` — un vrai projet séparé, pas une extension de cette correction.
+
+**Non fait dans ce sprint** (limite assumée, pas contournable depuis cet environnement) :
+- **Aucune vérification avec un vrai lecteur d'écran** : la conclusion ci-dessus repose sur la lecture du code source d'`eframe`/`egui` et la présence confirmée d'`accesskit_macos` dans `Cargo.lock`, pas sur un test interactif avec VoiceOver actif (aucun accès à une session graphique macOS depuis cet environnement de développement, même limite que #9/#20/#32/#43/#48 tout au long de cette session).
+- **Accessibilité du contenu de page** : voir ci-dessus, projet distinct non engagé.
+- **Qualité des noms accessibles** : `egui` dérive le nom accessible d'un widget de son texte visible — les boutons purement iconographiques (ex. "🗑"/"↻" du panneau miniatures, Sprint 19) n'ont pas de nom accessible explicite distinct de l'emoji lui-même (`on_hover_text` existant, Sprint 19, affiche une infobulle visuelle mais ne fixe pas nécessairement le nom accessible — pas vérifié). Fixer ça correctement demanderait d'ajouter `accesskit` comme dépendance directe de `pdf-ui` et de câbler `Response::accesskit_node_builder` par bouton concerné, un vrai morceau de travail non engagé ici faute de pouvoir en vérifier le résultat.
+
+**Critère de sortie :** correction de documentation vérifiée par lecture de code (chemin de rendu réel de `pdf-ui`, dépendances résolues dans `Cargo.lock`), aucun changement de code applicatif nécessaire pour ce sprint — le point à corriger était la documentation, pas le produit. **Statut réel : atteint pour la correction.** #50 reste ◐ dans `audit50quest.md` (contenu de page non accessible, vérification VoiceOver non faite), mais plus pour la raison précédemment documentée.
 
 ---
 

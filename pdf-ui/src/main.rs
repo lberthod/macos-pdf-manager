@@ -343,6 +343,12 @@ struct DocumentTab {
     checkbox_fields: Vec<pdf_edit::CheckboxFieldInfo>,
     /// (page affichée) pour laquelle `checkbox_fields` est à jour.
     checkbox_fields_state: Option<usize>,
+    /// Groupes de boutons radio de la page courante (Sprint 53, #43 suite) —
+    /// même schéma que `checkbox_fields`, un clic sur une option sélectionne
+    /// directement (pas de modale).
+    radio_groups: Vec<pdf_edit::RadioGroupInfo>,
+    /// (page affichée) pour laquelle `radio_groups` est à jour.
+    radio_groups_state: Option<usize>,
     /// Dernier décalage de défilement connu de la `ScrollArea` de la page
     /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
     /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
@@ -429,6 +435,8 @@ impl DocumentTab {
             form_fields_state: None,
             checkbox_fields: Vec::new(),
             checkbox_fields_state: None,
+            radio_groups: Vec::new(),
+            radio_groups_state: None,
             last_scroll_offset: egui::Vec2::ZERO,
             last_scroll_viewport: None,
             pending_scroll_offset: None,
@@ -894,6 +902,60 @@ impl DocumentTab {
         true
     }
 
+    /// Recalcule `self.radio_groups` si la page affichée a changé depuis le
+    /// dernier appel — même schéma que `ensure_checkbox_fields` (Sprint 53).
+    fn ensure_radio_groups(&mut self) {
+        let Some(session) = &self.session else {
+            self.radio_groups.clear();
+            return;
+        };
+        let page_index = session.page_index();
+        if self.radio_groups_state == Some(page_index) {
+            return;
+        }
+        self.radio_groups = session.radio_groups_on_current_page().unwrap_or_default();
+        self.radio_groups_state = Some(page_index);
+    }
+
+    /// Sélectionne l'option de `self.radio_groups` dont le rect contient le
+    /// prochain simple clic sur la page (Sprint 53, #43 suite) — même schéma
+    /// que `handle_checkbox_field_click`, mais bascule une option parmi
+    /// plusieurs plutôt que coché/décoché.
+    fn handle_radio_group_click(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) -> bool {
+        if !response.clicked() {
+            return false;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return false;
+        };
+        let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
+        let hit = self.radio_groups.iter().find_map(|group| {
+            group
+                .options
+                .iter()
+                .position(|o| {
+                    px >= o.rect[0] && px <= o.rect[2] && py >= o.rect[1] && py <= o.rect[3]
+                })
+                .map(|option_index| (group.name.clone(), option_index))
+        });
+        let Some((name, option_index)) = hit else {
+            return false;
+        };
+        let Some(session) = &mut self.session else {
+            return true;
+        };
+        match session.set_radio_group_value_on_current_page(&name, option_index) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de sélectionner l'option : {e}")),
+        }
+        true
+    }
+
     /// Supprime l'annotation actuellement sélectionnée (`self.selected_annotation`,
     /// bouton "🗑 Supprimer l'annotation", #32).
     fn delete_selected_annotation(&mut self) {
@@ -1056,6 +1118,7 @@ impl DocumentTab {
         // pour préremplir correctement la modale au prochain clic.
         self.form_fields_state = None;
         self.checkbox_fields_state = None;
+        self.radio_groups_state = None;
         self.refresh_render_worker_document();
     }
 
@@ -2251,6 +2314,7 @@ impl DocumentTab {
             self.ensure_annotations();
             self.ensure_form_fields();
             self.ensure_checkbox_fields();
+            self.ensure_radio_groups();
 
             // Clonée (bon marché : `TextureHandle` est un handle partagé)
             // pour ne pas garder de prêt sur `self.texture` pendant qu'on
@@ -2323,17 +2387,28 @@ impl DocumentTab {
                             );
                         }
 
+                        if !self.radio_groups.is_empty() {
+                            draw_radio_group_outlines(
+                                ui,
+                                &response,
+                                &self.radio_groups,
+                                media_box,
+                                scale,
+                            );
+                        }
+
                         // Le mode "📝 Ajouter texte" (#30) intercepte le
                         // simple clic à la place de la sélection/l'annotation
                         // (voir la doc de `handle_add_text_click`) — les deux
                         // usages ne doivent jamais se marcher dessus sur le
                         // même clic. Un clic tombant dans un champ de
-                        // formulaire (#Sprint 23) ou une case à cocher
-                        // (Sprint 52) a priorité sur la sélection/l'annotation,
-                        // pour la même raison.
+                        // formulaire (#Sprint 23), une case à cocher (Sprint
+                        // 52) ou un bouton radio (Sprint 53) a priorité sur la
+                        // sélection/l'annotation, pour la même raison.
                         if self.add_text_mode {
                             self.handle_add_text_click(&response, media_box, scale);
                         } else if !self.handle_checkbox_field_click(&response, media_box, scale)
+                            && !self.handle_radio_group_click(&response, media_box, scale)
                             && !self.handle_form_field_click(&response, media_box, scale)
                         {
                             // Un glissement sur la sélection courante (#32,
@@ -2632,6 +2707,38 @@ fn draw_checkbox_field_outlines(
             0.0,
             egui::Stroke::new(1.0, CHECKBOX_FIELD_OUTLINE_COLOR),
         );
+    }
+}
+
+/// Dessine un contour par option de chaque groupe de `groups` (Sprint 53,
+/// #43 suite) — même traitement visuel que `draw_checkbox_field_outlines`
+/// (remplissage translucide si sélectionnée), une option à la fois plutôt
+/// qu'un seul champ.
+fn draw_radio_group_outlines(
+    ui: &egui::Ui,
+    image_response: &egui::Response,
+    groups: &[pdf_edit::RadioGroupInfo],
+    media_box: [f64; 4],
+    scale: f64,
+) {
+    let painter = ui.painter();
+    for group in groups {
+        for option in &group.options {
+            let screen_rect =
+                page_rect_to_screen(option.rect, image_response.rect, media_box, scale);
+            if option.selected {
+                painter.rect_filled(
+                    screen_rect,
+                    1.0,
+                    CHECKBOX_FIELD_OUTLINE_COLOR.gamma_multiply(0.35),
+                );
+            }
+            painter.rect_stroke(
+                screen_rect,
+                0.0,
+                egui::Stroke::new(1.0, CHECKBOX_FIELD_OUTLINE_COLOR),
+            );
+        }
     }
 }
 

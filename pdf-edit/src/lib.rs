@@ -86,6 +86,26 @@ pub struct CheckboxFieldInfo {
     pub on_state: String,
 }
 
+/// Une option (un widget-enfant) d'un groupe de boutons radio, telle que
+/// renvoyée par `EditSession::radio_groups` — voir sa doc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadioOptionInfo {
+    pub obj_ref: ObjRef,
+    pub rect: [f64; 4],
+    pub on_state: String,
+    pub selected: bool,
+}
+
+/// Groupe de boutons radio visible, tel que renvoyé par
+/// `EditSession::radio_groups` (#43 suite) — un champ `/AcroForm` avec
+/// plusieurs `/Kids`, une option par widget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadioGroupInfo {
+    pub field_ref: ObjRef,
+    pub name: String,
+    pub options: Vec<RadioOptionInfo>,
+}
+
 pub struct EditSession {
     doc: Document,
     /// Objets nouveaux ou mis à jour, pas encore écrits sur disque —
@@ -1113,6 +1133,163 @@ impl EditSession {
         self.commit(EditOp {
             modified: vec![(field_ref.num, before, after)],
         });
+        Ok(())
+    }
+
+    /// Liste les groupes de boutons radio (`/FT /Btn` avec le bit `Ff`
+    /// `Radio` posé et `/Kids` non vide) de `/AcroForm/Fields` — le
+    /// complément de `checkbox_fields`, qui les exclut délibérément (leur
+    /// `/Rect` n'existe qu'au niveau de chaque `/Kids`, pas du champ parent).
+    /// Une option par widget-enfant, chacune avec son propre `/Rect` et son
+    /// propre état "coché" `on_state` (ex. `"red"`/`"blue"`, distinct d'une
+    /// option à l'autre contrairement à une case à cocher) — `selected`
+    /// reflète l'`/AS` de ce widget précis, pas le `/V` du champ parent
+    /// [redondant en théorie dans un PDF bien formé, mais lire `/AS` évite
+    /// de dépendre de la cohérence entre les deux].
+    pub fn radio_groups(&self) -> Result<Vec<RadioGroupInfo>, String> {
+        let root = self.doc.root().map_err(|e| e.to_string())?;
+        let Some(acroform_obj) = root.get("AcroForm") else {
+            return Ok(Vec::new());
+        };
+        let acroform = self.doc.get(acroform_obj).map_err(|e| e.to_string())?;
+        let Some(acroform_dict) = acroform.as_dict() else {
+            return Ok(Vec::new());
+        };
+        let Some(fields_obj) = acroform_dict.get("Fields") else {
+            return Ok(Vec::new());
+        };
+        let fields = self.doc.get(fields_obj).map_err(|e| e.to_string())?;
+        let Some(field_refs) = fields.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        const RADIO_FLAG: i64 = 1 << 15; // Bit 16, ISO 32000-1 tableau 226.
+        let mut out = Vec::new();
+        for field_obj in field_refs {
+            let Object::Reference(field_ref) = field_obj else {
+                continue;
+            };
+            let resolved = self.current(field_ref.num)?;
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get("FT").and_then(|o| o.as_name()) != Some("Btn") {
+                continue;
+            }
+            if dict.get("Ff").and_then(|o| o.as_int()).unwrap_or(0) & RADIO_FLAG == 0 {
+                continue;
+            }
+            let Some(name) = dict.get("T").and_then(|o| o.as_text_string()) else {
+                continue;
+            };
+            let Some(kids) = dict.get("Kids").and_then(|o| o.as_array()) else {
+                continue; // Pas un vrai groupe (0 ou 1 widget) : rien à proposer.
+            };
+
+            let mut options = Vec::new();
+            for kid_obj in kids {
+                let Object::Reference(kid_ref) = kid_obj else {
+                    continue;
+                };
+                let Ok(kid) = self.current(kid_ref.num) else {
+                    continue;
+                };
+                let Some(kid_dict) = kid.as_dict() else {
+                    continue;
+                };
+                let Some(rect_arr) = kid_dict
+                    .get("Rect")
+                    .and_then(|o| o.as_array())
+                    .filter(|r| r.len() >= 4)
+                else {
+                    continue;
+                };
+                let rect = [
+                    num(&rect_arr[0]),
+                    num(&rect_arr[1]),
+                    num(&rect_arr[2]),
+                    num(&rect_arr[3]),
+                ];
+                let Some(on_state) = Self::button_on_state(self, kid_dict) else {
+                    continue;
+                };
+                let selected =
+                    kid_dict.get("AS").and_then(|o| o.as_name()) == Some(on_state.as_str());
+                options.push(RadioOptionInfo {
+                    obj_ref: *kid_ref,
+                    rect,
+                    on_state,
+                    selected,
+                });
+            }
+            if options.is_empty() {
+                continue;
+            }
+            out.push(RadioGroupInfo {
+                field_ref: *field_ref,
+                name,
+                options,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Sélectionne l'option `option_index` du groupe de boutons radio
+    /// `field_name` (voir `radio_groups`) : fixe `/V` du champ parent à
+    /// l'état "coché" de cette option, et `/AS` de **chaque** widget-enfant
+    /// à son propre état "coché" si c'est l'option choisie, `/Off` sinon
+    /// (ISO 32000-1 §12.7.4.2.3 — un seul widget du groupe reste visuellement
+    /// coché). Un seul `EditOp`/entrée d'annulation pour tout le groupe.
+    pub fn set_radio_group_value(
+        &mut self,
+        field_name: &str,
+        option_index: usize,
+    ) -> Result<(), String> {
+        let field_ref = self.find_form_field(field_name)?;
+        let field_before = self.current(field_ref.num)?;
+        let mut field_dict = field_before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "form field object is not a dictionary".to_string())?;
+        let kids = field_dict
+            .get("Kids")
+            .and_then(|o| o.as_array())
+            .map(|a| a.to_vec())
+            .ok_or_else(|| format!("field '{field_name}' has no /Kids (not a radio group)"))?;
+
+        let mut modified = Vec::new();
+        let mut chosen_on_state = None;
+        for (i, kid_obj) in kids.iter().enumerate() {
+            let Object::Reference(kid_ref) = kid_obj else {
+                continue;
+            };
+            let kid_before = self.current(kid_ref.num)?;
+            let mut kid_dict = kid_before
+                .as_dict()
+                .cloned()
+                .ok_or_else(|| "radio widget object is not a dictionary".to_string())?;
+            let on_state = Self::button_on_state(self, &kid_dict)
+                .ok_or_else(|| format!("radio widget {} has no usable /AP /N", kid_ref.num))?;
+            let is_chosen = i == option_index;
+            if is_chosen {
+                chosen_on_state = Some(on_state.clone());
+            }
+            let as_state = if is_chosen {
+                Object::Name(on_state)
+            } else {
+                Object::Name("Off".to_string())
+            };
+            kid_dict.insert("AS", as_state);
+            modified.push((kid_ref.num, kid_before, Object::Dictionary(kid_dict)));
+        }
+        let chosen_on_state = chosen_on_state.ok_or_else(|| {
+            format!("option index {option_index} out of bounds for '{field_name}'")
+        })?;
+
+        field_dict.insert("V", Object::Name(chosen_on_state));
+        modified.push((field_ref.num, field_before, Object::Dictionary(field_dict)));
+
+        self.commit(EditOp { modified });
         Ok(())
     }
 
@@ -2508,5 +2685,75 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();
         std::fs::remove_file(&out_path2).ok();
+    }
+
+    /// `radio_groups` retrouve le groupe du fixture (2 options, "red" déjà
+    /// sélectionnée à la génération) — vérifie aussi qu'un seul groupe est
+    /// listé (pas un par widget-enfant).
+    #[test]
+    fn radio_groups_lists_the_group_with_initial_selection() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_radio.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = EditSession::open(&path).unwrap();
+
+        let groups = session.radio_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "color_choice");
+        assert_eq!(groups[0].options.len(), 2);
+        assert_eq!(groups[0].options[0].on_state, "red");
+        assert!(groups[0].options[0].selected);
+        assert_eq!(groups[0].options[1].on_state, "blue");
+        assert!(!groups[0].options[1].selected);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `set_radio_group_value` bascule la sélection vers l'autre option : le
+    /// widget nouvellement choisi passe à son propre état "coché", l'ancien
+    /// repasse à `/Off`, `/V` du champ suit — persistance vérifiée après
+    /// réouverture, et un seul widget reste coché dans le fichier final.
+    #[test]
+    fn set_radio_group_value_switches_selection_and_persists() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_radio.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_radio_group_value("color_choice", 1).unwrap();
+
+        let groups = session.radio_groups().unwrap();
+        assert!(!groups[0].options[0].selected);
+        assert!(groups[0].options[1].selected);
+
+        let out_path = write_fixture(b"radio-switch-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let root = reopened.root().unwrap();
+        let acroform = reopened.get(root.get("AcroForm").unwrap()).unwrap();
+        let fields = reopened
+            .get(acroform.as_dict().unwrap().get("Fields").unwrap())
+            .unwrap();
+        let field_ref = fields.as_array().unwrap()[0].as_reference().unwrap();
+        let field = reopened.resolve(field_ref).unwrap();
+        let field_dict = field.as_dict().unwrap();
+        assert_eq!(field_dict.get("V").and_then(|o| o.as_name()), Some("blue"));
+
+        let kids = field_dict.get("Kids").and_then(|o| o.as_array()).unwrap();
+        let selected_count = kids
+            .iter()
+            .filter_map(|o| o.as_reference())
+            .filter_map(|r| reopened.resolve(r).ok())
+            .filter(|kid| {
+                let dict = kid.as_dict().unwrap();
+                dict.get("AS").and_then(|o| o.as_name()) != Some("Off")
+            })
+            .count();
+        assert_eq!(
+            selected_count, 1,
+            "exactly one radio widget should remain checked"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
     }
 }

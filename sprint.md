@@ -337,6 +337,25 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 53 — Boutons radio groupés AcroForm (#43 suite)
+
+**Objectif :** #43 restait ◐ après le Sprint 52 (cases à cocher, pas les groupes radio). Ferme la partie "boutons radio groupés" — pas les listes/menus déroulants (`/Ch`), toujours hors périmètre.
+
+- [x] **Fixture `acroform_radio.pdf`** (nouveau, `reportlab.Canvas.acroForm.radio` — deux appels avec le même `name`, options `"red"`/`"blue"`) : le champ parent (`/FT /Btn`, bit `Ff` `Radio` posé) n'a **pas** de `/Rect` propre, seuls ses deux `/Kids` (les widgets, chacun avec son propre `/AP /N` — `/Off` + son propre nom d'état — et son propre `/AS`) en ont un. Confirme empiriquement pourquoi `checkbox_fields` (Sprint 52) les ignorait déjà correctement (leur filtre `/Rect` direct sur le champ les exclut naturellement).
+- [x] **`pdf-edit::EditSession::radio_groups`** (nouveau) liste les champs `/FT /Btn` avec le bit `Ff` `Radio` posé **et** `/Kids` non vide (le complément exact de ce que `checkbox_fields` exclut) : une `RadioOptionInfo` par widget-enfant (`/Rect`, `on_state` — réutilise `button_on_state`, Sprint 52 — et `selected`, lu depuis l'`/AS` de ce widget précis).
+- [x] **`pdf-edit::EditSession::set_radio_group_value`** (nouveau) sélectionne une option par indice : fixe l'`/AS` de **chaque** widget-enfant (son propre état "coché" si c'est l'option choisie, `/Off` sinon — ISO 32000-1 §12.7.4.2.3, un seul widget du groupe reste visuellement coché) et le `/V` du champ parent, le tout en un seul `EditOp`/entrée d'annulation pour tout le groupe. Testé bout en bout : bascule vers l'autre option, persistance après réouverture, **et vérification qu'un seul widget reste effectivement coché dans le fichier final** (pas seulement que le bon l'est).
+- [x] **`pdf_app::Session::radio_groups_on_current_page`/`set_radio_group_value_on_current_page`** — wrappers, filtrent chaque groupe à ses seules options référencées par `/Annots` de la page courante (le champ parent lui-même n'y apparaît jamais, contrairement à ses `/Kids`).
+- [x] **`pdf-ui`** dessine un contour par option (rempli translucide si sélectionnée, même traitement que les cases à cocher) ; un clic sur une option la sélectionne directement (`handle_radio_group_click`).
+
+**Non fait dans ce sprint** (la ligne #43 reste donc ◐, pas ☑) :
+- **Listes/menus déroulants** (`/Ch`) : toujours pas engagés.
+- **`option_index` suppose un groupe entier sur une seule page** : `set_radio_group_value_on_current_page` prend l'indice dans `/Kids` au sens du champ complet, pas dans la liste filtrée par page — les deux coïncident tant que le groupe ne s'étale pas sur plusieurs pages (cas normal, jamais vu en pratique), documenté comme limite connue plutôt que résolu par une résolution d'indice plus robuste (aurait ajouté de la complexité pour un cas quasi jamais rencontré).
+- **Vérification interactive** : même limite que les Sprints 51/52 — pas d'accès à une session graphique macOS depuis cet environnement de développement.
+
+**Critère de sortie :** `cargo test --workspace` vert (223 tests, +2 `pdf-edit` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint** pour la partie "boutons radio groupés" de #43 — reste ◐ dans `audit50quest.md`, seules les listes/menus déroulants restant à faire pour fermer complètement la ligne.
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

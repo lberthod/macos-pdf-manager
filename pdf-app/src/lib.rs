@@ -515,6 +515,51 @@ impl Session {
         Ok(out)
     }
 
+    /// Liste les champs de formulaire texte de la page courante (voir
+    /// `pdf_edit::EditSession::form_fields`) — filtré à partir des `/Annots`
+    /// de la page courante (même source que `annotations_on_current_page`)
+    /// puisque `form_fields` liste tous les champs du document sans
+    /// distinction de page. Permet à `pdf-ui` de dessiner un contour
+    /// cliquable par champ et de préremplir une modale de saisie avec la
+    /// valeur actuelle.
+    pub fn form_fields_on_current_page(&self) -> Result<Vec<pdf_edit::FormFieldInfo>, String> {
+        let page = self.doc.page(self.page_index).map_err(|e| e.to_string())?;
+        let Some(annots_obj) = page.dict.get("Annots") else {
+            return Ok(Vec::new());
+        };
+        let annots = self.doc.get(annots_obj).map_err(|e| e.to_string())?;
+        let Some(refs) = annots.as_array() else {
+            return Ok(Vec::new());
+        };
+        let page_nums: std::collections::HashSet<u32> = refs
+            .iter()
+            .filter_map(|o| match o {
+                Object::Reference(r) => Some(r.num),
+                _ => None,
+            })
+            .collect();
+
+        Ok(self
+            .edit
+            .form_fields()?
+            .into_iter()
+            .filter(|f| page_nums.contains(&f.obj_ref.num))
+            .collect())
+    }
+
+    /// Fixe la valeur du champ de formulaire texte `field_name` (voir
+    /// `pdf_edit::EditSession::set_form_field_value`) et rafraîchit
+    /// immédiatement le rendu pour que la nouvelle valeur soit visible
+    /// avant toute sauvegarde.
+    pub fn set_form_field_value_on_current_page(
+        &mut self,
+        field_name: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        self.edit.set_form_field_value(field_name, value)?;
+        self.refresh_after_edit()
+    }
+
     /// Insère une page blanche à `at_index` (Sprint 19, câblage `pdf-ui` de
     /// `pdf_edit::EditSession::insert_blank_page`) — reprend le `MediaBox` de
     /// la page courante si le document en a au moins une, sinon une page
@@ -1220,6 +1265,31 @@ mod tests {
         let after_removal = session.annotations_on_current_page().unwrap();
         assert_eq!(after_removal.len(), 1);
         assert_eq!(after_removal[0].subtype, "Underline");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `form_fields_on_current_page` retrouve le champ du fixture (filtré
+    /// via les `/Annots` de la page courante) et
+    /// `set_form_field_value_on_current_page` met sa valeur à jour et
+    /// rafraîchit le rendu, comme les autres méthodes d'édition
+    /// `*_on_current_page`.
+    #[test]
+    fn form_fields_on_current_page_lists_and_fills_field() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_textfield.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        let fields = session.form_fields_on_current_page().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "name_field");
+        assert_eq!(fields[0].value, "");
+
+        session
+            .set_form_field_value_on_current_page("name_field", "Ada Lovelace")
+            .unwrap();
+        let fields = session.form_fields_on_current_page().unwrap();
+        assert_eq!(fields[0].value, "Ada Lovelace");
 
         std::fs::remove_file(&path).ok();
     }

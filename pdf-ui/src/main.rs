@@ -91,6 +91,10 @@ const HIGHLIGHT_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(90
 const SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 60, 110, 90);
 /// Contour des annotations existantes (panneau "annotations", Sprint 20).
 const ANNOTATION_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 60, 200);
+/// Contour des champs de formulaire texte cliquables (Sprint 23) — distinct
+/// de `ANNOTATION_OUTLINE_COLOR` pour ne pas laisser croire qu'un champ est
+/// une annotation supprimable comme les autres.
+const FORM_FIELD_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 140, 200);
 /// Taille de police par défaut du texte ajouté/remplacé (Sprint 20) — pas de
 /// réglage utilisateur pour l'instant, comme `pdf-cli add-text`/`replace-text`.
 const DEFAULT_TEXT_FONT_SIZE: f64 = 14.0;
@@ -106,6 +110,10 @@ const NEW_TEXT_BOX_SIZE: (f64, f64) = (220.0, 24.0);
 enum PendingTextAction {
     AddFreeText { rect: [f64; 4] },
     ReplaceText { rect: [f64; 4] },
+    /// Remplir un champ de formulaire texte au clic (Sprint 23) — la
+    /// modale est préremplie avec la valeur actuelle du champ plutôt que
+    /// vide, contrairement aux deux autres variantes.
+    FillForm { field_name: String },
 }
 
 /// État de la boîte de dialogue modale de saisie de texte (Sprint 20) —
@@ -265,6 +273,13 @@ struct DocumentTab {
     /// (#32) — un bouton "🗑 Supprimer l'annotation" apparaît tant qu'une
     /// sélection existe.
     selected_annotation: Option<usize>,
+    /// Champs de formulaire texte de la page courante — recalculés à
+    /// chaque changement de page/édition (voir `ensure_form_fields`, même
+    /// schéma que `annotations`/`ensure_annotations`), affichés en contour
+    /// cliquable pour ouvrir `text_modal` et saisir une nouvelle valeur.
+    form_fields: Vec<pdf_edit::FormFieldInfo>,
+    /// (page affichée) pour laquelle `form_fields` est à jour.
+    form_fields_state: Option<usize>,
     /// Dernier décalage de défilement connu de la `ScrollArea` de la page
     /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
     /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
@@ -345,6 +360,8 @@ impl DocumentTab {
             annotations: Vec::new(),
             annotations_state: None,
             selected_annotation: None,
+            form_fields: Vec::new(),
+            form_fields_state: None,
             last_scroll_offset: egui::Vec2::ZERO,
             last_scroll_viewport: None,
             pending_scroll_offset: None,
@@ -713,6 +730,9 @@ impl DocumentTab {
                 (0.0, 0.0, 0.0),
                 (1.0, 1.0, 1.0),
             ),
+            PendingTextAction::FillForm { ref field_name } => {
+                session.set_form_field_value_on_current_page(field_name, &modal.input)
+            }
         };
         match result {
             Ok(()) => self.invalidate_after_edit(),
@@ -733,6 +753,21 @@ impl DocumentTab {
         }
         self.annotations = session.annotations_on_current_page().unwrap_or_default();
         self.annotations_state = Some(page_index);
+    }
+
+    /// Recalcule `self.form_fields` si la page affichée a changé depuis le
+    /// dernier appel — même schéma que `ensure_annotations`.
+    fn ensure_form_fields(&mut self) {
+        let Some(session) = &self.session else {
+            self.form_fields.clear();
+            return;
+        };
+        let page_index = session.page_index();
+        if self.form_fields_state == Some(page_index) {
+            return;
+        }
+        self.form_fields = session.form_fields_on_current_page().unwrap_or_default();
+        self.form_fields_state = Some(page_index);
     }
 
     /// Supprime l'annotation actuellement sélectionnée (`self.selected_annotation`,
@@ -891,6 +926,9 @@ impl DocumentTab {
         // suivre.
         self.annotations_state = None;
         self.selected_annotation = None;
+        // Une valeur de champ modifiée doit être relue (`ensure_form_fields`)
+        // pour préremplir correctement la modale au prochain clic.
+        self.form_fields_state = None;
         self.refresh_render_worker_document();
     }
 
@@ -1398,6 +1436,38 @@ impl DocumentTab {
             .map(|a| a.index);
     }
 
+    /// Consomme le prochain simple clic sur la page tombant dans le rect
+    /// d'un champ de formulaire texte de `self.form_fields` (Sprint 23) :
+    /// ouvre `text_modal` préremplie avec la valeur actuelle du champ.
+    /// Renvoie `true` si le clic a été consommé (appelant : ne pas aussi
+    /// traiter ce même clic comme une sélection/un clic d'annotation).
+    fn handle_form_field_click(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) -> bool {
+        if !response.clicked() {
+            return false;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return false;
+        };
+        let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
+        let Some(field) = self.form_fields.iter().find(|f| {
+            px >= f.rect[0] && px <= f.rect[2] && py >= f.rect[1] && py <= f.rect[3]
+        }) else {
+            return false;
+        };
+        self.text_modal = Some(TextInputModal {
+            action: PendingTextAction::FillForm {
+                field_name: field.name.clone(),
+            },
+            input: field.value.clone(),
+        });
+        true
+    }
+
     /// Affiche la boîte de dialogue de saisie de texte (#30/#40), le cas
     /// échéant — une fenêtre flottante `egui::Window` plutôt qu'un panneau
     /// fixe, pour rester au-dessus du contenu de la page sans en changer la
@@ -1409,6 +1479,7 @@ impl DocumentTab {
         let title = match modal.action {
             PendingTextAction::AddFreeText { .. } => "Ajouter du texte",
             PendingTextAction::ReplaceText { .. } => "Remplacer le texte sélectionné",
+            PendingTextAction::FillForm { .. } => "Remplir le champ de formulaire",
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -1965,6 +2036,7 @@ impl DocumentTab {
             self.ensure_texture(ctx);
             self.ensure_highlights();
             self.ensure_annotations();
+            self.ensure_form_fields();
 
             // Clonée (bon marché : `TextureHandle` est un handle partagé)
             // pour ne pas garder de prêt sur `self.texture` pendant qu'on
@@ -2016,14 +2088,20 @@ impl DocumentTab {
                             );
                         }
 
+                        if !self.form_fields.is_empty() {
+                            draw_form_field_outlines(ui, &response, &self.form_fields, media_box, scale);
+                        }
+
                         // Le mode "📝 Ajouter texte" (#30) intercepte le
                         // simple clic à la place de la sélection/l'annotation
                         // (voir la doc de `handle_add_text_click`) — les deux
                         // usages ne doivent jamais se marcher dessus sur le
-                        // même clic.
+                        // même clic. Un clic tombant dans un champ de
+                        // formulaire (#Sprint 23) a priorité sur la
+                        // sélection/l'annotation, pour la même raison.
                         if self.add_text_mode {
                             self.handle_add_text_click(&response, media_box, scale);
-                        } else {
+                        } else if !self.handle_form_field_click(&response, media_box, scale) {
                             self.handle_annotation_click(&response, media_box, scale);
                             self.handle_text_selection(&response, media_box, scale);
                         }
@@ -2137,6 +2215,38 @@ fn draw_annotation_outlines(
             egui::Rect::from_min_max(min, max),
             0.0,
             egui::Stroke::new(width, ANNOTATION_OUTLINE_COLOR),
+        );
+    }
+}
+
+/// Dessine un contour (comme `draw_annotation_outlines`) par champ de
+/// formulaire texte de `fields` (Sprint 23) — indique où cliquer pour
+/// ouvrir la modale de saisie, sans distinction de sélection (contrairement
+/// aux annotations, un champ ne se "sélectionne" pas avant suppression).
+fn draw_form_field_outlines(
+    ui: &egui::Ui,
+    image_response: &egui::Response,
+    fields: &[pdf_edit::FormFieldInfo],
+    media_box: [f64; 4],
+    scale: f64,
+) {
+    let origin_x = media_box[0];
+    let origin_top = media_box[3];
+    let painter = ui.painter();
+    for field in fields {
+        let rect = field.rect;
+        let min = egui::pos2(
+            image_response.rect.min.x + ((rect[0] - origin_x) * scale) as f32,
+            image_response.rect.min.y + ((origin_top - rect[3]) * scale) as f32,
+        );
+        let max = egui::pos2(
+            image_response.rect.min.x + ((rect[2] - origin_x) * scale) as f32,
+            image_response.rect.min.y + ((origin_top - rect[1]) * scale) as f32,
+        );
+        painter.rect_stroke(
+            egui::Rect::from_min_max(min, max),
+            0.0,
+            egui::Stroke::new(1.0, FORM_FIELD_OUTLINE_COLOR),
         );
     }
 }

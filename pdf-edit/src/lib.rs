@@ -58,6 +58,18 @@ struct PageTreeState {
     order: Vec<ObjRef>,
 }
 
+/// Champ de formulaire texte visible, tel que renvoyé par
+/// `EditSession::form_fields` — assez d'information pour dessiner un
+/// contour cliquable et pré-remplir une modale de saisie avec la valeur
+/// actuelle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormFieldInfo {
+    pub obj_ref: ObjRef,
+    pub name: String,
+    pub rect: [f64; 4],
+    pub value: String,
+}
+
 pub struct EditSession {
     doc: Document,
     /// Objets nouveaux ou mis à jour, pas encore écrits sur disque —
@@ -697,6 +709,69 @@ impl EditSession {
             }
         }
         Ok(())
+    }
+
+    /// Liste les champs de formulaire texte (`/FT /Tx`) de `/AcroForm/Fields`
+    /// (même périmètre qu'un seul niveau que `find_form_field`/
+    /// `set_form_field_value` — voir la doc de module) : assez d'information
+    /// pour que `pdf-app`/`pdf-ui` proposent un clic sur le champ affiché à
+    /// l'écran sans dupliquer la logique de résolution `/AcroForm`. Lit la
+    /// valeur courante via `current` (pas `doc.resolve`) pour refléter un
+    /// `set_form_field_value` déjà en attente dans cette session.
+    pub fn form_fields(&self) -> Result<Vec<FormFieldInfo>, String> {
+        let root = self.doc.root().map_err(|e| e.to_string())?;
+        let Some(acroform_obj) = root.get("AcroForm") else {
+            return Ok(Vec::new());
+        };
+        let acroform = self.doc.get(acroform_obj).map_err(|e| e.to_string())?;
+        let Some(acroform_dict) = acroform.as_dict() else {
+            return Ok(Vec::new());
+        };
+        let Some(fields_obj) = acroform_dict.get("Fields") else {
+            return Ok(Vec::new());
+        };
+        let fields = self.doc.get(fields_obj).map_err(|e| e.to_string())?;
+        let Some(field_refs) = fields.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for field_obj in field_refs {
+            let Object::Reference(r) = field_obj else {
+                continue;
+            };
+            let resolved = self.current(r.num)?;
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get("FT").and_then(|o| o.as_name()) != Some("Tx") {
+                continue; // Cases à cocher/boutons radio/listes hors périmètre, voir doc de module.
+            }
+            let Some(name) = dict.get("T").and_then(|o| o.as_text_string()) else {
+                continue;
+            };
+            let Some(rect_arr) = dict
+                .get("Rect")
+                .and_then(|o| o.as_array())
+                .filter(|r| r.len() >= 4)
+            else {
+                continue;
+            };
+            let rect = [
+                num(&rect_arr[0]),
+                num(&rect_arr[1]),
+                num(&rect_arr[2]),
+                num(&rect_arr[3]),
+            ];
+            let value = dict.get("V").and_then(|o| o.as_text_string()).unwrap_or_default();
+            out.push(FormFieldInfo {
+                obj_ref: *r,
+                name,
+                rect,
+                value,
+            });
+        }
+        Ok(out)
     }
 
     /// Trouve le champ `/AcroForm/Fields` de nom `/T` == `field_name`
@@ -1652,6 +1727,30 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();
+    }
+
+    /// `form_fields` retrouve le champ texte du fixture avec son nom/rect,
+    /// et reflète immédiatement une valeur déjà posée par
+    /// `set_form_field_value` dans la même session (lue via `current`, pas
+    /// `doc.resolve` — voir la doc de `form_fields`).
+    #[test]
+    fn form_fields_lists_field_and_reflects_pending_value() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_textfield.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = EditSession::open(&path).unwrap();
+
+        let fields = session.form_fields().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "name_field");
+        assert_eq!(fields[0].value, "");
+
+        session
+            .set_form_field_value("name_field", "Ada Lovelace")
+            .unwrap();
+        let fields = session.form_fields().unwrap();
+        assert_eq!(fields[0].value, "Ada Lovelace");
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// Texte de chaque page d'un document rouvert, dans l'ordre — sert à

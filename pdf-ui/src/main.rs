@@ -102,6 +102,42 @@ const DEFAULT_TEXT_FONT_SIZE: f64 = 14.0;
 /// libre ajouté au clic (Sprint 20, #30) — l'utilisateur ne redimensionne pas
 /// encore la boîte lui-même, voir la limitation documentée dans STATUS.md.
 const NEW_TEXT_BOX_SIZE: (f64, f64) = (220.0, 24.0);
+/// Demi-côté (pixels écran) d'une poignée de redimensionnement d'annotation
+/// (#32) — même valeur pour la zone dessinée et la zone cliquable/glissable.
+const ANNOTATION_HANDLE_HALF: f32 = 5.0;
+/// Taille minimale (points page) qu'un redimensionnement d'annotation peut
+/// atteindre — évite un rect dégénéré (largeur/hauteur nulle ou négative) si
+/// l'utilisateur glisse une poignée au-delà du coin opposé.
+const ANNOTATION_MIN_SIZE: f64 = 4.0;
+
+/// Un coin du rectangle d'une annotation sélectionnée (#32) — celui que
+/// l'utilisateur a saisi pour redimensionner par glissement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Glissement en cours sur `selected_annotation` (#32) — déplacement
+/// (translation, taille inchangée) ou redimensionnement par un coin. Les deux
+/// capturent le rect *au début* du glissement (`start_rect`) et la position
+/// écran de départ (`start_pointer`) : le rect affiché à chaque frame est
+/// recalculé depuis ce point de départ plutôt qu'accumulé delta par delta,
+/// pour éviter toute dérive numérique sur un glissement long.
+#[derive(Debug, Clone, Copy)]
+enum AnnotationDrag {
+    Move {
+        start_pointer: egui::Pos2,
+        start_rect: [f64; 4],
+    },
+    Resize {
+        corner: Corner,
+        start_pointer: egui::Pos2,
+        start_rect: [f64; 4],
+    },
+}
 
 /// Ce que fait `text_modal` une fois l'utilisateur ayant validé sa saisie
 /// (Sprint 20) — `AddFreeText` pour #30 (ajouter du texte), `ReplaceText`
@@ -279,6 +315,17 @@ struct DocumentTab {
     /// (#32) — un bouton "🗑 Supprimer l'annotation" apparaît tant qu'une
     /// sélection existe.
     selected_annotation: Option<usize>,
+    /// Glissement en cours (déplacement ou redimensionnement par poignée) de
+    /// `selected_annotation` (#32) — `None` hors glissement. Voir
+    /// `handle_annotation_drag`.
+    annotation_drag: Option<AnnotationDrag>,
+    /// Rect "en direct" de l'annotation en cours de glissement, recalculé à
+    /// chaque frame de `dragged()` sans toucher `pdf-edit` (aucun `EditOp`
+    /// par frame) — seul `drag_stopped()` commet le rect final via
+    /// `Session::set_annotation_rect_on_current_page`. `None` hors
+    /// glissement, auquel cas `draw_annotation_outlines` retombe sur
+    /// `annotations[i].rect`.
+    annotation_drag_preview: Option<[f64; 4]>,
     /// Champs de formulaire texte de la page courante — recalculés à
     /// chaque changement de page/édition (voir `ensure_form_fields`, même
     /// schéma que `annotations`/`ensure_annotations`), affichés en contour
@@ -366,6 +413,8 @@ impl DocumentTab {
             annotations: Vec::new(),
             annotations_state: None,
             selected_annotation: None,
+            annotation_drag: None,
+            annotation_drag_preview: None,
             form_fields: Vec::new(),
             form_fields_state: None,
             last_scroll_offset: egui::Vec2::ZERO,
@@ -422,6 +471,8 @@ impl DocumentTab {
         self.annotations.clear();
         self.annotations_state = None;
         self.selected_annotation = None;
+        self.annotation_drag = None;
+        self.annotation_drag_preview = None;
         self.last_scroll_offset = egui::Vec2::ZERO;
         self.last_scroll_viewport = None;
         self.pending_scroll_offset = None;
@@ -932,6 +983,8 @@ impl DocumentTab {
         // suivre.
         self.annotations_state = None;
         self.selected_annotation = None;
+        self.annotation_drag = None;
+        self.annotation_drag_preview = None;
         // Une valeur de champ modifiée doit être relue (`ensure_form_fields`)
         // pour préremplir correctement la modale au prochain clic.
         self.form_fields_state = None;
@@ -1440,6 +1493,90 @@ impl DocumentTab {
             .iter()
             .find(|a| px >= a.rect[0] && px <= a.rect[2] && py >= a.rect[1] && py <= a.rect[3])
             .map(|a| a.index);
+    }
+
+    /// Démarre/poursuit/termine un glissement de déplacement ou de
+    /// redimensionnement de `selected_annotation` (#32). Renvoie `true` si
+    /// le glissement de cette frame concerne une annotation — l'appelant ne
+    /// doit alors pas aussi le traiter comme une sélection/un glissement de
+    /// sélection de texte (voir le commentaire au point d'appel).
+    ///
+    /// Ne modifie jamais `pdf-edit` pendant le glissement lui-même : chaque
+    /// frame de `dragged()` recalcule seulement `annotation_drag_preview`
+    /// (affichage), et c'est uniquement `drag_stopped()` qui commet le rect
+    /// final via `Session::set_annotation_rect_on_current_page` — un seul
+    /// `EditOp`/entrée d'annulation par glissement, pas une par frame.
+    fn handle_annotation_drag(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) -> bool {
+        if let Some(drag) = self.annotation_drag {
+            if response.dragged() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    self.annotation_drag_preview =
+                        Some(compute_annotation_drag_rect(drag, pos, scale));
+                }
+                return true;
+            }
+            if response.drag_stopped() {
+                self.annotation_drag = None;
+                let index = self.selected_annotation;
+                let rect = self.annotation_drag_preview.take();
+                if let (Some(index), Some(rect), Some(session)) = (index, rect, &mut self.session) {
+                    match session.set_annotation_rect_on_current_page(index, rect) {
+                        Ok(()) => self.invalidate_after_edit(),
+                        Err(e) => {
+                            self.error = Some(format!("Impossible de déplacer l'annotation : {e}"))
+                        }
+                    }
+                }
+                return true;
+            }
+            // Glissement toujours actif mais ni `dragged()` ni
+            // `drag_stopped()` cette frame (rare, ex. perte de focus) :
+            // consommé quand même pour ne pas laisser retomber sur la
+            // sélection de texte au milieu d'un glissement.
+            return true;
+        }
+
+        if !response.drag_started() {
+            return false;
+        }
+        let Some(index) = self.selected_annotation else {
+            return false;
+        };
+        let Some(annot) = self.annotations.iter().find(|a| a.index == index) else {
+            return false;
+        };
+        let Some(pos) = response.interact_pointer_pos() else {
+            return false;
+        };
+        let screen_rect = page_rect_to_screen(annot.rect, response.rect, media_box, scale);
+        let hit_corner = annotation_screen_corners(screen_rect)
+            .into_iter()
+            .find(|(_, corner_pos)| corner_pos.distance(pos) <= ANNOTATION_HANDLE_HALF * 1.8)
+            .map(|(corner, _)| corner);
+
+        if let Some(corner) = hit_corner {
+            self.annotation_drag = Some(AnnotationDrag::Resize {
+                corner,
+                start_pointer: pos,
+                start_rect: annot.rect,
+            });
+            self.annotation_drag_preview = Some(annot.rect);
+            true
+        } else if screen_rect.contains(pos) {
+            self.annotation_drag = Some(AnnotationDrag::Move {
+                start_pointer: pos,
+                start_rect: annot.rect,
+            });
+            self.annotation_drag_preview = Some(annot.rect);
+            true
+        } else {
+            false
+        }
     }
 
     /// Consomme le prochain simple clic sur la page tombant dans le rect
@@ -2093,6 +2230,7 @@ impl DocumentTab {
                                 media_box,
                                 scale,
                                 self.selected_annotation,
+                                self.annotation_drag_preview,
                             );
                         }
 
@@ -2116,8 +2254,16 @@ impl DocumentTab {
                         if self.add_text_mode {
                             self.handle_add_text_click(&response, media_box, scale);
                         } else if !self.handle_form_field_click(&response, media_box, scale) {
-                            self.handle_annotation_click(&response, media_box, scale);
-                            self.handle_text_selection(&response, media_box, scale);
+                            // Un glissement sur la sélection courante (#32,
+                            // déplacement ou poignée de redimensionnement) a
+                            // priorité sur la sélection/la sélection de texte
+                            // pour le même geste — sinon le même glissement
+                            // finirait aussi interprété comme une sélection
+                            // de texte sous l'annotation.
+                            if !self.handle_annotation_drag(&response, media_box, scale) {
+                                self.handle_annotation_click(&response, media_box, scale);
+                                self.handle_text_selection(&response, media_box, scale);
+                            }
                         }
                         if !self.selection_rects.is_empty() {
                             draw_highlights(
@@ -2199,6 +2345,114 @@ fn draw_highlights(
 /// par annotation de `annotations` (Sprint 20, #32) — l'annotation
 /// `selected` (le cas échéant) a un trait plus épais pour rester
 /// identifiable avant de cliquer "🗑 Supprimer l'annotation".
+/// Convertit un rectangle espace page (`[x0 y0 x1 y1]`, origine bas-gauche)
+/// en rectangle écran dans le repère de `image_rect` — même transformation
+/// que `draw_highlights`/`screen_to_page`, factorisée ici pour être partagée
+/// par le dessin du contour, celui des poignées et leur détection de clic
+/// (#32).
+fn page_rect_to_screen(
+    rect: [f64; 4],
+    image_rect: egui::Rect,
+    media_box: [f64; 4],
+    scale: f64,
+) -> egui::Rect {
+    let origin_x = media_box[0];
+    let origin_top = media_box[3];
+    let min = egui::pos2(
+        image_rect.min.x + ((rect[0] - origin_x) * scale) as f32,
+        image_rect.min.y + ((origin_top - rect[3]) * scale) as f32,
+    );
+    let max = egui::pos2(
+        image_rect.min.x + ((rect[2] - origin_x) * scale) as f32,
+        image_rect.min.y + ((origin_top - rect[1]) * scale) as f32,
+    );
+    egui::Rect::from_min_max(min, max)
+}
+
+/// Les 4 coins de `rect` associés au `Corner` qu'ils représentent, dans
+/// l'ordre où `page_rect_to_screen` les range (`min`/`max` XY, pas
+/// nécessairement haut-gauche/bas-droit en espace écran vs page — la page a
+/// l'origine en bas, l'écran en haut, donc `rect.min` en écran correspond au
+/// coin **haut-gauche** en page).
+fn annotation_screen_corners(screen_rect: egui::Rect) -> [(Corner, egui::Pos2); 4] {
+    [
+        (Corner::TopLeft, screen_rect.min),
+        (
+            Corner::TopRight,
+            egui::pos2(screen_rect.max.x, screen_rect.min.y),
+        ),
+        (
+            Corner::BottomLeft,
+            egui::pos2(screen_rect.min.x, screen_rect.max.y),
+        ),
+        (Corner::BottomRight, screen_rect.max),
+    ]
+}
+
+/// Calcule le rect espace page d'une annotation en cours de glissement à la
+/// position pointeur écran `pos` (#32) — voir `handle_annotation_drag`.
+/// Recalculé depuis `start_pointer`/`start_rect` (pas accumulé delta par
+/// delta d'une frame à l'autre) pour éviter toute dérive numérique sur un
+/// glissement long ; `y` écran croît vers le bas, `y` page vers le haut,
+/// d'où le signe opposé entre `dx`/`dy`.
+fn compute_annotation_drag_rect(drag: AnnotationDrag, pos: egui::Pos2, scale: f64) -> [f64; 4] {
+    match drag {
+        AnnotationDrag::Move {
+            start_pointer,
+            start_rect,
+        } => {
+            let dx = (pos.x - start_pointer.x) as f64 / scale;
+            let dy = (pos.y - start_pointer.y) as f64 / scale;
+            [
+                start_rect[0] + dx,
+                start_rect[1] - dy,
+                start_rect[2] + dx,
+                start_rect[3] - dy,
+            ]
+        }
+        AnnotationDrag::Resize {
+            corner,
+            start_pointer,
+            start_rect,
+        } => {
+            let dx = (pos.x - start_pointer.x) as f64 / scale;
+            let dy = (pos.y - start_pointer.y) as f64 / scale;
+            let [x0, y0, x1, y1] = start_rect;
+            let (mut nx0, mut ny0, mut nx1, mut ny1) = (x0, y0, x1, y1);
+            match corner {
+                Corner::TopLeft => {
+                    nx0 = x0 + dx;
+                    ny1 = y1 - dy;
+                }
+                Corner::TopRight => {
+                    nx1 = x1 + dx;
+                    ny1 = y1 - dy;
+                }
+                Corner::BottomLeft => {
+                    nx0 = x0 + dx;
+                    ny0 = y0 - dy;
+                }
+                Corner::BottomRight => {
+                    nx1 = x1 + dx;
+                    ny0 = y0 - dy;
+                }
+            }
+            // Empêche un rect dégénéré/inversé si la poignée est glissée
+            // au-delà du coin opposé : referme à `ANNOTATION_MIN_SIZE` du
+            // côté fixe plutôt que de laisser `x0 > x1`/`y0 > y1`.
+            match corner {
+                Corner::TopLeft | Corner::BottomLeft => nx0 = nx0.min(x1 - ANNOTATION_MIN_SIZE),
+                Corner::TopRight | Corner::BottomRight => nx1 = nx1.max(x0 + ANNOTATION_MIN_SIZE),
+            }
+            match corner {
+                Corner::TopLeft | Corner::TopRight => ny1 = ny1.max(y0 + ANNOTATION_MIN_SIZE),
+                Corner::BottomLeft | Corner::BottomRight => ny0 = ny0.min(y1 - ANNOTATION_MIN_SIZE),
+            }
+            [nx0, ny0, nx1, ny1]
+        }
+    }
+}
+
 fn draw_annotation_outlines(
     ui: &egui::Ui,
     image_response: &egui::Response,
@@ -2206,30 +2460,35 @@ fn draw_annotation_outlines(
     media_box: [f64; 4],
     scale: f64,
     selected: Option<usize>,
+    drag_preview: Option<[f64; 4]>,
 ) {
-    let origin_x = media_box[0];
-    let origin_top = media_box[3];
     let painter = ui.painter();
     for annot in annotations {
-        let rect = annot.rect;
-        let min = egui::pos2(
-            image_response.rect.min.x + ((rect[0] - origin_x) * scale) as f32,
-            image_response.rect.min.y + ((origin_top - rect[3]) * scale) as f32,
-        );
-        let max = egui::pos2(
-            image_response.rect.min.x + ((rect[2] - origin_x) * scale) as f32,
-            image_response.rect.min.y + ((origin_top - rect[1]) * scale) as f32,
-        );
-        let width = if selected == Some(annot.index) {
-            2.5
+        let is_selected = selected == Some(annot.index);
+        let rect = if is_selected {
+            drag_preview.unwrap_or(annot.rect)
         } else {
-            1.0
+            annot.rect
         };
+        let screen_rect = page_rect_to_screen(rect, image_response.rect, media_box, scale);
+        let width = if is_selected { 2.5 } else { 1.0 };
         painter.rect_stroke(
-            egui::Rect::from_min_max(min, max),
+            screen_rect,
             0.0,
             egui::Stroke::new(width, ANNOTATION_OUTLINE_COLOR),
         );
+        if is_selected {
+            for (_, corner_pos) in annotation_screen_corners(screen_rect) {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(
+                        corner_pos,
+                        egui::vec2(ANNOTATION_HANDLE_HALF * 2.0, ANNOTATION_HANDLE_HALF * 2.0),
+                    ),
+                    1.0,
+                    ANNOTATION_OUTLINE_COLOR,
+                );
+            }
+        }
     }
 }
 

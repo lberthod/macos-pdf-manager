@@ -300,6 +300,24 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 51 — Poignées de déplacement/redimensionnement d'annotation (#32)
+
+**Objectif :** dernier manque non trivial du groupe E (`audit50quest.md`, Must) — #32 restait ◐ depuis le Sprint 20 (sélection/suppression seulement). Ferme la moitié "poignées", pas la moitié "couleur/opacité" (voir ci-dessous pourquoi elle reste hors périmètre).
+
+- [x] **`pdf-edit::EditSession::set_annotation_rect`** (nouveau) : ne modifie que `/Rect` de l'annotation d'indice `annot_index` (même ordre que `remove_annotation`, résolu via `page_annotation_refs`), et remet `/QuadPoints` à l'échelle affine depuis l'ancien `/Rect` vers le nouveau s'il existe. Aucune régénération du flux `/AP /N` : il reste dessiné à l'origine `(0,0)`-`BBox` inchangé, c'est `pdf_core::interp::resolve_normal_appearance` (déjà existant depuis le Sprint 13-14) qui le mappe sur le `/Rect` courant — un déplacement (même taille) rend donc une translation exacte, un redimensionnement étire/compresse le contenu existant pour tenir dans le nouveau rectangle. Testé bout en bout (déplacement + `/QuadPoints` suivant + persistance après réouverture).
+- [x] **`pdf_app::Session::set_annotation_rect_on_current_page`** — wrapper d'une ligne, même schéma que les autres méthodes d'édition (`refresh_after_edit`). Testé (rect immédiatement visible dans `annotations_on_current_page` avant toute sauvegarde, et persiste après `save_edits_in_place` + réouverture).
+- [x] **`pdf-ui` : 4 poignées de coin glissables** sur l'annotation sélectionnée (`draw_annotation_outlines` les dessine, `handle_annotation_drag` les détecte/gère) : glisser à l'intérieur du contour déplace (translation), glisser une poignée redimensionne depuis le coin opposé fixe. Le rect affiché pendant le glissement (`annotation_drag_preview`) est recalculé à chaque frame sans toucher `pdf-edit` — un seul appel à `set_annotation_rect_on_current_page` (donc une seule entrée d'annulation) au relâchement du bouton, pas un par frame. Un redimensionnement ne peut pas inverser le rectangle : la poignée mobile est bornée à `ANNOTATION_MIN_SIZE` (4pt) du côté fixe.
+
+**Non fait dans ce sprint** (la ligne #32 reste donc ◐, pas ☑) :
+- **Couleur/opacité après création** : contrairement au déplacement/redimensionnement (qui ne touche que `/Rect`, jamais le contenu de l'`/AP`), changer la couleur demanderait de reparser puis régénérer le flux de contenu existant selon le sous-type (`rg`/`RG` pour Highlight/Underline/StrikeOut, texte pour FreeText) — un vrai sous-morceau de travail par type d'annotation, pas un simple champ à mettre à jour. Le seul point d'opacité déjà réglable (`/ca` de l'`ExtGState` du surlignage, `HIGHLIGHT_FILL_ALPHA` fixe) n'est pas exposé à l'utilisateur.
+- **Sélection non conservée après un déplacement/redimensionnement** : `set_annotation_rect_on_current_page` appelle `refresh_after_edit` → `pdf-ui::invalidate_after_edit` efface `selected_annotation` comme après n'importe quelle édition (les indices peuvent changer après d'autres opérations) — l'utilisateur doit recliquer l'annotation pour continuer à la déplacer. Accepté comme la même limitation que le reste de l'app plutôt qu'un cas spécial.
+- **Poignées de bord** (milieu de chaque côté, redimensionnement 1 axe) : seuls les 4 coins existent, pas de redimensionnement horizontal/vertical seul.
+- **Vérification interactive** : comme pour #20/#48 (Sprint 21), l'environnement de développement n'a pas d'accès à une session graphique macOS pour confirmer le geste de glissement à la souris — validé par les tests `pdf-edit`/`pdf-app` (bout en bout sur de vrais fichiers) et par lecture de code, pas par un essai interactif réel.
+
+**Critère de sortie :** `cargo test --workspace` vert (216 tests, +1 `pdf-edit` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint** pour la moitié "poignées" de #32 — reste ◐ dans `audit50quest.md`, la moitié "couleur/opacité" restant à faire séparément.
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

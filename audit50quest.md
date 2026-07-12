@@ -62,7 +62,7 @@ Légende : ☐ Absent · ◐ Partiel · ☑ Présent — Prio : M Must · S Shou
 | 29 | Dessin à main levée | C | ○ | ☐ | Non implémenté. |
 | 30 | Zone de texte libre (FreeText) | S | ○ | ☑ | **Fermé Sprint 20.** Bouton bascule "📝 Ajouter texte" → clic sur la page → boîte de dialogue modale → `add_free_text_on_current_page`. Boîte de taille fixe (`NEW_TEXT_BOX_SIZE`), pas encore redimensionnable par l'utilisateur. |
 | 31 | Signature (tracer/importer, poser, redimensionner) | S | ○ | ☐ | Non implémenté, ni moteur ni UI. |
-| 32 | Éditer/déplacer/supprimer une annotation (poignées, couleur, opacité) | M | ○ | ◐ | **Amélioré Sprint 20** (reste ◐, pas ☑) : `Session::annotations_on_current_page` liste les annotations de la page, `pdf-ui` dessine un contour cliquable par annotation et propose "🗑 Supprimer l'annotation" au clic. **Toujours pas de poignées de déplacement/redimensionnement ni de réglage couleur/opacité après création** — délibérément hors scope de cette passe. |
+| 32 | Éditer/déplacer/supprimer une annotation (poignées, couleur, opacité) | M | ○ | ◐ | **Amélioré Sprint 20** : `Session::annotations_on_current_page` liste les annotations de la page, `pdf-ui` dessine un contour cliquable par annotation et propose "🗑 Supprimer l'annotation" au clic. **Poignées de déplacement/redimensionnement fermées au Sprint 51** : `EditSession::set_annotation_rect` (ne touche que `/Rect`, remis à l'échelle affine sur `/QuadPoints` si présent — le flux `/AP /N` existant est mappé dessus par `resolve_normal_appearance`, pas régénéré) + `Session::set_annotation_rect_on_current_page` + 4 poignées de coin glissables dans `pdf-ui` (`handle_annotation_drag`, un seul `EditOp`/undo par glissement, pas un par frame). **Reste ◐, pas ☑ : toujours pas de réglage couleur/opacité après création** (nécessiterait de reparser/régénérer le contenu de l'`/AP` existant selon le sous-type, hors périmètre de cette passe). |
 
 ## F · Manipulation de pages
 
@@ -136,7 +136,7 @@ Implémenté au Sprint 21 (délégation à Aperçu via AppleScript) mais **non v
 - **#21 (recherche)** : fonctionnelle mais sans compteur d'occurrences ni reconstruction par blocs — utilisable mais perçue comme "brute".
 - **#23 (sélection)** : le glisser et le double/triple-clic marchent (Sprint 18) ; reste la sélection en mode défilement continu, absente.
 - **#14/#16 (fidélité de rendu)** : très solide (niveau 1 de la grille de conformité PDF entièrement acquis, niveau 2 bien avancé), le vrai manque restant est Type1 historique et les espaces colorimétriques avancés — un manque de fond de dossier, pas un manque quotidien.
-- **#32 (annotations)** : sélection/suppression fermées au Sprint 20, mais toujours pas de poignées de déplacement/redimensionnement ni de réglage couleur/opacité après création.
+- **#32 (annotations)** : sélection/suppression fermées au Sprint 20, poignées de déplacement/redimensionnement fermées au Sprint 51 — reste seulement le réglage couleur/opacité après création.
 
 ### Le piège connu : ligne 40
 

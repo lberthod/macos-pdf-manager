@@ -452,6 +452,19 @@ impl Session {
         self.refresh_after_edit()
     }
 
+    /// Déplace/redimensionne l'annotation d'indice `annot_index` de la page
+    /// courante vers `new_rect` (voir `pdf_edit::EditSession::set_annotation_rect`,
+    /// #32) et rafraîchit le rendu.
+    pub fn set_annotation_rect_on_current_page(
+        &mut self,
+        annot_index: usize,
+        new_rect: [f64; 4],
+    ) -> Result<(), String> {
+        self.edit
+            .set_annotation_rect(self.page_index, annot_index, new_rect)?;
+        self.refresh_after_edit()
+    }
+
     /// Retire l'annotation d'indice `annot_index` de la page courante (voir
     /// `pdf_edit::EditSession::remove_annotation`) et rafraîchit le rendu.
     pub fn remove_annotation_on_current_page(&mut self, annot_index: usize) -> Result<(), String> {
@@ -1265,6 +1278,53 @@ mod tests {
         let after_removal = session.annotations_on_current_page().unwrap();
         assert_eq!(after_removal.len(), 1);
         assert_eq!(after_removal[0].subtype, "Underline");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `set_annotation_rect_on_current_page` (#32) déplace l'annotation et le
+    /// nouveau rect est immédiatement visible dans `annotations_on_current_page`
+    /// (avant toute sauvegarde, comme les autres opérations d'édition), et
+    /// persiste après réouverture.
+    #[test]
+    fn set_annotation_rect_on_current_page_moves_and_persists() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+        let annots = session.annotations_on_current_page().unwrap();
+        assert_eq!(annots[0].rect, [100.0, 600.0, 300.0, 630.0]);
+
+        session
+            .set_annotation_rect_on_current_page(annots[0].index, [150.0, 620.0, 350.0, 650.0])
+            .unwrap();
+        let moved = session.annotations_on_current_page().unwrap();
+        assert_eq!(moved[0].rect, [150.0, 620.0, 350.0, 650.0]);
+
+        session.save_edits_in_place().unwrap();
+        let reopened = pdf_core::Document::open(std::fs::read(&path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annot_ref = page
+            .dict
+            .get("Annots")
+            .and_then(|o| reopened.get(o).ok())
+            .and_then(|a| a.as_array().map(|v| v.to_vec()))
+            .unwrap();
+        let annot = reopened.get(&annot_ref[0]).unwrap();
+        let rect: Vec<f64> = annot
+            .as_dict()
+            .unwrap()
+            .get("Rect")
+            .and_then(|o| o.as_array())
+            .unwrap()
+            .iter()
+            .map(obj_num)
+            .collect();
+        assert_eq!(rect, vec![150.0, 620.0, 350.0, 650.0]);
 
         std::fs::remove_file(&path).ok();
     }

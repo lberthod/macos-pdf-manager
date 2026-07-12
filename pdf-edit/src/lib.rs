@@ -711,6 +711,88 @@ impl EditSession {
         Ok(())
     }
 
+    /// Déplace/redimensionne l'annotation d'indice `annot_index` (même ordre
+    /// que `remove_annotation`) de la page `page_index` vers `new_rect`
+    /// (`[x0 y0 x1 y1]`, espace page, pas nécessairement normalisé) — #32
+    /// (poignées de déplacement/redimensionnement). Ne touche qu'`/Rect` (et
+    /// `/QuadPoints` s'il existe, remis à l'échelle affine depuis l'ancien
+    /// `/Rect` vers le nouveau) : le flux d'apparence `/AP /N` n'est jamais
+    /// régénéré, il reste dessiné à `origin (0,0)`-`BBox` puis mappé sur
+    /// `/Rect` par `pdf_core::interp::resolve_normal_appearance` (ISO
+    /// 32000-1 §12.5.5) — un déplacement (même taille) rend donc une
+    /// translation exacte du contenu existant, un redimensionnement
+    /// l'étire/le compresse pour tenir dans le nouveau rectangle (pas de
+    /// retour à la ligne recalculé pour `/FreeText`, approximation
+    /// acceptable comme le reste de ce moteur pour ce type d'opération).
+    pub fn set_annotation_rect(
+        &mut self,
+        page_index: usize,
+        annot_index: usize,
+        new_rect: [f64; 4],
+    ) -> Result<(), String> {
+        let refs = self.page_annotation_refs(page_index)?;
+        let annot_ref = *refs.get(annot_index).ok_or_else(|| {
+            format!(
+                "annotation index {annot_index} out of bounds (0..{})",
+                refs.len()
+            )
+        })?;
+
+        let before = self.current(annot_ref.num)?;
+        let mut dict = before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "annotation object is not a dictionary".to_string())?;
+
+        let old_rect = dict
+            .get("Rect")
+            .and_then(|o| o.as_array())
+            .filter(|r| r.len() >= 4)
+            .map(|r| [num(&r[0]), num(&r[1]), num(&r[2]), num(&r[3])])
+            .unwrap_or(new_rect);
+
+        let (x0, y0, x1, y1) = (
+            new_rect[0].min(new_rect[2]),
+            new_rect[1].min(new_rect[3]),
+            new_rect[0].max(new_rect[2]),
+            new_rect[1].max(new_rect[3]),
+        );
+        dict.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Real(x0),
+                Object::Real(y0),
+                Object::Real(x1),
+                Object::Real(y1),
+            ]),
+        );
+
+        if let Some(Object::Array(quad)) = dict.get("QuadPoints").cloned() {
+            let (ox0, oy0, ox1, oy1) = (old_rect[0], old_rect[1], old_rect[2], old_rect[3]);
+            let (ow, oh) = ((ox1 - ox0).max(1e-6), (oy1 - oy0).max(1e-6));
+            let rescaled: Vec<Object> = quad
+                .chunks(2)
+                .flat_map(|pair| {
+                    let px = num(&pair[0]);
+                    let py = num(&pair[1]);
+                    let fx = (px - ox0) / ow;
+                    let fy = (py - oy0) / oh;
+                    [
+                        Object::Real(x0 + fx * (x1 - x0)),
+                        Object::Real(y0 + fy * (y1 - y0)),
+                    ]
+                })
+                .collect();
+            dict.insert("QuadPoints", Object::Array(rescaled));
+        }
+
+        let after = Object::Dictionary(dict);
+        self.commit(EditOp {
+            modified: vec![(annot_ref.num, before, after)],
+        });
+        Ok(())
+    }
+
     /// Liste les champs de formulaire texte (`/FT /Tx`) de `/AcroForm/Fields`
     /// (même périmètre qu'un seul niveau que `find_form_field`/
     /// `set_form_field_value` — voir la doc de module) : assez d'information
@@ -2110,6 +2192,60 @@ mod tests {
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(annots, 1);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    #[test]
+    fn set_annotation_rect_moves_and_rescales_quad_points_and_persists() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_highlight_annotation(0, [100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0), vec![])
+            .unwrap();
+
+        // Déplacement pur (même taille) : translation de +50/+20.
+        session
+            .set_annotation_rect(0, 0, [150.0, 620.0, 350.0, 650.0])
+            .unwrap();
+
+        let out_path = write_fixture(b"move-annot-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annot_ref = page
+            .dict
+            .get("Annots")
+            .and_then(|o| reopened.get(o).ok())
+            .and_then(|a| a.as_array().map(|v| v.to_vec()))
+            .unwrap();
+        let annot = reopened.get(&annot_ref[0]).unwrap();
+        let dict = annot.as_dict().unwrap();
+        let rect: Vec<f64> = dict
+            .get("Rect")
+            .and_then(|o| o.as_array())
+            .unwrap()
+            .iter()
+            .map(num)
+            .collect();
+        assert_eq!(rect, vec![150.0, 620.0, 350.0, 650.0]);
+
+        // QuadPoints doit avoir suivi le même déplacement (largeur/hauteur
+        // inchangées), pas être resté à l'ancienne position.
+        let quad: Vec<f64> = dict
+            .get("QuadPoints")
+            .and_then(|o| o.as_array())
+            .unwrap()
+            .iter()
+            .map(num)
+            .collect();
+        assert_eq!(quad[0], 150.0); // coin haut-gauche x
+        assert_eq!(quad[1], 650.0); // coin haut-gauche y
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();

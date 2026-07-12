@@ -278,11 +278,30 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 **Objectif :** fiabiliser avant diffusion plus large. (Renuméroté de "18+" à "23+" pour laisser la place aux Sprints 18-22 issus de l'audit 50 fonctionnalités, voir [analyse_sprint.md](./analyse_sprint.md) — certains items ci-dessous sont déjà repris plus tôt dans ce plan : chiffrement et accessibilité au Sprint 22.)
 
-- [ ] Fuzzing du parser (`cargo-fuzz`).
+- [x] Fuzzing du parser (`cargo-fuzz`) — voir Sprint 56 ci-dessous.
 - [ ] Optimisation performance sur gros fichiers.
 - [ ] Accessibilité, conformité PDF/A.
-- [ ] Chiffrement (`/Encrypt`, RC4/AES).
+- [x] Chiffrement (`/Encrypt`, RC4/AES) — fait au Sprint 22, voir `analyse_sprint.md`.
 - [ ] Signatures numériques.
+
+---
+
+## Sprint 56 — Fuzzing du parser (`cargo-fuzz`)
+
+**Objectif :** premier point du Sprint 23+ (durcissement) engagé — fuzzer `pdf-core`, la surface d'attaque la plus exposée du projet (n'importe quel fichier ouvert par l'utilisateur y passe). Voir [fuzz/README.md](./fuzz/README.md) pour le détail (prérequis, cibles, comment relancer).
+
+- [x] **Infrastructure `cargo-fuzz`** (`fuzz/`, nouveau workspace Cargo indépendant du workspace principal) : deux cibles libFuzzer, `parse_document` (`Document::open` + balayage superficiel des pages/table des matières, sans rendu) et `render_document` (comme la première, mais rend la première page en CPU via `pdf-render` — couvre en plus interpréteur de contenu, résolution de polices, décodage d'image). Nécessite un toolchain **nightly** (`-Zsanitizer=address`, indisponible sur stable) — installé et utilisé uniquement pour cette passe, le reste du projet reste sur stable.
+- [x] **Deux bugs réels trouvés dans les deux premières minutes** de fuzzing, tous deux des débordements arithmétiques (détectés par les assertions de débordement, actives sous `cargo fuzz` **et** sous n'importe quel build `dev` standard de ce workspace — pas seulement un artefact du fuzzing) :
+  - `pdf-core::filters::ascii85_decode` : un octet hors de la plage ASCII85 valide (`'!'..='u'`) faisait paniquer `b - 33`. Corrigé : erreur propre, comme `ascii_hex_decode` le fait déjà pour un chiffre hexadécimal invalide.
+  - `pdf-core::parser::parse_stream_body` : un `/Length` négatif faisait déborder `*n as usize` puis `pos + len`. Corrigé : un `/Length` négatif est traité comme absent (repli sur la recherche littérale de `endstream`) ; `pos.saturating_add(len)` en défense en profondeur pour le cas positif mais absurdement grand.
+- [x] **Régressions** : un test unitaire par bug (`pdf-core/src/filters.rs`/`pdf-core/src/parser.rs`), pas les octets de plantage bruts commités (le corpus/les artefacts `cargo-fuzz` sont volontairement exclus de git — voir `fuzz/README.md` sur pourquoi et comment les reconstituer depuis le corpus de fixtures déjà versionné).
+- [x] **~260 000 exécutions cumulées** sur les deux cibles après ces deux correctifs, sans nouveau plantage.
+
+**Non fait dans ce sprint** (voir `fuzz/README.md` "Non fait") :
+- **CI continue** : pas de job dédié qui lance `cargo fuzz` en continu (ex. OSS-Fuzz) — session ponctuelle, pas une intégration récurrente.
+- **Cible dédiée à l'édition** (`pdf-edit`) : seule la lecture (`pdf-core`) est fuzzée — l'édition part toujours d'un document déjà ouvert avec succès, surface d'attaque nettement plus restreinte.
+
+**Critère de sortie :** `cargo test --workspace` vert (231 tests, +2 `pdf-core`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre — le workspace principal reste inchangé côté toolchain (stable), seul `fuzz/` nécessite nightly. **Statut réel : atteint.** Premier point du Sprint 23+ fermé ; deux bugs réels corrigés dès la première session de fuzzing, ce qui valide la mise en place (pas un exercice théorique).
 
 ---
 

@@ -139,6 +139,9 @@ fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
             out.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
+        if !(33..=117).contains(&b) {
+            return Err(PdfError::DecodeError("ASCII85Decode: invalid digit".into()));
+        }
         group[count] = b - 33;
         count += 1;
         if count == 5 {
@@ -370,6 +373,19 @@ mod tests {
     fn ascii85_roundtrip() {
         let decoded = ascii85_decode(b"87cURD_*#4DfTZ)+T~>").unwrap();
         assert_eq!(decoded, b"Hello, World!");
+    }
+
+    /// Régression trouvée par `cargo fuzz` (`fuzz/fuzz_targets/render_document.rs`,
+    /// Sprint 56) : un octet hors de la plage ASCII85 valide (`'!'`..=`'u'`,
+    /// 33..=117) qui n'est ni espace, ni `~`, ni `z` faisait paniquer
+    /// `b - 33` par débordement (`attempt to subtract with overflow`) sur un
+    /// build avec assertions de débordement activées — doit renvoyer une
+    /// erreur propre à la place, comme `ascii_hex_decode` le fait déjà pour
+    /// un chiffre hexadécimal invalide.
+    #[test]
+    fn ascii85_decode_rejects_byte_below_valid_range_instead_of_panicking() {
+        assert!(ascii85_decode(&[0x00]).is_err());
+        assert!(ascii85_decode(b"\x01\x02").is_err());
     }
 
     #[test]

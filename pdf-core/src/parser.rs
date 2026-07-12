@@ -174,12 +174,20 @@ impl<'a> Parser<'a> {
         }
 
         let length = match dict.get("Length") {
-            Some(Object::Integer(n)) => Some(*n as usize),
+            // Un `/Length` négatif est invalide (trouvé par `cargo fuzz`,
+            // Sprint 56) : `*n as usize` l'enroulerait vers un nombre
+            // énorme — traité comme absent plutôt que rejeter tout
+            // l'objet, même repli que pour une référence indirecte
+            // ci-dessous (recherche littérale de `endstream`).
+            Some(Object::Integer(n)) if *n >= 0 => Some(*n as usize),
             _ => None, // Référence indirecte : résolue plus tard par le Document (Sprint 3-4).
         };
 
         let (raw_data, end_pos) = if let Some(len) = length {
-            let end = (pos + len).min(self.data.len());
+            // `saturating_add` : défense en profondeur même pour un
+            // `/Length` positif mais absurdement grand (proche de
+            // `usize::MAX`), qui pourrait sinon faire déborder l'addition.
+            let end = pos.saturating_add(len).min(self.data.len());
             (self.data[pos..end].to_vec(), end)
         } else {
             // Fallback : chercher "endstream" littéralement.
@@ -297,6 +305,27 @@ mod tests {
         let (_, _, obj) = parser.parse_indirect_object().unwrap();
         match obj {
             Object::Stream(s) => assert_eq!(s.raw_data, b"Hello World"),
+            other => panic!("expected stream, got {other:?}"),
+        }
+    }
+
+    /// Régression trouvée par `cargo fuzz` (`fuzz/fuzz_targets/parse_document.rs`,
+    /// Sprint 56) : un `/Length` négatif faisait déborder `*n as usize`
+    /// (enroulé vers un nombre énorme) puis `pos + len` (`attempt to add
+    /// with overflow` sur un build avec assertions de débordement activées)
+    /// — doit se replier sur la recherche littérale de `endstream` comme
+    /// pour une référence indirecte non résolue, pas paniquer.
+    #[test]
+    fn negative_length_falls_back_to_endstream_search_instead_of_panicking() {
+        let input = b"1 0 obj\n<< /Length -10 >>\nstream\nHello World\nendstream\nendobj";
+        let mut parser = Parser::new(input);
+        let (_, _, obj) = parser.parse_indirect_object().unwrap();
+        match obj {
+            // Repli "recherche littérale de `endstream`" : inclut le saut
+            // de ligne qui précède le mot-clé, comme pour toute autre
+            // référence indirecte non résolue (même comportement, pas une
+            // particularité du cas négatif).
+            Object::Stream(s) => assert_eq!(s.raw_data, b"Hello World\n"),
             other => panic!("expected stream, got {other:?}"),
         }
     }

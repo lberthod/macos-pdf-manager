@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "papyruspdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pdf-core]
+path = "../pdf-core"
+
+[dependencies.pdf-render]
+path = "../pdf-render"
+
+[[bin]]
+name = "parse_document"
+path = "fuzz_targets/parse_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render_document"
+path = "fuzz_targets/render_document.rs"
+test = false
+doc = false
+bench = false

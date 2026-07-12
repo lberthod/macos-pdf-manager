@@ -279,29 +279,10 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 **Objectif :** fiabiliser avant diffusion plus large. (Renuméroté de "18+" à "23+" pour laisser la place aux Sprints 18-22 issus de l'audit 50 fonctionnalités, voir [analyse_sprint.md](./analyse_sprint.md) — certains items ci-dessous sont déjà repris plus tôt dans ce plan : chiffrement et accessibilité au Sprint 22.)
 
 - [x] Fuzzing du parser (`cargo-fuzz`) — voir Sprint 56 ci-dessous.
-- [ ] Optimisation performance sur gros fichiers.
+- [x] Optimisation performance sur gros fichiers — voir Sprint 57 ci-dessous.
 - [ ] Accessibilité, conformité PDF/A.
 - [x] Chiffrement (`/Encrypt`, RC4/AES) — fait au Sprint 22, voir `analyse_sprint.md`.
 - [ ] Signatures numériques.
-
----
-
-## Sprint 56 — Fuzzing du parser (`cargo-fuzz`)
-
-**Objectif :** premier point du Sprint 23+ (durcissement) engagé — fuzzer `pdf-core`, la surface d'attaque la plus exposée du projet (n'importe quel fichier ouvert par l'utilisateur y passe). Voir [fuzz/README.md](./fuzz/README.md) pour le détail (prérequis, cibles, comment relancer).
-
-- [x] **Infrastructure `cargo-fuzz`** (`fuzz/`, nouveau workspace Cargo indépendant du workspace principal) : deux cibles libFuzzer, `parse_document` (`Document::open` + balayage superficiel des pages/table des matières, sans rendu) et `render_document` (comme la première, mais rend la première page en CPU via `pdf-render` — couvre en plus interpréteur de contenu, résolution de polices, décodage d'image). Nécessite un toolchain **nightly** (`-Zsanitizer=address`, indisponible sur stable) — installé et utilisé uniquement pour cette passe, le reste du projet reste sur stable.
-- [x] **Deux bugs réels trouvés dans les deux premières minutes** de fuzzing, tous deux des débordements arithmétiques (détectés par les assertions de débordement, actives sous `cargo fuzz` **et** sous n'importe quel build `dev` standard de ce workspace — pas seulement un artefact du fuzzing) :
-  - `pdf-core::filters::ascii85_decode` : un octet hors de la plage ASCII85 valide (`'!'..='u'`) faisait paniquer `b - 33`. Corrigé : erreur propre, comme `ascii_hex_decode` le fait déjà pour un chiffre hexadécimal invalide.
-  - `pdf-core::parser::parse_stream_body` : un `/Length` négatif faisait déborder `*n as usize` puis `pos + len`. Corrigé : un `/Length` négatif est traité comme absent (repli sur la recherche littérale de `endstream`) ; `pos.saturating_add(len)` en défense en profondeur pour le cas positif mais absurdement grand.
-- [x] **Régressions** : un test unitaire par bug (`pdf-core/src/filters.rs`/`pdf-core/src/parser.rs`), pas les octets de plantage bruts commités (le corpus/les artefacts `cargo-fuzz` sont volontairement exclus de git — voir `fuzz/README.md` sur pourquoi et comment les reconstituer depuis le corpus de fixtures déjà versionné).
-- [x] **~260 000 exécutions cumulées** sur les deux cibles après ces deux correctifs, sans nouveau plantage.
-
-**Non fait dans ce sprint** (voir `fuzz/README.md` "Non fait") :
-- **CI continue** : pas de job dédié qui lance `cargo fuzz` en continu (ex. OSS-Fuzz) — session ponctuelle, pas une intégration récurrente.
-- **Cible dédiée à l'édition** (`pdf-edit`) : seule la lecture (`pdf-core`) est fuzzée — l'édition part toujours d'un document déjà ouvert avec succès, surface d'attaque nettement plus restreinte.
-
-**Critère de sortie :** `cargo test --workspace` vert (231 tests, +2 `pdf-core`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre — le workspace principal reste inchangé côté toolchain (stable), seul `fuzz/` nécessite nightly. **Statut réel : atteint.** Premier point du Sprint 23+ fermé ; deux bugs réels corrigés dès la première session de fuzzing, ce qui valide la mise en place (pas un exercice théorique).
 
 ---
 
@@ -409,6 +390,44 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 - **Vérification interactive** : même limite que les Sprints 51-54.
 
 **Critère de sortie :** `cargo test --workspace` vert (229 tests, +3 `pdf-edit` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint.** #32 passe de ◐ à ☑ dans `audit50quest.md` — couverture Must 81 % → 83 %. Plus aucune ligne du groupe E/F Must à l'état "moteur prêt, UI absente/partielle" (voir aussi #43, fermé au Sprint 54).
+
+---
+
+## Sprint 56 — Fuzzing du parser (`cargo-fuzz`)
+
+**Objectif :** premier point du Sprint 23+ (durcissement) engagé — fuzzer `pdf-core`, la surface d'attaque la plus exposée du projet (n'importe quel fichier ouvert par l'utilisateur y passe). Voir [fuzz/README.md](./fuzz/README.md) pour le détail (prérequis, cibles, comment relancer).
+
+- [x] **Infrastructure `cargo-fuzz`** (`fuzz/`, nouveau workspace Cargo indépendant du workspace principal) : deux cibles libFuzzer, `parse_document` (`Document::open` + balayage superficiel des pages/table des matières, sans rendu) et `render_document` (comme la première, mais rend la première page en CPU via `pdf-render` — couvre en plus interpréteur de contenu, résolution de polices, décodage d'image). Nécessite un toolchain **nightly** (`-Zsanitizer=address`, indisponible sur stable) — installé et utilisé uniquement pour cette passe, le reste du projet reste sur stable.
+- [x] **Deux bugs réels trouvés dans les deux premières minutes** de fuzzing, tous deux des débordements arithmétiques (détectés par les assertions de débordement, actives sous `cargo fuzz` **et** sous n'importe quel build `dev` standard de ce workspace — pas seulement un artefact du fuzzing) :
+  - `pdf-core::filters::ascii85_decode` : un octet hors de la plage ASCII85 valide (`'!'..='u'`) faisait paniquer `b - 33`. Corrigé : erreur propre, comme `ascii_hex_decode` le fait déjà pour un chiffre hexadécimal invalide.
+  - `pdf-core::parser::parse_stream_body` : un `/Length` négatif faisait déborder `*n as usize` puis `pos + len`. Corrigé : un `/Length` négatif est traité comme absent (repli sur la recherche littérale de `endstream`) ; `pos.saturating_add(len)` en défense en profondeur pour le cas positif mais absurdement grand.
+- [x] **Régressions** : un test unitaire par bug (`pdf-core/src/filters.rs`/`pdf-core/src/parser.rs`), pas les octets de plantage bruts commités (le corpus/les artefacts `cargo-fuzz` sont volontairement exclus de git — voir `fuzz/README.md` sur pourquoi et comment les reconstituer depuis le corpus de fixtures déjà versionné).
+- [x] **~260 000 exécutions cumulées** sur les deux cibles après ces deux correctifs, sans nouveau plantage.
+
+**Non fait dans ce sprint** (voir `fuzz/README.md` "Non fait") :
+- **CI continue** : pas de job dédié qui lance `cargo fuzz` en continu (ex. OSS-Fuzz) — session ponctuelle, pas une intégration récurrente.
+- **Cible dédiée à l'édition** (`pdf-edit`) : seule la lecture (`pdf-core`) est fuzzée — l'édition part toujours d'un document déjà ouvert avec succès, surface d'attaque nettement plus restreinte.
+
+**Critère de sortie :** `cargo test --workspace` vert (231 tests, +2 `pdf-core`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre — le workspace principal reste inchangé côté toolchain (stable), seul `fuzz/` nécessite nightly. **Statut réel : atteint.** Premier point du Sprint 23+ fermé ; deux bugs réels corrigés dès la première session de fuzzing, ce qui valide la mise en place (pas un exercice théorique).
+
+---
+
+## Sprint 57 — Optimisation performance sur gros fichiers
+
+**Objectif :** deuxième point du Sprint 23+ engagé — pas d'optimisation spéculative, mesurer d'abord sur un document réellement volumineux puis corriger le ou les points chauds trouvés (même méthode que le fuzzing au Sprint 56 : mesurer avant de deviner).
+
+- [x] **`pdf-cli bench <file.pdf>`** (nouvelle commande, permanente — pas un outil jetable) : mesure séparément l'ouverture (parse + xref), le décodage du contenu par page, l'interprétation (`Interpreter::run_page_with_annotations`), l'extraction de texte (`pdf-text`) et le rendu CPU (`pdf-render`) sur **tout** le document, avec un total et une moyenne par page pour chaque étape — contrairement à `render-info`/`render`/`text`, limités à une seule page.
+- [x] **Mesure sur un document synthétique de 1500 pages** (texte dense : 40 lignes/page, ~4000 caractères/page, police Helvetica standard non intégrée — généré via `reportlab`, pas commité, cette taille de corpus étant hors du principe "diversité pas volume" déjà établi pour `pdf-core/tests/fixtures/`) : `Interpret (total)` ressortait à **3,09 s** (2,06 ms/page) — le point chaud le plus net après `Render CPU`.
+- [x] **Bug de performance trouvé et corrigé — pas seulement une optimisation, un vrai gaspillage documenté comme tel dans le code depuis le Sprint 5-6/7-8** : `Interpreter::show_text` rechargeait le dictionnaire de police complet (`Font::load` — `/Widths`, `/Encoding`, `/ToUnicode`) à **chaque** opérateur `Tj`/`TJ`, avec un commentaire explicite ("acceptable tant que les documents restent de taille modeste"). Corrigé par `Interpreter::font_cache` (nouveau champ, `BTreeMap<ObjRef, Rc<Font>>`) : une police référencée indirectement (le cas normal — tout générateur PDF réel partage le même objet `/Font` entre les pages) n'est chargée qu'une fois pour tout le document, pas une fois par `Tj`/`TJ`. Un dictionnaire de police inline (rare) reste rechargé à chaque appel, comme avant — pas de référence d'objet stable à utiliser comme clé, donc aucun risque de partage incorrect entre `resources_stack` imbriquées (la préoccupation exacte que le commentaire d'origine visait à éviter).
+- [x] **Deuxième gaspillage trouvé en creusant le premier** : même une fois `Font` mis en cache, `Font::glyph_outline`/`cid_glyph_outline` reparsaient la police entière depuis ses octets bruts (`ttf_parser::Face::parse`) à **chaque** caractère — alors qu'un texte de plusieurs milliers de caractères n'a qu'une poignée de codes distincts (26 lettres, chiffres, ponctuation). Corrigé par `outline_cache`/`cid_outline_cache` (nouveaux champs `Font`, `RefCell<HashMap<...>>`) : le contour d'un code déjà vu par cette instance de `Font` est réutilisé au lieu d'être recalculé — et puisque `Font` est maintenant lui-même mis en cache pour tout le document (point précédent), c'est bien "une fois par caractère distinct par document", pas "une fois par caractère distinct par page".
+- [x] **Résultat mesuré** (même document, `pdf-cli bench`) : `Interpret` **3,09 s → 564 ms** (÷5,5, 2,06 ms/page → 376 µs/page) ; total bout en bout **18,01 s → 12,15 s** (÷1,5). `Render CPU` reste dominant (11,55 s/12,15 s, ~95 %) — voir "Non fait" ci-dessous.
+- [x] **Régressions** : `pdf-core/src/interp.rs::lookup_font_caches_by_object_reference` (`Rc::ptr_eq` entre deux appels consécutifs sur la même référence d'objet, fixture réel) — la correction elle-même (pas de nouveau comportement observable côté `DisplayList`, uniquement moins de travail redondant) est aussi couverte indirectement par l'ensemble des tests `pdf-core`/`interp` existants, qui échoueraient si le cache renvoyait un résultat incorrect.
+
+**Non fait dans ce sprint** (mesuré, pas hors périmètre par supposition) :
+- **`Render CPU` reste le poste dominant** (~95 % du total sur le document de test) : c'est la rasterisation `tiny-skia` elle-même (chemins vectoriels de ~4000 glyphes/page + un rectangle), pas un gaspillage algorithmique comme les deux corrigés ci-dessus — l'améliorer demanderait soit un atlas de glyphes façon `pdf-render-gpu` (Sprint 9-10, `GlyphCache` — pas encore côté CPU), soit une réorganisation plus profonde du pipeline de rasterisation, un chantier bien plus large que cette passe. **À relativiser** : ce chemin CPU synchrone est un chemin de repli (voir `pdf_render::render_page` vs le backend GPU par défaut, Sprint 9-10) et `pdf-ui` ne rend jamais 1500 pages synchrones d'un coup de toute façon (défilement virtualisé + rendu hors thread UI depuis le Sprint 21, #20) — ce document synthétique sert à isoler le coût par page, pas à simuler un scénario d'usage réel.
+- **`pdf-app::Session`** n'a pas de cache de police équivalent à celui ajouté dans `pdf-core::interp` : `Session::render_cache`/`text_cache` (Sprint 9-10) mettent déjà en cache des pages *entières* déjà rendues/le texte déjà extrait — donc pour l'usage réel de `pdf-ui` (navigation, pas relecture séquentielle des 1500 pages), le gain de `font_cache` compte surtout la **première** fois qu'une page est vue, pas les révisites (déjà couvertes par le cache existant).
+
+**Critère de sortie :** `cargo test --workspace` vert (232 tests, +1 `pdf-core`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre, gain mesuré et reproductible (`pdf-cli bench`, gardé en permanence pour vérifier une régression future). **Statut réel : atteint** pour le point chaud identifié (police/contours) — `Render CPU` documenté comme hors périmètre de cette passe plutôt que non examiné.
 
 ---
 

@@ -29,6 +29,7 @@ fn print_usage() {
         "       pdf-cli replace-text <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1> <font_size> <text>"
     );
     eprintln!("       pdf-cli remove-annotation <in.pdf> <out.pdf> <page_index> <annot_index>");
+    eprintln!("       pdf-cli bench <file.pdf>");
 }
 
 fn main() -> ExitCode {
@@ -67,6 +68,7 @@ fn main() -> ExitCode {
         Some("add-text") => run_add_text_args(&args),
         Some("replace-text") => run_replace_text_args(&args),
         Some("remove-annotation") => run_remove_annotation_args(&args),
+        Some("bench") => args.get(2).map(|path| run_bench(path)),
         _ => None,
     };
 
@@ -398,6 +400,77 @@ fn run_dump(path: &str) -> pdf_core::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Mesure le temps de chaque étape du pipeline sur tout le document (pas
+/// une seule page comme `render-info`/`render`/`text`) — Sprint 57
+/// (sprint.md, "Optimisation performance sur gros fichiers") : outil de
+/// diagnostic répétable pour un document réel de grande taille, pas un
+/// micro-benchmark synthétique. Le rendu utilise `pdf-render` (CPU) : c'est
+/// le chemin réellement emprunté par `pdf-ui` en mode défilement continu et
+/// miniatures (voir `pdf-ui/src/render_worker.rs`, Sprint 21 #20).
+fn run_bench(path: &str) -> pdf_core::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let open_start = Instant::now();
+    let doc = read_document(path)?;
+    let open_time = open_start.elapsed();
+
+    let page_count = doc.page_count()?;
+
+    let (mut content_time, mut interp_time, mut text_time, mut render_time) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+
+    for i in 0..page_count {
+        let page = doc.page(i)?;
+
+        let t0 = Instant::now();
+        let content = doc.page_content(&page)?;
+        content_time += t0.elapsed();
+
+        let t1 = Instant::now();
+        let display = Interpreter::run_page_with_annotations(&doc, &page, &content)?;
+        interp_time += t1.elapsed();
+
+        let t2 = Instant::now();
+        let _page_text = pdf_text::extract_page_text(&display);
+        text_time += t2.elapsed();
+
+        let t3 = Instant::now();
+        let _pixmap = pdf_render::render_page(&display, page.media_box);
+        render_time += t3.elapsed();
+    }
+
+    let per_page = |d: Duration| -> Duration {
+        d.checked_div(page_count.max(1) as u32)
+            .unwrap_or(Duration::ZERO)
+    };
+    println!("File: {path}");
+    println!("Pages: {page_count}");
+    println!("Open (parse + xref):     {open_time:>10.2?}");
+    println!(
+        "Page content (total):    {content_time:>10.2?}  ({:.2?}/page)",
+        per_page(content_time)
+    );
+    println!(
+        "Interpret (total):       {interp_time:>10.2?}  ({:.2?}/page)",
+        per_page(interp_time)
+    );
+    println!(
+        "Text extract (total):    {text_time:>10.2?}  ({:.2?}/page)",
+        per_page(text_time)
+    );
+    println!(
+        "Render CPU (total):      {render_time:>10.2?}  ({:.2?}/page)",
+        per_page(render_time)
+    );
+    let total = open_time + content_time + interp_time + text_time + render_time;
+    println!("Total:                   {total:>10.2?}");
     Ok(())
 }
 

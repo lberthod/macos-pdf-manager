@@ -50,6 +50,7 @@
 //!   `/System/Library/Fonts` (chemins macOS codés en dur) — un portage
 //!   passerait par Core Text ou fontconfig.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::display::PathSegment;
@@ -134,7 +135,21 @@ pub struct Font {
     system_fallback: Option<(std::sync::Arc<Vec<u8>>, u32)>,
     /// `Some` seulement si `subtype == "Type0"` (voir `is_composite`).
     cid: Option<CidFontData>,
+    /// Contours déjà résolus par `glyph_outline` (police simple), clé
+    /// `(code, unicode)` — Sprint 57 ("Optimisation performance sur gros
+    /// fichiers", sprint.md) : sans ce cache, chaque appel reparse la police
+    /// entière depuis ses octets bruts (`ttf_parser::Face::parse`) même pour
+    /// un caractère déjà vu — un texte de plusieurs milliers de caractères
+    /// n'a pourtant qu'une poignée de codes distincts. `RefCell` : lecture
+    /// seule du point de vue de l'appelant (`&self`), le cache est un détail
+    /// d'implémentation.
+    outline_cache: RefCell<OutlineCache>,
+    /// Même principe que `outline_cache`, pour `cid_glyph_outline` (police
+    /// composite) — clé par CID plutôt que `(code, unicode)`.
+    cid_outline_cache: RefCell<HashMap<u32, Option<Vec<PathSegment>>>>,
 }
+
+type OutlineCache = HashMap<(u8, Option<char>), Option<Vec<PathSegment>>>;
 
 impl Font {
     /// Construit une police à partir de son dictionnaire `/Font` déjà résolu.
@@ -339,6 +354,8 @@ impl Font {
             embedded_cff,
             system_fallback,
             cid,
+            outline_cache: RefCell::new(HashMap::new()),
+            cid_outline_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -372,6 +389,16 @@ impl Font {
     /// est interrogé directement par code brut (`cff::Table::glyph_index`),
     /// pas de notion de cmap Unicode dans ce format.
     pub fn glyph_outline(&self, code: u8, unicode: Option<char>) -> Option<Vec<PathSegment>> {
+        let key = (code, unicode);
+        if let Some(cached) = self.outline_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let result = self.glyph_outline_uncached(code, unicode);
+        self.outline_cache.borrow_mut().insert(key, result.clone());
+        result
+    }
+
+    fn glyph_outline_uncached(&self, code: u8, unicode: Option<char>) -> Option<Vec<PathSegment>> {
         if let Some(data) = self.embedded_truetype.as_ref() {
             let face = ttf_parser::Face::parse(data, 0).ok()?;
             let gid = unicode.and_then(|u| face.glyph_index(u)).or_else(|| {
@@ -445,6 +472,17 @@ impl Font {
     /// `CidGlyphSource` pour la résolution CID -> GID selon le sous-type du
     /// descendant.
     pub fn cid_glyph_outline(&self, cid: u32) -> Option<Vec<PathSegment>> {
+        if let Some(cached) = self.cid_outline_cache.borrow().get(&cid) {
+            return cached.clone();
+        }
+        let result = self.cid_glyph_outline_uncached(cid);
+        self.cid_outline_cache
+            .borrow_mut()
+            .insert(cid, result.clone());
+        result
+    }
+
+    fn cid_glyph_outline_uncached(&self, cid: u32) -> Option<Vec<PathSegment>> {
         match self.cid.as_ref()?.glyph_source.as_ref()? {
             CidGlyphSource::TrueType { cid_to_gid } => {
                 let gid = match cid_to_gid {

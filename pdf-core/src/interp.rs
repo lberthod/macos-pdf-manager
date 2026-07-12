@@ -16,6 +16,7 @@
 //! - Les patterns, shadings et le contenu marqué sont ignorés.
 //! - Les images XObject ne sont pas décodées (position seulement).
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::content::{parse_content_stream, ContentInstruction};
@@ -25,7 +26,7 @@ use crate::display::{
 use crate::document::Document;
 use crate::error::Result;
 use crate::font::Font;
-use crate::object::{Dictionary, Object};
+use crate::object::{Dictionary, ObjRef, Object};
 
 const MAX_XOBJECT_DEPTH: usize = 12;
 
@@ -90,6 +91,20 @@ pub struct Interpreter<'a> {
     text_line_matrix: Matrix,
     resources_stack: Vec<Dictionary>,
     depth: usize,
+    /// Cache des polices déjà chargées (`Font::load`), clé par référence
+    /// d'objet indirect (Sprint 57, "Optimisation performance sur gros
+    /// fichiers" — sprint.md) : `show_text` rechargeait sinon le dictionnaire
+    /// de police complet (`/Widths`, `/Encoding`, `/ToUnicode`...) à **chaque**
+    /// `Tj`/`TJ`, un coût négligeable sur un document modeste mais qui domine
+    /// sur un document texte de plusieurs centaines de pages (mesuré :
+    /// ~2 ms/page sur un document de 1500 pages/40 lignes, `pdf-cli bench`).
+    /// Ne cache que les polices référencées indirectement (le cas normal —
+    /// tout générateur PDF réel partage le même objet `/Font` entre les
+    /// pages) ; un dictionnaire de police inline (rare) reste rechargé à
+    /// chaque appel, comme avant — aucun risque de partage incorrect entre
+    /// `resources_stack` imbriquées puisqu'il n'y a alors pas de référence
+    /// d'objet stable à utiliser comme clé.
+    font_cache: BTreeMap<ObjRef, Rc<Font>>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -107,6 +122,7 @@ impl<'a> Interpreter<'a> {
             text_line_matrix: Matrix::IDENTITY,
             resources_stack: vec![resources],
             depth: 0,
+            font_cache: BTreeMap::new(),
         }
     }
 
@@ -591,16 +607,7 @@ impl<'a> Interpreter<'a> {
 
     fn show_text(&mut self, bytes: &[u8]) {
         let font_name = self.gs.font.clone().unwrap_or_default();
-        // Rechargé à chaque appel plutôt que mis en cache : simple et correct
-        // (pas de risque d'incohérence entre resources_stack imbriquées),
-        // au prix d'un re-parsing du dict de police par Tj/TJ — acceptable
-        // tant que les documents restent de taille modeste (voir sprint.md).
-        let font = self
-            .lookup_resource("Font", &font_name)
-            .ok()
-            .flatten()
-            .and_then(|obj| obj.as_dict().cloned())
-            .and_then(|dict| Font::load(self.doc, &dict).ok());
+        let font = self.lookup_font(&font_name);
 
         match &font {
             // Police composite (`/Type0`) : codes 2 octets = CID (voir
@@ -802,6 +809,38 @@ impl<'a> Interpreter<'a> {
             return Ok(None);
         };
         Ok(Some(self.doc.get(entry)?))
+    }
+
+    /// Résout et charge la police `name` de la catégorie `/Font` des
+    /// ressources courantes, en réutilisant `font_cache` quand l'entrée est
+    /// une référence indirecte (le cas normal — voir la doc du champ). Une
+    /// entrée introuvable ou dont le chargement échoue n'est jamais mise en
+    /// cache (retourne `None` sans rien enregistrer), pour ne pas figer un
+    /// échec transitoire.
+    fn lookup_font(&mut self, name: &str) -> Option<Rc<Font>> {
+        let resources = self.resources_stack.last()?;
+        let cat_obj = resources.get("Font")?;
+        let cat_dict = self.doc.get(cat_obj).ok()?;
+        let cat_dict = cat_dict.as_dict()?;
+        let entry = cat_dict.get(name)?;
+
+        if let Object::Reference(r) = entry {
+            if let Some(font) = self.font_cache.get(r) {
+                return Some(Rc::clone(font));
+            }
+            let dict = self.doc.resolve(*r).ok()?;
+            let dict = dict.as_dict()?;
+            let font = Rc::new(Font::load(self.doc, dict).ok()?);
+            self.font_cache.insert(*r, Rc::clone(&font));
+            return Some(font);
+        }
+
+        // Dictionnaire de police inline (rare) : pas de référence stable à
+        // utiliser comme clé, donc pas de mise en cache — comportement
+        // inchangé par rapport à avant cette optimisation.
+        let dict = self.doc.get(entry).ok()?;
+        let dict = dict.as_dict()?;
+        Font::load(self.doc, dict).ok().map(Rc::new)
     }
 }
 
@@ -1162,6 +1201,28 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// Sprint 57 ("Optimisation performance sur gros fichiers", sprint.md) :
+    /// `lookup_font` doit réutiliser le même `Rc<Font>` pour deux appels
+    /// consécutifs sur la même référence d'objet indirecte (`/F1 20 0 R`
+    /// dans ce fixture), au lieu de reparser le dictionnaire de police à
+    /// chaque appel comme avant cette passe.
+    #[test]
+    fn lookup_font_caches_by_object_reference() {
+        let bytes = include_bytes!("../tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let page = doc.page(0).unwrap();
+        let mut interp = Interpreter::new(&doc, page.resources.clone());
+
+        let first = interp
+            .lookup_font("F1")
+            .expect("fixture is known to reference an /F1 font resource");
+        let second = interp.lookup_font("F1").unwrap();
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "second lookup_font should reuse the cached Rc<Font> instance, not reload it"
+        );
     }
 
     /// Bout en bout sur un vrai `/Type0`/`CIDFontType2` (`/Identity-H`,

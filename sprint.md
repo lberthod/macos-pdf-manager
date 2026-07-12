@@ -318,6 +318,25 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 52 — Cases à cocher AcroForm (#43 suite)
+
+**Objectif :** #43 restait ◐ après le Sprint 50 (champs texte `/Tx` seulement). Ferme la partie "cases à cocher" (`/Btn`) — pas les boutons radio groupés ni les listes/menus déroulants (`/Ch`), voir ci-dessous pourquoi.
+
+- [x] **Fixture `acroform_checkbox.pdf`** (nouveau, `reportlab.Canvas.acroForm.checkbox`) : le corpus n'avait qu'un champ texte (`acroform_textfield.pdf`), pas de champ `/FT /Btn` pour exercer ce sous-morceau — `/AP /N` y est un dictionnaire d'états (`/Off`, `/Yes`) plutôt qu'un flux unique, `/AS /Off` initialement, `Ff 2` (pas de bit `Pushbutton`/`Radio`).
+- [x] **`pdf-edit::EditSession::checkbox_fields`** (nouveau) liste les champs `/FT /Btn` de `/AcroForm/Fields` qui sont leur propre widget (`/Rect` direct sur le champ, pas seulement sur des `/Kids` — ce qui exclut naturellement les boutons radio groupés, dont le `/Rect` n'existe qu'au niveau de chaque `/Kids`) et qui n'ont pas le bit `Ff` `Pushbutton` (pas de notion coché/décoché). `button_on_state` (nouveau, privé) retrouve le nom de l'état "coché" en cherchant la première clé de `/AP /N` différente de `/Off` — variable d'un générateur PDF à l'autre (`"Yes"`, `"1"`...), pas déductible autrement que de l'apparence déjà présente dans le fichier.
+- [x] **`pdf-edit::EditSession::set_checkbox_field_value`** (nouveau) bascule `/AS`+`/V` entre le nom d'état "coché" et `/Off` — **ne régénère jamais `/AP`**, contrairement à `set_form_field_value` pour le texte : un vrai PDF a déjà les deux apparences (cochée/décochée) dans `/AP /N`, c'est `pdf_core::interp::resolve_normal_appearance` (déjà là depuis le Sprint 13-14) qui résout laquelle afficher selon `/AS`. Testé bout en bout : coché puis décoché, persistance après réouverture pour les deux sens, **et vérification que l'état affecte effectivement le rendu** (nombre d'éléments de la `DisplayList` différent entre coché/décoché).
+- [x] **`pdf_app::Session::checkbox_fields_on_current_page`/`set_checkbox_field_value_on_current_page`** — wrappers, même schéma que les champs texte.
+- [x] **`pdf-ui`** dessine un contour par case (rempli d'un translucide si coché, sinon contour seul) ; un clic dedans bascule directement l'état (`handle_checkbox_field_click`) — pas de modale de saisie, contrairement à un champ texte, l'action est immédiate.
+
+**Non fait dans ce sprint** (la ligne #43 reste donc ◐, pas ☑) :
+- **Boutons radio groupés** (`/Kids`, un widget par option) : `checkbox_fields` les ignore délibérément (pas de `/Rect` exploitable au niveau du champ parent) — les gérer demanderait de résoudre chaque `/Kids` séparément et de garantir qu'un seul reste coché par groupe (`/V` du parent partagé entre toutes les options), un vrai sous-morceau de travail distinct.
+- **Listes/menus déroulants** (`/Ch`) : pas engagés, sémantique différente (choix dans une liste, pas bascule binaire).
+- **Vérification interactive** : comme pour #20/#32/#48, pas d'accès à une session graphique macOS depuis cet environnement de développement pour confirmer le clic à la souris — validé par les tests `pdf-edit`/`pdf-app` (bout en bout, y compris rendu) et par lecture de code.
+
+**Critère de sortie :** `cargo test --workspace` vert (219 tests, +2 `pdf-edit` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint** pour la partie "cases à cocher" de #43 — reste ◐ dans `audit50quest.md`, boutons radio groupés et listes restant à faire séparément.
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

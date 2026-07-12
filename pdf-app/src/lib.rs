@@ -573,6 +573,48 @@ impl Session {
         self.refresh_after_edit()
     }
 
+    /// Liste les cases à cocher de la page courante (voir
+    /// `pdf_edit::EditSession::checkbox_fields`, #43 suite) — même filtrage
+    /// par `/Annots` de la page courante que `form_fields_on_current_page`.
+    pub fn checkbox_fields_on_current_page(
+        &self,
+    ) -> Result<Vec<pdf_edit::CheckboxFieldInfo>, String> {
+        let page = self.doc.page(self.page_index).map_err(|e| e.to_string())?;
+        let Some(annots_obj) = page.dict.get("Annots") else {
+            return Ok(Vec::new());
+        };
+        let annots = self.doc.get(annots_obj).map_err(|e| e.to_string())?;
+        let Some(refs) = annots.as_array() else {
+            return Ok(Vec::new());
+        };
+        let page_nums: std::collections::HashSet<u32> = refs
+            .iter()
+            .filter_map(|o| match o {
+                Object::Reference(r) => Some(r.num),
+                _ => None,
+            })
+            .collect();
+
+        Ok(self
+            .edit
+            .checkbox_fields()?
+            .into_iter()
+            .filter(|f| page_nums.contains(&f.obj_ref.num))
+            .collect())
+    }
+
+    /// Coche/décoche la case `field_name` de la page courante (voir
+    /// `pdf_edit::EditSession::set_checkbox_field_value`) et rafraîchit
+    /// immédiatement le rendu.
+    pub fn set_checkbox_field_value_on_current_page(
+        &mut self,
+        field_name: &str,
+        checked: bool,
+    ) -> Result<(), String> {
+        self.edit.set_checkbox_field_value(field_name, checked)?;
+        self.refresh_after_edit()
+    }
+
     /// Insère une page blanche à `at_index` (Sprint 19, câblage `pdf-ui` de
     /// `pdf_edit::EditSession::insert_blank_page`) — reprend le `MediaBox` de
     /// la page courante si le document en a au moins une, sinon une page
@@ -1350,6 +1392,36 @@ mod tests {
             .unwrap();
         let fields = session.form_fields_on_current_page().unwrap();
         assert_eq!(fields[0].value, "Ada Lovelace");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `checkbox_fields_on_current_page`/`set_checkbox_field_value_on_current_page`
+    /// (#43 suite, Sprint 52) — même schéma que le champ texte ci-dessus,
+    /// mais pour `/FT /Btn` : `checked` reflète `/AS` immédiatement, avant
+    /// toute sauvegarde.
+    #[test]
+    fn checkbox_fields_on_current_page_lists_and_toggles_field() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_checkbox.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        let fields = session.checkbox_fields_on_current_page().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "agree_field");
+        assert!(!fields[0].checked);
+
+        session
+            .set_checkbox_field_value_on_current_page("agree_field", true)
+            .unwrap();
+        let fields = session.checkbox_fields_on_current_page().unwrap();
+        assert!(fields[0].checked);
+
+        session
+            .set_checkbox_field_value_on_current_page("agree_field", false)
+            .unwrap();
+        let fields = session.checkbox_fields_on_current_page().unwrap();
+        assert!(!fields[0].checked);
 
         std::fs::remove_file(&path).ok();
     }

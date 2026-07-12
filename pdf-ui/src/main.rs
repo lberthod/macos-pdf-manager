@@ -95,6 +95,10 @@ const ANNOTATION_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 60,
 /// de `ANNOTATION_OUTLINE_COLOR` pour ne pas laisser croire qu'un champ est
 /// une annotation supprimable comme les autres.
 const FORM_FIELD_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 140, 200);
+/// Contour des cases à cocher cliquables (Sprint 52, #43 suite) — même
+/// teinte que `FORM_FIELD_OUTLINE_COLOR` (même famille "champ de
+/// formulaire"), un remplissage translucide indique en plus l'état coché.
+const CHECKBOX_FIELD_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 140, 200);
 /// Taille de police par défaut du texte ajouté/remplacé (Sprint 20) — pas de
 /// réglage utilisateur pour l'instant, comme `pdf-cli add-text`/`replace-text`.
 const DEFAULT_TEXT_FONT_SIZE: f64 = 14.0;
@@ -333,6 +337,12 @@ struct DocumentTab {
     form_fields: Vec<pdf_edit::FormFieldInfo>,
     /// (page affichée) pour laquelle `form_fields` est à jour.
     form_fields_state: Option<usize>,
+    /// Cases à cocher de la page courante (Sprint 52, #43 suite) — même
+    /// schéma que `form_fields`/`ensure_form_fields`, mais un clic bascule
+    /// directement l'état (pas de modale de saisie, contrairement au texte).
+    checkbox_fields: Vec<pdf_edit::CheckboxFieldInfo>,
+    /// (page affichée) pour laquelle `checkbox_fields` est à jour.
+    checkbox_fields_state: Option<usize>,
     /// Dernier décalage de défilement connu de la `ScrollArea` de la page
     /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
     /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
@@ -417,6 +427,8 @@ impl DocumentTab {
             annotation_drag_preview: None,
             form_fields: Vec::new(),
             form_fields_state: None,
+            checkbox_fields: Vec::new(),
+            checkbox_fields_state: None,
             last_scroll_offset: egui::Vec2::ZERO,
             last_scroll_viewport: None,
             pending_scroll_offset: None,
@@ -827,6 +839,61 @@ impl DocumentTab {
         self.form_fields_state = Some(page_index);
     }
 
+    /// Recalcule `self.checkbox_fields` si la page affichée a changé depuis
+    /// le dernier appel — même schéma que `ensure_form_fields` (Sprint 52).
+    fn ensure_checkbox_fields(&mut self) {
+        let Some(session) = &self.session else {
+            self.checkbox_fields.clear();
+            return;
+        };
+        let page_index = session.page_index();
+        if self.checkbox_fields_state == Some(page_index) {
+            return;
+        }
+        self.checkbox_fields = session
+            .checkbox_fields_on_current_page()
+            .unwrap_or_default();
+        self.checkbox_fields_state = Some(page_index);
+    }
+
+    /// Bascule (coché <-> décoché) la case de `self.checkbox_fields` dont le
+    /// rect contient le prochain simple clic sur la page (Sprint 52, #43
+    /// suite) — contrairement à un champ texte, pas de modale de saisie :
+    /// l'action est immédiate. Renvoie `true` si le clic est tombé dans une
+    /// case (consommé), pour que l'appelant ne le traite pas aussi comme une
+    /// sélection/un clic d'annotation.
+    fn handle_checkbox_field_click(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) -> bool {
+        if !response.clicked() {
+            return false;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return false;
+        };
+        let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
+        let Some(field) = self
+            .checkbox_fields
+            .iter()
+            .find(|f| px >= f.rect[0] && px <= f.rect[2] && py >= f.rect[1] && py <= f.rect[3])
+        else {
+            return false;
+        };
+        let name = field.name.clone();
+        let new_checked = !field.checked;
+        let Some(session) = &mut self.session else {
+            return true;
+        };
+        match session.set_checkbox_field_value_on_current_page(&name, new_checked) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de cocher/décocher le champ : {e}")),
+        }
+        true
+    }
+
     /// Supprime l'annotation actuellement sélectionnée (`self.selected_annotation`,
     /// bouton "🗑 Supprimer l'annotation", #32).
     fn delete_selected_annotation(&mut self) {
@@ -988,6 +1055,7 @@ impl DocumentTab {
         // Une valeur de champ modifiée doit être relue (`ensure_form_fields`)
         // pour préremplir correctement la modale au prochain clic.
         self.form_fields_state = None;
+        self.checkbox_fields_state = None;
         self.refresh_render_worker_document();
     }
 
@@ -2182,6 +2250,7 @@ impl DocumentTab {
             self.ensure_highlights();
             self.ensure_annotations();
             self.ensure_form_fields();
+            self.ensure_checkbox_fields();
 
             // Clonée (bon marché : `TextureHandle` est un handle partagé)
             // pour ne pas garder de prêt sur `self.texture` pendant qu'on
@@ -2244,16 +2313,29 @@ impl DocumentTab {
                             );
                         }
 
+                        if !self.checkbox_fields.is_empty() {
+                            draw_checkbox_field_outlines(
+                                ui,
+                                &response,
+                                &self.checkbox_fields,
+                                media_box,
+                                scale,
+                            );
+                        }
+
                         // Le mode "📝 Ajouter texte" (#30) intercepte le
                         // simple clic à la place de la sélection/l'annotation
                         // (voir la doc de `handle_add_text_click`) — les deux
                         // usages ne doivent jamais se marcher dessus sur le
                         // même clic. Un clic tombant dans un champ de
-                        // formulaire (#Sprint 23) a priorité sur la
-                        // sélection/l'annotation, pour la même raison.
+                        // formulaire (#Sprint 23) ou une case à cocher
+                        // (Sprint 52) a priorité sur la sélection/l'annotation,
+                        // pour la même raison.
                         if self.add_text_mode {
                             self.handle_add_text_click(&response, media_box, scale);
-                        } else if !self.handle_form_field_click(&response, media_box, scale) {
+                        } else if !self.handle_checkbox_field_click(&response, media_box, scale)
+                            && !self.handle_form_field_click(&response, media_box, scale)
+                        {
                             // Un glissement sur la sélection courante (#32,
                             // déplacement ou poignée de redimensionnement) a
                             // priorité sur la sélection/la sélection de texte
@@ -2520,6 +2602,35 @@ fn draw_form_field_outlines(
             egui::Rect::from_min_max(min, max),
             0.0,
             egui::Stroke::new(1.0, FORM_FIELD_OUTLINE_COLOR),
+        );
+    }
+}
+
+/// Dessine un contour par case à cocher de `fields` (Sprint 52, #43 suite) —
+/// comme `draw_form_field_outlines`, mais coché est en plus indiqué par un
+/// remplissage translucide (pas de modale à ouvrir pour voir l'état, un clic
+/// bascule directement — voir `handle_checkbox_field_click`).
+fn draw_checkbox_field_outlines(
+    ui: &egui::Ui,
+    image_response: &egui::Response,
+    fields: &[pdf_edit::CheckboxFieldInfo],
+    media_box: [f64; 4],
+    scale: f64,
+) {
+    let painter = ui.painter();
+    for field in fields {
+        let screen_rect = page_rect_to_screen(field.rect, image_response.rect, media_box, scale);
+        if field.checked {
+            painter.rect_filled(
+                screen_rect,
+                1.0,
+                CHECKBOX_FIELD_OUTLINE_COLOR.gamma_multiply(0.35),
+            );
+        }
+        painter.rect_stroke(
+            screen_rect,
+            0.0,
+            egui::Stroke::new(1.0, CHECKBOX_FIELD_OUTLINE_COLOR),
         );
     }
 }

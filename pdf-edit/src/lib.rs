@@ -70,6 +70,22 @@ pub struct FormFieldInfo {
     pub value: String,
 }
 
+/// Case à cocher visible, telle que renvoyée par `EditSession::checkbox_fields`
+/// (#43 suite) — pas les boutons radio groupés ni les boutons-poussoir, voir
+/// la doc de `checkbox_fields`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckboxFieldInfo {
+    pub obj_ref: ObjRef,
+    pub name: String,
+    pub rect: [f64; 4],
+    pub checked: bool,
+    /// Nom de l'état "coché" dans `/AP /N` (ex. `"Yes"`, `"1"` — variable
+    /// d'un générateur PDF à l'autre), utile pour l'affichage/le débogage
+    /// mais pas nécessaire pour basculer l'état (`set_checkbox_field_value`
+    /// le retrouve lui-même).
+    pub on_state: String,
+}
+
 pub struct EditSession {
     doc: Document,
     /// Objets nouveaux ou mis à jour, pas encore écrits sur disque —
@@ -952,6 +968,146 @@ impl EditSession {
         let mut ap_ref_dict = Dictionary::new();
         ap_ref_dict.insert("N", Object::Reference(ObjRef::new(ap_num, 0)));
         field_dict.insert("AP", Object::Dictionary(ap_ref_dict));
+
+        let after = Object::Dictionary(field_dict);
+        self.commit(EditOp {
+            modified: vec![(field_ref.num, before, after)],
+        });
+        Ok(())
+    }
+
+    /// Liste les cases à cocher (`/FT /Btn`) de `/AcroForm/Fields` qui sont
+    /// leur propre annotation-widget (`/Rect` présent directement sur le
+    /// dictionnaire de champ, pas seulement sur des `/Kids`) — #43 (suite),
+    /// la même limite volontaire qu'`find_form_field`/`form_fields` : un seul
+    /// niveau, pas de résolution de groupe. **Exclut les boutons radio
+    /// groupés** (plusieurs `/Kids`, un widget par option, chacun sans
+    /// `/Rect` propre au niveau du champ parent) et les boutons-poussoir
+    /// (`Ff` bit `Pushbutton`, pas de notion de coché/décoché) : ni les uns
+    /// ni les autres n'ont de `/Rect` exploitable ici pour les premiers, ou
+    /// de sémantique on/off pour les seconds — `on_state` reste `None` et le
+    /// champ est alors ignoré par `checkbox_fields` (voir le filtre
+    /// ci-dessous).
+    pub fn checkbox_fields(&self) -> Result<Vec<CheckboxFieldInfo>, String> {
+        let root = self.doc.root().map_err(|e| e.to_string())?;
+        let Some(acroform_obj) = root.get("AcroForm") else {
+            return Ok(Vec::new());
+        };
+        let acroform = self.doc.get(acroform_obj).map_err(|e| e.to_string())?;
+        let Some(acroform_dict) = acroform.as_dict() else {
+            return Ok(Vec::new());
+        };
+        let Some(fields_obj) = acroform_dict.get("Fields") else {
+            return Ok(Vec::new());
+        };
+        let fields = self.doc.get(fields_obj).map_err(|e| e.to_string())?;
+        let Some(field_refs) = fields.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for field_obj in field_refs {
+            let Object::Reference(r) = field_obj else {
+                continue;
+            };
+            let resolved = self.current(r.num)?;
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get("FT").and_then(|o| o.as_name()) != Some("Btn") {
+                continue;
+            }
+            const PUSHBUTTON_FLAG: i64 = 1 << 16; // Bit 17, ISO 32000-1 tableau 226.
+            if dict.get("Ff").and_then(|o| o.as_int()).unwrap_or(0) & PUSHBUTTON_FLAG != 0 {
+                continue;
+            }
+            let Some(name) = dict.get("T").and_then(|o| o.as_text_string()) else {
+                continue;
+            };
+            let Some(rect_arr) = dict
+                .get("Rect")
+                .and_then(|o| o.as_array())
+                .filter(|r| r.len() >= 4)
+            else {
+                continue; // Vraisemblablement un bouton radio groupé (/Kids), voir doc.
+            };
+            let rect = [
+                num(&rect_arr[0]),
+                num(&rect_arr[1]),
+                num(&rect_arr[2]),
+                num(&rect_arr[3]),
+            ];
+            let Some(on_state) = Self::button_on_state(self, dict) else {
+                continue; // /AP /N absent ou sans état autre que /Off : rien à cocher.
+            };
+            let checked = dict.get("AS").and_then(|o| o.as_name()) == Some(on_state.as_str());
+            out.push(CheckboxFieldInfo {
+                obj_ref: *r,
+                name,
+                rect,
+                checked,
+                on_state,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Nom (autre que `/Off`) du premier état trouvé dans le dictionnaire
+    /// d'apparences `/AP /N` d'une case à cocher — ISO 32000-1 §12.5.6.19 :
+    /// pour une case à cocher (par opposition à un champ texte), `/AP /N`
+    /// est un dictionnaire d'états plutôt qu'un flux unique directement.
+    fn button_on_state(session: &EditSession, dict: &Dictionary) -> Option<String> {
+        let ap = dict.get("AP")?;
+        let ap_dict = match ap {
+            Object::Dictionary(d) => d.clone(),
+            Object::Reference(r) => session
+                .current(r.num)
+                .ok()
+                .and_then(|o| o.as_dict().cloned())?,
+            _ => return None,
+        };
+        let n = ap_dict.get("N")?;
+        let n_dict = match n {
+            Object::Dictionary(d) => d.clone(),
+            Object::Reference(r) => session
+                .current(r.num)
+                .ok()
+                .and_then(|o| o.as_dict().cloned())?,
+            _ => return None,
+        };
+        let state = n_dict.iter().find(|(k, _)| k.as_str() != "Off");
+        state.map(|(k, _)| k.to_string())
+    }
+
+    /// Coche/décoche la case `field_name` (voir `checkbox_fields`) : fixe
+    /// `/AS` (état d'apparence affiché, résolu par
+    /// `pdf_core::interp::resolve_normal_appearance` contre le dictionnaire
+    /// d'états déjà présent dans `/AP /N` — pas besoin de le régénérer,
+    /// contrairement à `set_form_field_value` pour le texte) et `/V` (valeur
+    /// du champ, ISO 32000-1 §12.7.4.2.3) au même nom d'état, ou à `/Off`
+    /// pour décocher.
+    pub fn set_checkbox_field_value(
+        &mut self,
+        field_name: &str,
+        checked: bool,
+    ) -> Result<(), String> {
+        let field_ref = self.find_form_field(field_name)?;
+        let before = self.current(field_ref.num)?;
+        let mut field_dict = before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "form field object is not a dictionary".to_string())?;
+
+        let on_state = Self::button_on_state(self, &field_dict).ok_or_else(|| {
+            format!("field '{field_name}' has no usable /AP /N appearance states")
+        })?;
+        let state = if checked {
+            Object::Name(on_state)
+        } else {
+            Object::Name("Off".to_string())
+        };
+        field_dict.insert("AS", state.clone());
+        field_dict.insert("V", state);
 
         let after = Object::Dictionary(field_dict);
         self.commit(EditOp {
@@ -2249,5 +2405,108 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();
+    }
+
+    /// `checkbox_fields` retrouve la case du fixture (décochée initialement,
+    /// `/AS /Off`) avec son état "coché" (`on_state`, `"Yes"` pour ce
+    /// fixture reportlab) — voir la doc de `checkbox_fields` sur pourquoi
+    /// c'est le seul champ `/Btn` de ce fixture à être listé (pas de
+    /// bouton-poussoir/radio groupé ici).
+    #[test]
+    fn checkbox_fields_lists_the_unchecked_field() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_checkbox.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = EditSession::open(&path).unwrap();
+
+        let fields = session.checkbox_fields().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "agree_field");
+        assert!(!fields[0].checked);
+        assert_eq!(fields[0].on_state, "Yes");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `set_checkbox_field_value` coche la case (`/AS`+`/V` -> l'état "on"),
+    /// puis la décoche (`/AS`+`/V` -> `/Off`) — persistance vérifiée après
+    /// sauvegarde incrémentale + réouverture pour les deux sens.
+    #[test]
+    fn set_checkbox_field_value_toggles_and_persists() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_checkbox.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .set_checkbox_field_value("agree_field", true)
+            .unwrap();
+        assert!(session.checkbox_fields().unwrap()[0].checked);
+
+        let out_path = write_fixture(b"checkbox-checked-out");
+        session.save_as(&out_path).unwrap();
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let root = reopened.root().unwrap();
+        let acroform = reopened.get(root.get("AcroForm").unwrap()).unwrap();
+        let fields = reopened
+            .get(acroform.as_dict().unwrap().get("Fields").unwrap())
+            .unwrap();
+        let field_ref = fields.as_array().unwrap()[0].as_reference().unwrap();
+        let field = reopened.resolve(field_ref).unwrap();
+        let dict = field.as_dict().unwrap();
+        assert_eq!(dict.get("AS").and_then(|o| o.as_name()), Some("Yes"));
+        assert_eq!(dict.get("V").and_then(|o| o.as_name()), Some("Yes"));
+
+        // `/AS` coché doit bien changer ce qui est effectivement rendu :
+        // `resolve_normal_appearance` doit résoudre l'état `/AP /N /Yes`
+        // (un flux différent, contenant la marque de coche) plutôt que
+        // `/Off` (généralement vide ou juste la bordure).
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+        let display_checked =
+            Interpreter::run_page_with_annotations(&reopened, &page, &content).unwrap();
+        let unchecked_bytes = std::fs::read(&path).unwrap();
+        let unchecked_doc = pdf_core::Document::open(unchecked_bytes).unwrap();
+        let unchecked_page = unchecked_doc.page(0).unwrap();
+        let unchecked_content = unchecked_doc.page_content(&unchecked_page).unwrap();
+        let display_unchecked = Interpreter::run_page_with_annotations(
+            &unchecked_doc,
+            &unchecked_page,
+            &unchecked_content,
+        )
+        .unwrap();
+        assert_ne!(
+            display_checked.items.len(),
+            display_unchecked.items.len(),
+            "checked/unchecked appearances should render a different number of display items"
+        );
+
+        // Décocher à nouveau, sur une session fraîche ouverte sur le fichier
+        // déjà coché.
+        let mut session2 = EditSession::open(&out_path).unwrap();
+        session2
+            .set_checkbox_field_value("agree_field", false)
+            .unwrap();
+        assert!(!session2.checkbox_fields().unwrap()[0].checked);
+        let out_path2 = write_fixture(b"checkbox-unchecked-out");
+        session2.save_as(&out_path2).unwrap();
+        let reopened2 = pdf_core::Document::open(std::fs::read(&out_path2).unwrap()).unwrap();
+        let root2 = reopened2.root().unwrap();
+        let acroform2 = reopened2.get(root2.get("AcroForm").unwrap()).unwrap();
+        let fields2 = reopened2
+            .get(acroform2.as_dict().unwrap().get("Fields").unwrap())
+            .unwrap();
+        let field_ref2 = fields2.as_array().unwrap()[0].as_reference().unwrap();
+        let field2 = reopened2.resolve(field_ref2).unwrap();
+        assert_eq!(
+            field2
+                .as_dict()
+                .unwrap()
+                .get("AS")
+                .and_then(|o| o.as_name()),
+            Some("Off")
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+        std::fs::remove_file(&out_path2).ok();
     }
 }

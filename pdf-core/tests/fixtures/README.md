@@ -15,6 +15,7 @@
 - `large_60_pages.pdf` — document de 60 pages (texte + rectangle par page, cross-reference stream + object streams), pour les tests de navigation/recherche/miniatures sur un document de taille non triviale.
 - `outline_test.pdf` — 4 pages, une table des matières plate ("Section 1".."Section 4", une par page), générée avec `reportlab.Canvas.bookmarkPage`/`addOutlineEntry`. Sert à tester la lecture de `/Outlines` (`pdf-core::outline`), en particulier la résolution des destinations directes (`/Dest` tableau `[page /Fit]`) en index de page.
 - `type0_cid_truetype.pdf` — texte "AB" en police composite **`/Type0`/`CIDFontType2`** (`/Encoding /Identity-H`, `/CIDToGIDMap /Identity`) : sous-ensemble TrueType Monaco réel (2 glyphes) extrait via `fonttools subset --text="AB"`, dont les GID (renumérotés par le sous-ensembleur) servent directement de codes 2 octets dans le flux de contenu (`<0001 0002>` — cas réel le plus courant, où le CID est le GID directement plutôt que passer par un `/CIDToGIDMap` explicite). Construit **à la main avec pikepdf** (comme `embedded_cff_font.pdf`), avec un `/ToUnicode` (`beginbfchar` GID -> `A`/`B`) et un `/W` donnant une largeur distincte à chaque GID (`/DW` sert de repli). Premier fixture réel `/Type0` du corpus (les autres tests composites de `pdf-core::font`/`interp` restent synthétiques) — sert de non-régression bout en bout pour `font.rs::cid_glyph_outline`/`cid_metrics` et `interp::show_text` sur un vrai PDF produit par un outil tiers.
+- `acroform_checkbox.pdf` — page avec une case à cocher AcroForm simple (`reportlab.Canvas.acroForm.checkbox`, `/FT /Btn`, `Ff 2` — pas de bit `Pushbutton`/`Radio`, un seul widget qui est aussi le champ). `/AP /N` est un dictionnaire d'états (`/Off`, `/Yes`) plutôt qu'un flux unique, `/AS /Off` initialement. Sert de fixture de bout en bout pour `pdf-edit::EditSession::checkbox_fields`/`set_checkbox_field_value` (Sprint 52, #43 suite) : coche/décoche en ne touchant que `/AS`+`/V`, sans régénérer `/AP` (contrairement au champ texte, dont l'apparence est synthétisée depuis zéro).
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -227,6 +228,16 @@ font12 = pdf12.make_indirect(pikepdf.Dictionary(
 page12.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font12))
 page12.Contents = pikepdf.Stream(pdf12, f"BT /F1 48 Tf 50 100 Td <{gid_a:04X}{gid_b:04X}> Tj ET".encode("ascii"))
 pdf12.save("type0_cid_truetype.pdf")
+
+# acroform_checkbox.pdf
+buf13 = io.BytesIO()
+c13 = canvas.Canvas(buf13, pagesize=letter)
+c13.drawString(72, 750, "Simple AcroForm checkbox test")
+c13.acroForm.checkbox(name="agree_field", tooltip="Agree?", x=72, y=650, size=16, buttonStyle="check", borderStyle="inset", checked=False)
+c13.showPage()
+c13.save()
+with Pdf.open(io.BytesIO(buf13.getvalue())) as pdf:
+    pdf.save("acroform_checkbox.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
 ```
 
 - `bold_italic_standard_fonts.pdf` — cinq lignes en polices standard non embarquées **hors Helvetica plain** (`Times-Bold`, `Times-Italic`, `Courier-BoldOblique`, `Helvetica-BoldOblique`, `Symbol`) : exerce la sélection de face gras/italique de la substitution système (`.ttc` avec choix de face) au-delà du seul fixture Helvetica déjà couvert.

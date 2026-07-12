@@ -87,6 +87,14 @@ impl Document {
         self.xref.entries.len()
     }
 
+    /// Octets bruts du fichier tel qu'ouvert (avant toute résolution
+    /// d'objet) — `pub(crate)` : sert à `signature.rs` pour hacher la
+    /// portion `/ByteRange` d'une signature numérique, qui porte sur le
+    /// fichier physique, pas sur une notion d'objet PDF résolu.
+    pub(crate) fn raw_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn trailer(&self) -> &Dictionary {
         &self.trailer
     }

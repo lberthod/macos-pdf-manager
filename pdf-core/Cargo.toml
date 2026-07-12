@@ -18,5 +18,19 @@ md-5 = "0.10"
 sha2 = "0.10"
 aes = "0.8"
 cbc = "0.1"
+# Sprint 59 (#50/signatures numériques, sprint.md Sprint 23+) : vérification
+# cryptographique de signature `/Sig` (PKCS#7/CMS détaché, ISO 32000-1
+# §12.8.3.3) — RSA/SHA-2 seulement (le cas très majoritaire en pratique),
+# pas de validation de chaîne de confiance/révocation (voir la doc de
+# module de `signature.rs`). `cms` est en pré-version (`0.3.0-pre.2`,
+# encore aucune version stable publiée à ce jour) et tire `der`/`spki` en
+# version 0.8, incompatible au niveau des types avec `rsa`/`pkcs8` (version
+# 0.7 transitive) — contournement systématique par aller-retour en octets
+# DER bruts plutôt que conversion directe, voir `signature.rs`.
+cms = "0.3.0-pre.2"
+der = "0.8"
+x509-cert = "0.3"
+rsa = "0.9"
+sha1 = "0.10"
 
 [dev-dependencies]

@@ -22,6 +22,7 @@ pub mod object;
 pub mod outline;
 pub mod page;
 pub mod parser;
+pub mod signature;
 pub mod writer;
 pub mod xref;
 
@@ -30,3 +31,4 @@ pub use error::{PdfError, Result};
 pub use object::{Dictionary, Name, ObjRef, Object, Stream};
 pub use outline::OutlineItem;
 pub use page::Page;
+pub use signature::{SignatureField, SignatureStatus};

@@ -30,6 +30,7 @@ fn print_usage() {
     );
     eprintln!("       pdf-cli remove-annotation <in.pdf> <out.pdf> <page_index> <annot_index>");
     eprintln!("       pdf-cli bench <file.pdf>");
+    eprintln!("       pdf-cli verify-signatures <file.pdf>");
 }
 
 fn main() -> ExitCode {
@@ -69,6 +70,7 @@ fn main() -> ExitCode {
         Some("replace-text") => run_replace_text_args(&args),
         Some("remove-annotation") => run_remove_annotation_args(&args),
         Some("bench") => args.get(2).map(|path| run_bench(path)),
+        Some("verify-signatures") => args.get(2).map(|path| run_verify_signatures(path)),
         _ => None,
     };
 
@@ -471,6 +473,57 @@ fn run_bench(path: &str) -> pdf_core::Result<()> {
     );
     let total = open_time + content_time + interp_time + text_time + render_time;
     println!("Total:                   {total:>10.2?}");
+    Ok(())
+}
+
+/// Liste et vérifie chaque signature `/Sig` du document (Sprint 59,
+/// `pdf_core::signature`) — voir sa doc de module pour ce que "valide"
+/// signifie (intégrité cryptographique, pas confiance/chaîne de
+/// certification).
+fn run_verify_signatures(path: &str) -> pdf_core::Result<()> {
+    let doc = read_document(path)?;
+    let fields = doc.signature_fields()?;
+    if fields.is_empty() {
+        println!("No digital signature fields found in {path}");
+        return Ok(());
+    }
+    for field in &fields {
+        println!("Field: {}", field.field_name);
+        if let Some(name) = &field.signer_name {
+            println!("  Name: {name}");
+        }
+        if let Some(reason) = &field.reason {
+            println!("  Reason: {reason}");
+        }
+        if let Some(location) = &field.location {
+            println!("  Location: {location}");
+        }
+        if let Some(time) = &field.signing_time {
+            println!("  Signed: {time}");
+        }
+        match field.verify(&doc) {
+            pdf_core::SignatureStatus::Valid { signer } => {
+                println!(
+                    "  Status: VALID (integrity only, not a trust decision) — signer cert CN: {}",
+                    signer.as_deref().unwrap_or("(none)")
+                );
+            }
+            pdf_core::SignatureStatus::ContentModified => {
+                println!("  Status: INVALID — document content modified after signing");
+            }
+            pdf_core::SignatureStatus::InvalidSignature => {
+                println!("  Status: INVALID — cryptographic signature does not match");
+            }
+            pdf_core::SignatureStatus::UnsupportedAlgorithm => {
+                println!("  Status: UNSUPPORTED — algorithm not handled (non-RSA key, unlisted digest, or oversized key)");
+            }
+            pdf_core::SignatureStatus::Malformed => {
+                println!(
+                    "  Status: MALFORMED — /Contents is not a valid detached PKCS#7 signature"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

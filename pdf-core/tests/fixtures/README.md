@@ -19,6 +19,7 @@
 - `acroform_radio.pdf` — page avec un groupe de 2 boutons radio AcroForm (`reportlab.Canvas.acroForm.radio`, deux appels avec le même `name`, options `"red"` sélectionnée initialement et `"blue"`). Le champ parent (`/FT /Btn`, `Ff` avec le bit `Radio` posé) n'a pas de `/Rect` propre, seuls ses deux `/Kids` (les widgets) en ont un — chacun avec son propre `/AP /N` (`/Off` + son propre nom d'état, `"red"`/`"blue"`) et son propre `/AS`. Sert de fixture de bout en bout pour `pdf-edit::EditSession::radio_groups`/`set_radio_group_value` (Sprint 53, #43 suite) : bascule `/AS` de chaque widget-enfant (un seul reste coché) et `/V` du champ parent, sans régénérer aucune apparence.
 - `acroform_choice.pdf` — page avec un champ liste/menu déroulant AcroForm (`reportlab.Canvas.acroForm.choice`, `/FT /Ch`, `fieldFlags="combo"`, 3 options `[(display, code), ...]`). `/Opt` est un tableau de paires `[texte affiché, code]` mais `/V`/`/DV` valent le **premier** élément de la paire (`"Apple"`, pas `"apple"`) — comportement réel de reportlab, pas forcément la lecture qu'on ferait de l'ordre `/Opt` d'ISO 32000-1 §12.7.4.4 à la lettre. Sert de fixture de bout en bout pour `pdf-edit::EditSession::choice_fields`/`set_choice_field_value` (Sprint 54, #43 suite, dernier sous-cas) : contrairement aux cases à cocher/boutons radio, ce type de champ **régénère** son apparence (texte simple, comme un champ `/Tx`) plutôt que de basculer un `/AS` déjà présent dans `/AP /N`.
 - `encrypted_user_password.pdf` — page chiffrée avec un **vrai mot de passe utilisateur non vide** (`pikepdf.Encryption(owner="ownerpass", user="secret123", R=4)`, AES-128), contrairement aux deux fixtures chiffrés existants (`encrypted_rc4.pdf`/`encrypted_aes256.pdf`, tous deux à mot de passe utilisateur vide). Sert de fixture de bout en bout pour `pdf_core::crypt::Decryptor`/`Document::open_with_password` (Sprint 58, `audit50quest.md` #50 suite) : bon mot de passe (`"secret123"`) déchiffre et recompose le texte en clair, mauvais mot de passe **et** mot de passe vide implicite tous deux rejetés avec `PdfError::IncorrectPassword`.
+- `signed_document.pdf` — page avec une signature numérique `/Sig` réelle (`pyHanko`, PKCS#7/CMS détaché `adbe.pkcs7.detached`, RSA-2048/SHA-256), signée avec un certificat **auto-signé** généré pour ce fixture (`CN=Test Signer`, pas de chaîne de confiance — ce module ne la vérifie de toute façon pas, voir `signature.rs`). Généré avec un outil distinct de `reportlab`/`pikepdf` (aucun des deux ne sait signer) — voir la section dédiée ci-dessous plutôt que le bloc de régénération commun. Sert de fixture de bout en bout pour `pdf_core::signature::Document::signature_fields`/`SignatureField::verify` (Sprint 59, `sprint.md` Sprint 23+) : signature intacte acceptée (`SignatureStatus::Valid`), et falsifier un octet dans la zone couverte par `/ByteRange` **après** signature est bien détecté (`SignatureStatus::ContentModified`) — le test qui compte le plus pour ce module.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -467,4 +468,66 @@ font = pdf.make_indirect(pikepdf.Dictionary(
 page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
 page.Contents = pikepdf.Stream(pdf, f"BT /F1 48 Tf 50 100 Td <{cid_ni:04X}{cid_hao:04X}> Tj ET".encode("ascii"))
 pdf.save("type0_cid_cff.pdf")
+```
+
+### `signed_document.pdf` (nécessite en plus un venv avec `pyhanko`)
+
+Ni `reportlab` ni `pikepdf` ne savent produire de signature numérique —
+`pyhanko` (`pip install pyhanko`) le fait, plus la génération d'un
+certificat de test auto-signé via `cryptography` (déjà une dépendance de
+`pyhanko`) :
+
+```python
+import datetime
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Signer")])
+cert = (
+    x509.CertificateBuilder()
+    .subject_name(subject)
+    .issuer_name(issuer)
+    .public_key(key.public_key())
+    .serial_number(x509.random_serial_number())
+    .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+    .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+    .sign(key, hashes.SHA256())
+)
+with open("signer_key.pem", "wb") as f:
+    f.write(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+with open("signer_cert.pem", "wb") as f:
+    f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+# Puis signer un PDF minimal généré avec reportlab :
+import io
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from pyhanko.sign import signers
+from pyhanko.sign.fields import SigFieldSpec, append_signature_field
+from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=letter)
+c.drawString(72, 720, "Digitally signed PDF test")
+c.showPage()
+c.save()
+buf.seek(0)
+
+w = IncrementalPdfFileWriter(buf)
+append_signature_field(w, SigFieldSpec(sig_field_name="Signature1"))
+signer = signers.SimpleSigner.load("signer_key.pem", "signer_cert.pem", key_passphrase=None)
+out = signers.sign_pdf(
+    w,
+    signers.PdfSignatureMetadata(field_name="Signature1", reason="Testing", name="Test Signer"),
+    signer=signer,
+)
+with open("signed_document.pdf", "wb") as f:
+    f.write(out.getvalue())
 ```

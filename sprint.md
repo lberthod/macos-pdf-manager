@@ -282,7 +282,7 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 - [x] Optimisation performance sur gros fichiers — voir Sprint 57 ci-dessous.
 - [ ] Accessibilité, conformité PDF/A.
 - [x] Chiffrement (`/Encrypt`, RC4/AES) — fait au Sprint 22, voir `analyse_sprint.md`.
-- [ ] Signatures numériques.
+- [x] Signatures numériques — vérification (lecture seule, intégrité pas confiance) faite au Sprint 59 ci-dessous ; production de signature non faite.
 
 ---
 
@@ -447,6 +447,32 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 - **Vérification interactive** de la fenêtre de saisie : comme pour #20/#32/#43/#48, pas d'accès à une session graphique macOS depuis cet environnement de développement — validé par les tests `pdf-core`/`pdf-app` (bout en bout, y compris rejet) et par lecture de code côté `pdf-ui`.
 
 **Critère de sortie :** `cargo test --workspace` vert (234 tests, +1 `pdf-core` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint** pour le sous-cas "vrai mot de passe" de #50 — reste ◐ dans `audit50quest.md`, seule l'accessibilité VoiceOver/clavier restant à faire pour fermer complètement la ligne.
+
+---
+
+## Sprint 59 — Vérification de signature numérique `/Sig`
+
+**Objectif :** dernier point du Sprint 23+ à avoir un scope tractable en une passe (l'accessibilité VoiceOver, l'autre point restant, demande une intégration architecturale — `AccessKit` ou pont `NSAccessibility` manuel — bien plus large qu'une correction ciblée, et n'est de toute façon pas vérifiable sans session graphique). Feasibilité vérifiée **avant** d'écrire le code définitif : sondage séparé (crate temporaire hors du workspace) contre un vrai PDF signé, avec cas positif (signature intacte) et négatif (contenu falsifié après signature) — voir "Risques" plus bas pour ce que ce sondage a trouvé.
+
+- [x] **Nouveau module `pdf-core::signature`** — `Document::signature_fields()` liste les champs `/FT /Sig` déjà signés (`/V` présent) de `/AcroForm/Fields` (métadonnées : `/Name`, `/Reason`, `/Location`, `/M`, `/Contents`, `/ByteRange`) ; `SignatureField::verify(&doc)` vérifie la signature PKCS#7/CMS détachée (`adbe.pkcs7.detached`, ISO 32000-1 §12.8.3.3, le gestionnaire très largement dominant en pratique) et renvoie un `SignatureStatus` (`Valid`/`ContentModified`/`InvalidSignature`/`UnsupportedAlgorithm`/`Malformed`).
+- [x] **Portée volontairement restreinte à l'intégrité, pas à la confiance** (documenté en tête de module) : vérifie que le contenu couvert par `/ByteRange` n'a pas changé depuis la signature **et** que la signature RSA correspond au certificat embarqué — **jamais** que ce certificat est digne de confiance (pas de chaîne de certification jusqu'à une autorité racine, pas de révocation OCSP/CRL). Un projet séparé, pas une extension incrémentale — même logique de séquencement que 6c (édition chirurgicale du flux de contenu, Sprint 17+) ou la validation de confiance de #50-déchiffrement.
+- [x] **Algorithmes pris en charge : RSA (PKCS#1 v1.5) + SHA-1/256/384/512** — couvre l'immense majorité des signatures PDF réelles. ECDSA/Ed25519/DSA ou digest non listé renvoient `UnsupportedAlgorithm` plutôt que d'échouer silencieusement ou de paniquer ; taille de module RSA plafonnée (`MAX_RSA_MODULUS_BITS`, 8192 bits) pour qu'un PDF hostile ne puisse pas forcer une opération anormalement lente.
+- [x] **Zéro `.unwrap()`/`.expect()` sur une donnée venant du fichier** (`/Contents` est un bourrage à zéro de taille fixe autour du DER réel, structure ASN.1 potentiellement malformée — donnée hostile par défaut, jamais approuvée a priori) : chaque étape de décodage est un `Option`/`Result` propagé jusqu'à `SignatureStatus::Malformed`. Testé explicitement (`verify_rejects_truncated_contents_without_panicking`).
+- [x] **Nouveau fixture réel `signed_document.pdf`** (`pyhanko`, RSA-2048/SHA-256, certificat de test auto-signé `CN=Test Signer` — ni `reportlab` ni `pikepdf` ne savent signer, voir `pdf-core/tests/fixtures/README.md`). Testé bout en bout : liste + métadonnées correctes, signature intacte acceptée, **et** falsifier un octet dans la zone `/ByteRange` après signature bien détecté (`ContentModified`) — le test qui compte le plus, celui qui garantit que la vérification n'est pas un théâtre de sécurité.
+- [x] **`pdf-cli verify-signatures <file.pdf>`** (nouvelle commande) exerçant tout le pipeline sur un vrai fichier, comme le reste de `pdf-cli` — vérifié manuellement sur le fixture signé (accepté), un PDF non signé (liste vide), et une copie falsifiée d'un octet (rejetée).
+
+**Risques rencontrés et résolus** (documentés en tête de `signature.rs`, pas juste corrigés silencieusement) :
+- **`cms` est en pré-version** (`0.3.0-pre.2`, aucune version stable publiée à ce jour) — seule exception dans ce projet à la préférence pour des crates stables, faute d'alternative mature pour CMS/PKCS#7 en Rust pur au moment de cette passe.
+- **Dédoublement de version `der`/`spki`/`const-oid`** entre la pile `cms`/`x509-cert` (der 0.8) et la pile `rsa`/`pkcs8` (der 0.7, tirée transitivement) — deux générations de la même famille RustCrypto sans `From`/`TryFrom` entre elles, découvert par le sondage de faisabilité (`cargo build` échouait sur 3 points de jonction différents : `Pkcs1v15Sign::new::<D>()`, `RsaPublicKey::TryFrom<SubjectPublicKeyInfo>`, `OctetStringRef::decode_as`). Contourné systématiquement par aller-retour en octets DER bruts (`to_der()` d'un côté, `from_public_key_der()`/`decode_as::<&T>()` de l'autre) plutôt que conversion de type directe — les octets DER produits par l'une sont lisibles par l'autre même si leurs types Rust ne s'unifient pas.
+- **`/Contents` porte un bourrage à zéro** au-delà de la longueur réelle du DER (espace réservé fixe pour insérer la signature sans décaler les autres offsets) — `ContentInfo::from_der` échouait sur les octets de trop (`TrailingData`) avant qu'un décodeur de longueur DER manuel (`der_object_len`, forme courte/longue ISO/IEC 8825-1 §8.1.3) ne tronque au bon endroit.
+
+**Non fait dans ce sprint** :
+- **VoiceOver/accessibilité** : toujours non engagée, seul vrai point ouvert restant du Sprint 23+ (voir Sprint 58 pour le même constat côté #50).
+- **`pdf-edit`/`pdf-ui`** : lecture seule — pas de production de signature (nécessiterait de porter une clé privée, un tout autre projet), pas d'affichage dans `pdf-ui` (câblage UI restant, comme beaucoup de capacités moteur avant leur câblage — voir le schéma récurrent des Sprints 19/50/52-54).
+- **Cas sans attributs signés** (`signedAttrs` absent du `SignerInfo`, rare pour un PDF) : renvoie `UnsupportedAlgorithm` plutôt qu'un chemin de vérification distinct (hachage direct du contenu plutôt que des attributs signés) — non implémenté.
+- **PKCS#1 PSS, ECDSA** : seul PKCS#1 v1.5 est géré ; PSS et les clés non-RSA renvoient `UnsupportedAlgorithm`.
+
+**Critère de sortie :** `cargo test --workspace` vert (238 tests, +4 `pdf-core`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre, vérifié manuellement en ligne de commande sur 3 scénarios réels (signature intacte, document non signé, document falsifié). **Statut réel : atteint.** Dernier point tractable du Sprint 23+ fermé ; validé end-to-end avec un vrai outil de signature tiers (`pyhanko`), pas seulement des données synthétiques.
 
 ---
 

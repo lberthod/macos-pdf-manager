@@ -22,6 +22,8 @@ pub enum PdfError {
     DecodeError(String),
     #[error("encrypted PDF documents are not supported (/Encrypt present in trailer)")]
     Encrypted,
+    #[error("incorrect password for this encrypted PDF")]
+    IncorrectPassword,
 }
 
 pub type Result<T> = std::result::Result<T, PdfError>;

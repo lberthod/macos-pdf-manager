@@ -3,14 +3,16 @@
 //! Adobe niveau 3 pour la révision 5 — pour la révision 6 (AES-256), Sprint
 //! 22, `audit50quest.md` #50.
 //!
-//! Portée volontairement restreinte : seul le mot de passe utilisateur
-//! **vide** est géré (le cas réel le plus courant — un PDF "protégé" dont
-//! l'ouverture n'est en réalité soumise à aucun mot de passe, seules les
-//! permissions d'édition/impression sont restreintes côté lecteurs qui les
-//! respectent). Aucune UI de saisie de mot de passe n'existe encore côté
-//! `pdf-app`/`pdf-ui` ; un document nécessitant un vrai mot de passe utilisateur
-//! reste donc illisible (le déchiffrement avec la mauvaise clé produit du
-//! contenu corrompu plutôt qu'une erreur explicite — limitation connue).
+//! Mot de passe utilisateur vide **et** réel tous deux gérés depuis le
+//! Sprint 58 : `Decryptor::new` prend le mot de passe candidat en paramètre
+//! et **vérifie** qu'il correspond bien à `/U` (Algorithme 4/5, ou le sel de
+//! validation pour les révisions 5/6) avant de renvoyer un contexte
+//! utilisable — un mot de passe incorrect renvoie une erreur explicite
+//! (`DecryptError::WrongPassword`, propagée en `PdfError::IncorrectPassword`
+//! par `Document::open_with_password`) plutôt que de produire silencieusement
+//! du contenu corrompu avec une clé erronée, comme c'était le cas avant
+//! cette passe. Câblé jusqu'à l'UI : `pdf-ui` propose une fenêtre de saisie
+//! quand l'ouverture avec un mot de passe vide échoue ainsi.
 //!
 //! Primitives cryptographiques (MD5/SHA-2/RC4/AES) déléguées à des crates
 //! auditées (`md-5`, `sha2`, `rc4`, `aes`, `cbc`) plutôt que réimplémentées à
@@ -33,12 +35,34 @@ const PAD: [u8; 32] = [
     0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
 ];
 
+/// Complète (ou tronque) `password` à exactement 32 octets avec `PAD`
+/// (ISO 32000-1 Algorithme 2, étape a) — un mot de passe vide redonne donc
+/// exactement `PAD`, comme avant que cette fonction n'existe.
+fn pad_password(password: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = password.len().min(32);
+    out[..n].copy_from_slice(&password[..n]);
+    out[n..].copy_from_slice(&PAD[..32 - n]);
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CryptMethod {
     Rc4,
     AesV2, // AES-128-CBC
     AesV3, // AES-256-CBC
     Identity,
+}
+
+/// Pourquoi `Decryptor::new` a échoué — distingue "gestionnaire de sécurité
+/// non standard/non reconnu" (rien à faire, message générique) de "mot de
+/// passe incorrect" (l'utilisateur peut réessayer avec un autre mot de
+/// passe) : deux situations que `Document::open_with_password` doit
+/// distinguer pour donner un message utile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecryptError {
+    Unsupported,
+    WrongPassword,
 }
 
 /// Contexte de déchiffrement d'un document — construit une fois à
@@ -58,18 +82,39 @@ pub struct Decryptor {
 
 impl Decryptor {
     /// Construit le contexte de déchiffrement à partir du dictionnaire
-    /// `/Encrypt` (déjà résolu, non chiffré) et du premier élément de
-    /// `/ID` du trailer (ISO 32000-1 exige `/ID` pour les révisions <= 4).
-    /// Suppose un mot de passe utilisateur vide (voir la doc de module).
-    pub fn new(encrypt: &Dictionary, id0: &[u8], encrypt_obj_num: Option<u32>) -> Option<Self> {
+    /// `/Encrypt` (déjà résolu, non chiffré), du premier élément de `/ID`
+    /// du trailer (ISO 32000-1 exige `/ID` pour les révisions <= 4) et du
+    /// mot de passe utilisateur candidat (`password`, octets bruts — chaîne
+    /// vide pour "pas de mot de passe fourni", le cas normal). **Vérifie**
+    /// le mot de passe contre `/U` (Algorithme 4/5 pour les révisions <= 4,
+    /// sel de validation pour les révisions 5/6) avant de renvoyer un
+    /// contexte utilisable : sans cette vérification, un mot de passe
+    /// incorrect produirait silencieusement une clé de fichier erronée et
+    /// donc du contenu corrompu au lieu d'une erreur claire — c'était le cas
+    /// avant cette passe (Sprint 58, `audit50quest.md` #50), voir
+    /// `Document::open_with_password`.
+    pub fn new(
+        encrypt: &Dictionary,
+        id0: &[u8],
+        encrypt_obj_num: Option<u32>,
+        password: &[u8],
+    ) -> Result<Self, DecryptError> {
+        use DecryptError::Unsupported;
+
         if encrypt.get("Filter").and_then(|o| o.as_name()) != Some("Standard") {
-            return None; // gestionnaire de sécurité non standard : non géré.
+            return Err(Unsupported); // gestionnaire de sécurité non standard : non géré.
         }
         let v = encrypt.get("V").and_then(|o| o.as_int()).unwrap_or(0);
-        let r = encrypt.get("R").and_then(|o| o.as_int())?;
-        let o_entry = string_bytes(encrypt.get("O")?)?;
-        let u_entry = string_bytes(encrypt.get("U")?)?;
-        let p = encrypt.get("P").and_then(|o| o.as_int())? as i32;
+        let r = encrypt
+            .get("R")
+            .and_then(|o| o.as_int())
+            .ok_or(Unsupported)?;
+        let o_entry = string_bytes(encrypt.get("O").ok_or(Unsupported)?).ok_or(Unsupported)?;
+        let u_entry = string_bytes(encrypt.get("U").ok_or(Unsupported)?).ok_or(Unsupported)?;
+        let p = encrypt
+            .get("P")
+            .and_then(|o| o.as_int())
+            .ok_or(Unsupported)? as i32;
 
         if v <= 4 {
             let length_bits = encrypt.get("Length").and_then(|o| o.as_int()).unwrap_or(40);
@@ -83,8 +128,9 @@ impl Decryptor {
                 .map(|o| matches!(o, Object::Boolean(true)))
                 .unwrap_or(true);
 
+            let padded_password = pad_password(password);
             let mut input = Vec::with_capacity(32 + 32 + 4 + id0.len() + 4);
-            input.extend_from_slice(&PAD); // mot de passe utilisateur vide, complété.
+            input.extend_from_slice(&padded_password);
             input.extend_from_slice(&o_entry[..32.min(o_entry.len())]);
             input.extend_from_slice(&p.to_le_bytes());
             input.extend_from_slice(id0);
@@ -99,13 +145,41 @@ impl Decryptor {
             }
             let file_key = hash[..key_len.min(16)].to_vec();
 
+            // Algorithme 4 (R2) / 5 (R3-4), ISO 32000-1 §7.6.4.4 : recalcule
+            // `/U` à partir de `file_key` et compare — la seule façon de
+            // savoir si `password` était le bon avant de déchiffrer quoi
+            // que ce soit avec une clé potentiellement fausse.
+            let expected_u = if r == 2 {
+                rc4_apply(&file_key, &PAD)
+            } else {
+                let mut hash_input = Vec::with_capacity(32 + id0.len());
+                hash_input.extend_from_slice(&PAD);
+                hash_input.extend_from_slice(id0);
+                let mut step: [u8; 16] = Md5::digest(&hash_input).into();
+                let mut buf = rc4_apply(&file_key, &step);
+                for i in 1u8..=19 {
+                    let round_key: Vec<u8> = file_key.iter().map(|b| b ^ i).collect();
+                    buf = rc4_apply(&round_key, &buf);
+                }
+                step.copy_from_slice(&buf[..16]);
+                step.to_vec()
+            };
+            let matches = if r == 2 {
+                expected_u == u_entry
+            } else {
+                u_entry.len() >= 16 && expected_u[..16] == u_entry[..16]
+            };
+            if !matches {
+                return Err(DecryptError::WrongPassword);
+            }
+
             let method = if v == 4 {
                 crypt_filter_method(encrypt).unwrap_or(CryptMethod::Rc4)
             } else {
                 CryptMethod::Rc4
             };
 
-            Some(Self {
+            Ok(Self {
                 file_key,
                 method,
                 v,
@@ -114,19 +188,38 @@ impl Decryptor {
         } else {
             // V5 (R5/R6, AES-256) : voir Algorithme 2.A (ISO 32000-2 §7.6.4.3.3)
             // pour retrouver la clé de fichier à partir du mot de passe
-            // utilisateur — ici toujours vide.
+            // utilisateur.
             if u_entry.len() < 48 {
-                return None;
+                return Err(Unsupported);
             }
+            let validation_salt = &u_entry[32..40];
             let key_salt = &u_entry[40..48];
-            let ue = string_bytes(encrypt.get("UE")?)?;
+            let ue = string_bytes(encrypt.get("UE").ok_or(Unsupported)?).ok_or(Unsupported)?;
             if ue.len() != 32 {
-                return None;
+                return Err(Unsupported);
             }
-            let intermediate = if r >= 6 {
-                hardened_hash(&[], key_salt, &[])
+
+            // Sel de *validation* : recalcule le hachage stocké dans les 32
+            // premiers octets de `/U` et compare, avant de dériver quoi que
+            // ce soit à partir du sel de *clé* — même principe que
+            // l'Algorithme 5 ci-dessus pour les révisions <= 4.
+            let expected_validation = if r >= 6 {
+                hardened_hash(password, validation_salt, &[])
             } else {
                 let mut hasher = Sha256::new();
+                hasher.update(password);
+                hasher.update(validation_salt);
+                hasher.finalize().to_vec()
+            };
+            if expected_validation != u_entry[0..32] {
+                return Err(DecryptError::WrongPassword);
+            }
+
+            let intermediate = if r >= 6 {
+                hardened_hash(password, key_salt, &[])
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(password);
                 hasher.update(key_salt);
                 hasher.finalize().to_vec()
             };
@@ -136,7 +229,7 @@ impl Decryptor {
             let file_key = aes256_cbc_decrypt_no_padding(&key, &iv, &ue);
             iv.fill(0);
 
-            Some(Self {
+            Ok(Self {
                 file_key,
                 method: CryptMethod::AesV3,
                 v,

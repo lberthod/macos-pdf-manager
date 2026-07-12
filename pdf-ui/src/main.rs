@@ -182,6 +182,18 @@ struct AnnotationStylePopup {
     opacity: f32,
 }
 
+/// Fenêtre de saisie de mot de passe (Sprint 58, `audit50quest.md` #50) —
+/// ouverte par `open_path` quand `Session::open` échoue avec
+/// `SessionOpenError::IncorrectPassword` (mot de passe vide implicite
+/// refusé par le document). `error` porte le message d'un essai précédent
+/// raté dans **cette même** fenêtre (pas l'erreur générique `DocumentTab::error`,
+/// pour ne pas fermer la fenêtre à chaque nouvel essai).
+struct PasswordPrompt {
+    path: PathBuf,
+    input: String,
+    error: Option<String>,
+}
+
 fn main() -> eframe::Result<()> {
     // Backend `wgpu` plutôt que le `glow` par défaut d'eframe : condition
     // nécessaire pour partager le `Device`/`Queue` d'eframe avec
@@ -379,6 +391,9 @@ struct DocumentTab {
     /// direct dans la fenêtre puis appliquées via
     /// `Session::set_annotation_style_on_current_page`.
     annotation_style_popup: Option<AnnotationStylePopup>,
+    /// Fenêtre de saisie de mot de passe ouverte par `open_path` (#50,
+    /// Sprint 58) — `None` si aucune. Voir `PasswordPrompt`.
+    password_prompt: Option<PasswordPrompt>,
     /// Dernier décalage de défilement connu de la `ScrollArea` de la page
     /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
     /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
@@ -471,6 +486,7 @@ impl DocumentTab {
             choice_fields_state: None,
             choice_field_popup: None,
             annotation_style_popup: None,
+            password_prompt: None,
             last_scroll_offset: egui::Vec2::ZERO,
             last_scroll_viewport: None,
             pending_scroll_offset: None,
@@ -528,17 +544,31 @@ impl DocumentTab {
         self.annotation_drag = None;
         self.annotation_drag_preview = None;
         self.annotation_style_popup = None;
+        self.password_prompt = None;
         self.last_scroll_offset = egui::Vec2::ZERO;
         self.last_scroll_viewport = None;
         self.pending_scroll_offset = None;
 
-        match Session::open(path) {
+        match Session::open(path.clone()) {
             Ok(mut session) => {
                 if let Some(gpu) = &self.gpu {
                     session.set_gpu_renderer(gpu.clone());
                 }
                 self.session = Some(session);
                 self.refresh_render_worker_document();
+            }
+            // Mot de passe vide implicite refusé : le document a
+            // probablement un vrai mot de passe utilisateur (Sprint 58,
+            // #50) — propose une fenêtre de saisie plutôt qu'un message
+            // d'erreur définitif, `self.session` reste `None` tant que
+            // l'utilisateur n'a pas entré le bon mot de passe ou annulé.
+            Err(pdf_app::SessionOpenError::IncorrectPassword) => {
+                self.password_prompt = Some(PasswordPrompt {
+                    path,
+                    input: String::new(),
+                    error: None,
+                });
+                self.session = None;
             }
             Err(e) => {
                 self.error = Some(format!("Impossible d'ouvrir le fichier : {e}"));
@@ -1190,6 +1220,84 @@ impl DocumentTab {
         }
         if close {
             self.annotation_style_popup = None;
+        }
+    }
+
+    /// Affiche la fenêtre de saisie de mot de passe ouverte par `open_path`
+    /// (#50, Sprint 58), le cas échéant — un champ masqué (`password(true)`)
+    /// et deux boutons : "Ouvrir" rappelle `Session::open_with_password`
+    /// avec le mot de passe saisi (nouvel échec : message affiché **dans**
+    /// la fenêtre, qui reste ouverte pour un nouvel essai, contrairement à
+    /// `self.error` qui la fermerait) ; "Annuler" referme la fenêtre sans
+    /// ouvrir de document, l'onglet reste vide.
+    fn show_password_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &mut self.password_prompt else {
+            return;
+        };
+        let mut input = prompt.input.clone();
+        let error = prompt.error.clone();
+        let path = prompt.path.clone();
+
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("Mot de passe requis")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Ce document ({}) est protégé par un mot de passe.",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "document.pdf".to_string())
+                ));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut input)
+                        .password(true)
+                        .hint_text("Mot de passe"),
+                );
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if let Some(error) = &error {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), error);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Ouvrir").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if let Some(prompt) = &mut self.password_prompt {
+            prompt.input = input.clone();
+        }
+
+        if submit {
+            match Session::open_with_password(&path, input.as_bytes()) {
+                Ok(mut session) => {
+                    if let Some(gpu) = &self.gpu {
+                        session.set_gpu_renderer(gpu.clone());
+                    }
+                    self.session = Some(session);
+                    self.password_prompt = None;
+                    self.refresh_render_worker_document();
+                }
+                Err(pdf_app::SessionOpenError::IncorrectPassword) => {
+                    if let Some(prompt) = &mut self.password_prompt {
+                        prompt.error = Some("Mot de passe incorrect.".to_string());
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!("Impossible d'ouvrir le fichier : {e}"));
+                    self.password_prompt = None;
+                }
+            }
+        }
+        if cancel {
+            self.password_prompt = None;
         }
     }
 
@@ -2700,6 +2808,7 @@ impl DocumentTab {
         self.show_text_modal(ctx);
         self.show_choice_field_popup(ctx);
         self.show_annotation_style_popup(ctx);
+        self.show_password_prompt(ctx);
 
         outcome
     }

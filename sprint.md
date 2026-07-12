@@ -431,6 +431,25 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 58 — Vrai mot de passe utilisateur pour les PDF chiffrés (#50 suite)
+
+**Objectif :** sous-cas le plus tractable de #50 (`audit50quest.md`, groupe J) — VoiceOver/accessibilité demande une intégration `NSAccessibility` profonde, hors de portée d'une passe rapide et impossible à vérifier sans session graphique ; le mot de passe utilisateur réel, en revanche, était une lacune ponctuelle et bien scoppée dans `pdf-core::crypt` (Sprint 22), avec un bug documenté par le code lui-même ("le déchiffrement avec la mauvaise clé produit du contenu corrompu plutôt qu'une erreur explicite").
+
+- [x] **`pdf-core::crypt::Decryptor::new`** prend désormais `password: &[u8]` et **vérifie** qu'il correspond à `/U` avant de renvoyer un contexte utilisable — Algorithme 4 (R2)/5 (R3-4) ISO 32000-1 §7.6.4.4 (recalcule `/U` à partir de la clé de fichier candidate et compare), ou le sel de *validation* de `/U` (distinct du sel de *clé* déjà utilisé) pour R5/6. **Corrige un vrai bug, pas seulement une extension** : avant cette passe, un mot de passe incorrect (y compris le vide implicite sur un document qui en exige un réel) produisait silencieusement une clé de fichier erronée puis du contenu déchiffré corrompu, sans jamais échouer. `pad_password` (nouveau) remplace la constante `PAD` utilisée telle quelle jusqu'ici — complète/tronque le mot de passe candidat à 32 octets (ISO 32000-1 Algorithme 2, étape a) au lieu de toujours utiliser la chaîne de remplissage seule.
+- [x] **`DecryptError` (nouveau enum, `Unsupported`/`WrongPassword`)** distingue "gestionnaire de sécurité non standard" (rien à faire) de "mot de passe incorrect" (l'appelant peut proposer d'en ressaisir un) — propagé jusqu'à `PdfError::IncorrectPassword` (nouvelle variante) par `Document::open_with_password` (nouveau, `Document::open` devient un simple appel avec mot de passe vide).
+- [x] **`pdf_edit::EditSession::open_with_password`**/**`pdf_app::Session::open_with_password`** exposent le mot de passe de bout en bout jusqu'à l'UI — `pdf_app::SessionOpenError` (nouveau enum, `IncorrectPassword`/`Other`) donne à `pdf-ui` le signal typé dont il a besoin pour distinguer "mot de passe requis" d'une autre erreur d'ouverture générique.
+- [x] **`pdf-ui`** : quand `Session::open` (mot de passe vide implicite) échoue avec `IncorrectPassword`, une fenêtre de saisie (`PasswordPrompt`, champ masqué `TextEdit::password(true)`, Entrée ou bouton "Ouvrir" valident) s'ouvre à la place du message d'erreur générique ; un nouvel essai raté affiche l'erreur **dans** la fenêtre (qui reste ouverte) plutôt que de la fermer.
+- [x] **Nouveau fixture `encrypted_user_password.pdf`** (`pikepdf.Encryption(user="secret123", R=4)`, AES-128) — le corpus n'avait jusqu'ici que des fixtures à mot de passe vide. Testé bout en bout côté `pdf-core` (bon mot de passe déchiffre et recompose le texte en clair, mauvais mot de passe **et** mot de passe vide tous deux rejetés avec `PdfError::IncorrectPassword`) et côté `pdf-app` (`SessionOpenError::IncorrectPassword` observé, puis ouverture réussie avec le bon mot de passe).
+
+**Non fait dans ce sprint** (la ligne #50 reste ◐, pas ☑) :
+- **VoiceOver/accessibilité** (`NSAccessibility`) : non engagé — demanderait soit une intégration `AccessKit`/pont `NSAccessibility` manuel (`pdf-ui` dessine tout lui-même via `egui`/`wgpu`, aucun widget natif accessible par défaut), un chantier architectural bien plus large qu'une passe de correction ciblée, et de toute façon non vérifiable sans session graphique macOS + VoiceOver actif depuis cet environnement de développement.
+- **Encodage du mot de passe** : ISO 32000-1 §7.6.4.3.2 prévoit une conversion PDFDocEncoding/UTF-8 selon la révision (SASLprep pour R6) — non implémentée, le mot de passe saisi est utilisé tel quel en octets bruts. Couvre la quasi-totalité des mots de passe réels (ASCII simple), mais un mot de passe avec des caractères non-ASCII pourrait échouer à tort.
+- **Vérification interactive** de la fenêtre de saisie : comme pour #20/#32/#43/#48, pas d'accès à une session graphique macOS depuis cet environnement de développement — validé par les tests `pdf-core`/`pdf-app` (bout en bout, y compris rejet) et par lecture de code côté `pdf-ui`.
+
+**Critère de sortie :** `cargo test --workspace` vert (234 tests, +1 `pdf-core` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint** pour le sous-cas "vrai mot de passe" de #50 — reste ◐ dans `audit50quest.md`, seule l'accessibilité VoiceOver/clavier restant à faire pour fermer complètement la ligne.
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

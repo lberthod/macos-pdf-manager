@@ -132,8 +132,15 @@ pub struct EditSession {
 
 impl EditSession {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_with_password(path, b"")
+    }
+
+    /// Comme `open`, avec un mot de passe utilisateur explicite (Sprint 58,
+    /// `audit50quest.md` #50) — voir `pdf_core::Document::open_with_password`.
+    /// Sans effet sur un document non chiffré.
+    pub fn open_with_password(path: impl AsRef<Path>, password: &[u8]) -> Result<Self, String> {
         let data = std::fs::read(path.as_ref()).map_err(|e| e.to_string())?;
-        let doc = Document::open(data).map_err(|e| e.to_string())?;
+        let doc = Document::open_with_password(data, password).map_err(|e| e.to_string())?;
         let next_num = doc.next_free_object_num();
         Ok(Self {
             doc,

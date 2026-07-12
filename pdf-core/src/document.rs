@@ -1,6 +1,6 @@
 //! Modèle document (arbre logique) — architecture.md §4.4.
 
-use crate::crypt::Decryptor;
+use crate::crypt::{DecryptError, Decryptor};
 use crate::error::{PdfError, Result};
 use crate::filters::decode_stream;
 use crate::object::{Dictionary, ObjRef, Object};
@@ -15,16 +15,29 @@ pub struct Document {
     xref: XrefTable,
     trailer: Dictionary,
     cache: RefCell<BTreeMap<u32, Object>>,
-    /// Contexte de déchiffrement (`/Encrypt`, Sprint 22, voir `crypt.rs`) —
-    /// `None` pour un document non chiffré. Suppose un mot de passe
-    /// utilisateur vide (voir la doc de module de `crypt`) ; un document
-    /// avec un vrai mot de passe reste illisible (contenu corrompu plutôt
-    /// qu'une erreur explicite, limitation connue et documentée).
+    /// Contexte de déchiffrement (`/Encrypt`, Sprint 22/58, voir `crypt.rs`)
+    /// — `None` pour un document non chiffré.
     decryption: Option<Decryptor>,
 }
 
 impl Document {
+    /// Ouvre un document, en supposant un mot de passe utilisateur vide (le
+    /// cas normal — la grande majorité des PDF "protégés" ne restreignent
+    /// que l'édition/l'impression, pas l'ouverture). Pour un document dont
+    /// le mot de passe utilisateur est réellement non vide, utiliser
+    /// `open_with_password` — celui-ci renvoie `PdfError::IncorrectPassword`
+    /// plutôt qu'un succès trompeur (voir la doc de module de `crypt` pour
+    /// le bug que ça corrigeait avant le Sprint 58, `audit50quest.md` #50).
     pub fn open(data: Vec<u8>) -> Result<Self> {
+        Self::open_with_password(data, b"")
+    }
+
+    /// Comme `open`, avec un mot de passe utilisateur explicite (octets
+    /// bruts — encodage PDFDocEncoding/UTF-8 selon la révision, ISO
+    /// 32000-1 §7.6.4.3.2 ; en pratique un mot de passe ASCII simple couvre
+    /// la quasi-totalité des cas réels, pas de conversion d'encodage faite
+    /// ici). Sans effet sur un document non chiffré.
+    pub fn open_with_password(data: Vec<u8>, password: &[u8]) -> Result<Self> {
         let (xref, trailer) = parse_xref_chain(&data)?;
         let mut doc = Self {
             data,
@@ -53,12 +66,17 @@ impl Document {
                     _ => None,
                 })
                 .unwrap_or(&[]);
-            match Decryptor::new(&encrypt_dict, id0, encrypt_obj_num) {
-                Some(decryptor) => doc.decryption = Some(decryptor),
+            match Decryptor::new(&encrypt_dict, id0, encrypt_obj_num, password) {
+                Ok(decryptor) => doc.decryption = Some(decryptor),
                 // Gestionnaire de sécurité non standard, ou révision non
                 // reconnue : on ne peut pas déchiffrer, message clair plutôt
                 // que des erreurs de bas niveau trompeuses plus loin.
-                None => return Err(PdfError::Encrypted),
+                Err(DecryptError::Unsupported) => return Err(PdfError::Encrypted),
+                // Mot de passe incorrect (ou vide sur un document qui en
+                // exige un réel) : distinct de `Encrypted` pour que
+                // l'appelant (`pdf-app`/`pdf-ui`) sache qu'il peut proposer
+                // de ressaisir un mot de passe plutôt qu'abandonner.
+                Err(DecryptError::WrongPassword) => return Err(PdfError::IncorrectPassword),
             }
         }
 
@@ -481,6 +499,35 @@ mod tests {
             text, "AES-256 encrypted PDF test",
             "decrypted content stream must produce the original plaintext"
         );
+    }
+
+    /// Sprint 58 (`audit50quest.md` #50) : un mot de passe utilisateur réel
+    /// (pas vide) fonctionne bout en bout via `open_with_password`, et
+    /// `Document::open` (mot de passe vide implicite) échoue proprement sur
+    /// le même fichier avec `PdfError::IncorrectPassword` plutôt qu'un
+    /// contenu déchiffré silencieusement corrompu (le bug documenté dans
+    /// `crypt.rs` avant cette passe).
+    #[test]
+    fn opens_an_aes128_encrypted_pdf_with_a_real_non_empty_user_password() {
+        let bytes = include_bytes!("../tests/fixtures/encrypted_user_password.pdf").to_vec();
+
+        let doc = Document::open_with_password(bytes.clone(), b"secret123")
+            .expect("should decrypt with the correct non-empty user password");
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content(&page).unwrap();
+        let display =
+            crate::interp::Interpreter::run_page(&doc, page.resources.clone(), &content).unwrap();
+        let text = recovered_text_for_test(&display);
+        assert_eq!(
+            text,
+            "Password protected PDF test - if you can read this, the password worked"
+        );
+
+        let wrong = Document::open_with_password(bytes.clone(), b"wrong-password");
+        assert!(matches!(wrong, Err(PdfError::IncorrectPassword)));
+
+        let empty = Document::open(bytes);
+        assert!(matches!(empty, Err(PdfError::IncorrectPassword)));
     }
 
     /// Trois mises à jour incrémentales chaînées (`/Prev -> /Prev -> /Prev`),

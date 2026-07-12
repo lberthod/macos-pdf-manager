@@ -18,6 +18,7 @@
 - `acroform_checkbox.pdf` — page avec une case à cocher AcroForm simple (`reportlab.Canvas.acroForm.checkbox`, `/FT /Btn`, `Ff 2` — pas de bit `Pushbutton`/`Radio`, un seul widget qui est aussi le champ). `/AP /N` est un dictionnaire d'états (`/Off`, `/Yes`) plutôt qu'un flux unique, `/AS /Off` initialement. Sert de fixture de bout en bout pour `pdf-edit::EditSession::checkbox_fields`/`set_checkbox_field_value` (Sprint 52, #43 suite) : coche/décoche en ne touchant que `/AS`+`/V`, sans régénérer `/AP` (contrairement au champ texte, dont l'apparence est synthétisée depuis zéro).
 - `acroform_radio.pdf` — page avec un groupe de 2 boutons radio AcroForm (`reportlab.Canvas.acroForm.radio`, deux appels avec le même `name`, options `"red"` sélectionnée initialement et `"blue"`). Le champ parent (`/FT /Btn`, `Ff` avec le bit `Radio` posé) n'a pas de `/Rect` propre, seuls ses deux `/Kids` (les widgets) en ont un — chacun avec son propre `/AP /N` (`/Off` + son propre nom d'état, `"red"`/`"blue"`) et son propre `/AS`. Sert de fixture de bout en bout pour `pdf-edit::EditSession::radio_groups`/`set_radio_group_value` (Sprint 53, #43 suite) : bascule `/AS` de chaque widget-enfant (un seul reste coché) et `/V` du champ parent, sans régénérer aucune apparence.
 - `acroform_choice.pdf` — page avec un champ liste/menu déroulant AcroForm (`reportlab.Canvas.acroForm.choice`, `/FT /Ch`, `fieldFlags="combo"`, 3 options `[(display, code), ...]`). `/Opt` est un tableau de paires `[texte affiché, code]` mais `/V`/`/DV` valent le **premier** élément de la paire (`"Apple"`, pas `"apple"`) — comportement réel de reportlab, pas forcément la lecture qu'on ferait de l'ordre `/Opt` d'ISO 32000-1 §12.7.4.4 à la lettre. Sert de fixture de bout en bout pour `pdf-edit::EditSession::choice_fields`/`set_choice_field_value` (Sprint 54, #43 suite, dernier sous-cas) : contrairement aux cases à cocher/boutons radio, ce type de champ **régénère** son apparence (texte simple, comme un champ `/Tx`) plutôt que de basculer un `/AS` déjà présent dans `/AP /N`.
+- `encrypted_user_password.pdf` — page chiffrée avec un **vrai mot de passe utilisateur non vide** (`pikepdf.Encryption(owner="ownerpass", user="secret123", R=4)`, AES-128), contrairement aux deux fixtures chiffrés existants (`encrypted_rc4.pdf`/`encrypted_aes256.pdf`, tous deux à mot de passe utilisateur vide). Sert de fixture de bout en bout pour `pdf_core::crypt::Decryptor`/`Document::open_with_password` (Sprint 58, `audit50quest.md` #50 suite) : bon mot de passe (`"secret123"`) déchiffre et recompose le texte en clair, mauvais mot de passe **et** mot de passe vide implicite tous deux rejetés avec `PdfError::IncorrectPassword`.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -270,6 +271,15 @@ c15.showPage()
 c15.save()
 with Pdf.open(io.BytesIO(buf15.getvalue())) as pdf:
     pdf.save("acroform_choice.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# encrypted_user_password.pdf
+buf16 = io.BytesIO()
+c16 = canvas.Canvas(buf16, pagesize=letter)
+c16.drawString(72, 720, "Password protected PDF test - if you can read this, the password worked")
+c16.showPage()
+c16.save()
+with Pdf.open(io.BytesIO(buf16.getvalue())) as pdf:
+    pdf.save("encrypted_user_password.pdf", encryption=pikepdf.Encryption(owner="ownerpass", user="secret123", R=4))
 ```
 
 - `bold_italic_standard_fonts.pdf` — cinq lignes en polices standard non embarquées **hors Helvetica plain** (`Times-Bold`, `Times-Italic`, `Courier-BoldOblique`, `Helvetica-BoldOblique`, `Symbol`) : exerce la sélection de face gras/italique de la substitution système (`.ttc` avec choix de face) au-delà du seul fixture Helvetica déjà couvert.

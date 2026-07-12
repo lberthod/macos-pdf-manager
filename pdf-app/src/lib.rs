@@ -14,7 +14,29 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use pdf_core::{Document, Object};
+use pdf_core::{Document, Object, PdfError};
+
+/// Pourquoi `Session::open`/`open_with_password` a échoué — distingue
+/// "mot de passe incorrect ou manquant" (`pdf-ui` peut proposer d'en
+/// ressaisir un) du reste (fichier introuvable, PDF malformé, gestionnaire
+/// de sécurité non standard...), simplement rapporté comme texte (Sprint
+/// 58, `audit50quest.md` #50).
+#[derive(Debug)]
+pub enum SessionOpenError {
+    IncorrectPassword,
+    Other(String),
+}
+
+impl std::fmt::Display for SessionOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionOpenError::IncorrectPassword => {
+                write!(f, "incorrect password for this encrypted PDF")
+            }
+            SessionOpenError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
 
 /// Ré-exporté tel quel (pas de conversion vers un type propre à `pdf-app`,
 /// contrairement à `MatchRect`) : `OutlineItem` ne porte aucune notion liée
@@ -134,13 +156,33 @@ pub struct Session {
 }
 
 impl Session {
-    /// Ouvre un fichier PDF depuis le disque.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
+    /// Ouvre un fichier PDF depuis le disque, en supposant un mot de passe
+    /// utilisateur vide (le cas normal — voir
+    /// `pdf_core::Document::open_with_password`).
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, SessionOpenError> {
+        Self::open_with_password(path, b"")
+    }
+
+    /// Comme `open`, avec un mot de passe utilisateur explicite (Sprint 58,
+    /// `audit50quest.md` #50) — sur un document chiffré, `pdf-ui` appelle
+    /// d'abord `open` (mot de passe vide implicite) puis, sur
+    /// `SessionOpenError::IncorrectPassword`, propose une fenêtre de saisie
+    /// et rappelle celle-ci avec le mot de passe entré.
+    pub fn open_with_password(
+        path: impl Into<PathBuf>,
+        password: &[u8],
+    ) -> Result<Self, SessionOpenError> {
         let path = path.into();
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let doc = Document::open(bytes).map_err(|e| e.to_string())?;
-        let page_count = doc.page_count().map_err(|e| e.to_string())?;
-        let edit = pdf_edit::EditSession::open(&path)?;
+        let bytes = std::fs::read(&path).map_err(|e| SessionOpenError::Other(e.to_string()))?;
+        let doc = Document::open_with_password(bytes, password).map_err(|e| match e {
+            PdfError::IncorrectPassword => SessionOpenError::IncorrectPassword,
+            other => SessionOpenError::Other(other.to_string()),
+        })?;
+        let page_count = doc
+            .page_count()
+            .map_err(|e| SessionOpenError::Other(e.to_string()))?;
+        let edit = pdf_edit::EditSession::open_with_password(&path, password)
+            .map_err(SessionOpenError::Other)?;
         Ok(Self {
             doc,
             path,
@@ -1006,6 +1048,27 @@ mod tests {
     fn open_missing_file_returns_error() {
         let result = Session::open("/nonexistent/path/does-not-exist.pdf");
         assert!(result.is_err());
+    }
+
+    /// `Session::open` (mot de passe vide implicite) sur un document dont le
+    /// mot de passe utilisateur est réellement non vide doit échouer avec
+    /// `SessionOpenError::IncorrectPassword` — le signal typé dont `pdf-ui`
+    /// a besoin pour proposer une fenêtre de saisie plutôt qu'un message
+    /// d'erreur générique (Sprint 58, `audit50quest.md` #50).
+    #[test]
+    fn open_encrypted_pdf_without_password_reports_incorrect_password() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/encrypted_user_password.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let result = Session::open(&path);
+        assert!(matches!(result, Err(SessionOpenError::IncorrectPassword)));
+
+        let session = Session::open_with_password(&path, b"secret123")
+            .expect("should open with the correct password");
+        assert_eq!(session.page_count(), 1);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

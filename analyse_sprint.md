@@ -38,13 +38,13 @@
 
 ---
 
-## Sprint 20 — Câbler l'annotation & l'édition de texte à `pdf-ui` (Should, groupe E + G) — ✅ FERMÉ (sauf #43)
+## Sprint 20 — Câbler l'annotation & l'édition de texte à `pdf-ui` (Should, groupe E + G) — ✅ FERMÉ (#43 fermé séparément, voir Sprint 50)
 
 **Pourquoi ensuite :** même diagnostic que le Sprint 19 (moteur fait, UI absente) mais sur un périmètre plus délicat côté ergonomie (placement au clic, dialogues de saisie).
 
 - [x] **#30 — Outil FreeText** : bouton bascule "📝 Ajouter texte", clic sur la page (`handle_add_text_click`) → dialogue de saisie (`egui::Window` modal, `show_text_modal`) → `Session::add_free_text_on_current_page` avec les coordonnées du clic.
 - [x] **#40 (UI) — Remplacer un texte existant** : réutilise la sélection de texte déjà existante (`selection_bbox`, extrait de `highlight_selection`) pour proposer "✏ Remplacer…" → dialogue de saisie préremplie → `Session::replace_text_on_current_page` (nouveau wrapper).
-- [ ] **#43 (UI) — Remplissage de formulaire au clic** : **reporté**, confirmé comme prévu — nécessite d'abord d'exposer la position/liste des champs AcroForm d'une page (fonction à ajouter côté `pdf-app`/`pdf-core`, lecture de `/Annots` de type `/Widget`, symétrique de la nouvelle `annotations_on_current_page` mais pas encore écrite). Un vrai sous-morceau de travail, pas juste un câblage — candidat naturel pour ouvrir le prochain sprint annotation.
+- [x] **#43 (UI) — Remplissage de formulaire au clic** : reporté au Sprint 20, fermé hors sprint dédié juste après (voir `sprint.md` Sprint 50) — `EditSession::form_fields` + wrappers `pdf-app` + contour cliquable/dialogue préremplie dans `pdf-ui`. Champs `/Tx` seulement, `/Btn`/`/Ch` restent hors périmètre.
 - [x] **#32 — Sélection/suppression d'annotation** : `Session::annotations_on_current_page` (nouvelle méthode, liste `/Annots` avec `Rect`/`Subtype`) → contour cliquable par annotation (`draw_annotation_outlines`) → clic (`handle_annotation_click`) → bouton "🗑 Supprimer l'annotation" → `remove_annotation_on_current_page` (déjà existant). Le déplacement/redimensionnement (poignées) et le réglage couleur/opacité restent **volontairement différés** — la ligne reste ◐, pas ☑, dans `audit50quest.md`.
 - [x] **#26 — Souligner/barrer** : `pdf_edit::EditSession::add_underline_annotation`/`add_strikeout_annotation` (nouveau, partagent `add_line_markup_annotation` — une ligne tracée à `line_y_fraction` de la hauteur du rectangle plutôt que le remplissage semi-transparent de `/Highlight`), boutons "Souligner"/"Barrer" à côté de "🖍 Surligner" dans `pdf-ui`.
 

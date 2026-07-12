@@ -108,12 +108,18 @@ const NEW_TEXT_BOX_SIZE: (f64, f64) = (220.0, 24.0);
 /// pour #40 (remplacer un texte existant par superposition, réutilise la
 /// sélection courante).
 enum PendingTextAction {
-    AddFreeText { rect: [f64; 4] },
-    ReplaceText { rect: [f64; 4] },
+    AddFreeText {
+        rect: [f64; 4],
+    },
+    ReplaceText {
+        rect: [f64; 4],
+    },
     /// Remplir un champ de formulaire texte au clic (Sprint 23) — la
     /// modale est préremplie avec la valeur actuelle du champ plutôt que
     /// vide, contrairement aux deux autres variantes.
-    FillForm { field_name: String },
+    FillForm {
+        field_name: String,
+    },
 }
 
 /// État de la boîte de dialogue modale de saisie de texte (Sprint 20) —
@@ -1454,9 +1460,11 @@ impl DocumentTab {
             return false;
         };
         let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
-        let Some(field) = self.form_fields.iter().find(|f| {
-            px >= f.rect[0] && px <= f.rect[2] && py >= f.rect[1] && py <= f.rect[3]
-        }) else {
+        let Some(field) = self
+            .form_fields
+            .iter()
+            .find(|f| px >= f.rect[0] && px <= f.rect[2] && py >= f.rect[1] && py <= f.rect[3])
+        else {
             return false;
         };
         self.text_modal = Some(TextInputModal {
@@ -2089,7 +2097,13 @@ impl DocumentTab {
                         }
 
                         if !self.form_fields.is_empty() {
-                            draw_form_field_outlines(ui, &response, &self.form_fields, media_box, scale);
+                            draw_form_field_outlines(
+                                ui,
+                                &response,
+                                &self.form_fields,
+                                media_box,
+                                scale,
+                            );
                         }
 
                         // Le mode "📝 Ajouter texte" (#30) intercepte le

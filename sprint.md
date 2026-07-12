@@ -286,6 +286,20 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 50 — Câbler le remplissage de formulaire au clic (#43)
+
+**Objectif :** dernier point du Sprint 20 resté ouvert (#43, reporté faute de fonction de localisation des widgets) — refermer le seul manque connu du groupe E "moteur fait, zéro UI".
+
+- [x] **`pdf-edit::EditSession::form_fields`** (nouveau) liste les champs `/AcroForm/Fields` de type `/Tx` avec nom (`/T`), rectangle (`/Rect`) et valeur courante (`/V`), symétrique de `annotations_on_current_page` (Sprint 20) mais pour les widgets de formulaire plutôt que les annotations.
+- [x] **`pdf_app::Session::form_fields_on_current_page`/`set_form_field_value_on_current_page`** enveloppent `form_fields`/`set_form_field_value` pour la page courante, même schéma que les autres wrappers d'édition (`refresh_after_edit` après modification).
+- [x] **`pdf-ui`** dessine un contour cliquable par champ formulaire (même mécanique que `draw_annotation_outlines`) ; un clic ouvre la boîte de dialogue modale déjà utilisée pour `/FreeText`/remplacement de texte (`text_modal`/`PendingTextAction`), préremplie avec la valeur actuelle du champ.
+
+**Non touché dans ce sprint :** cases à cocher/boutons radio (`/Btn`) et listes/menus déroulants (`/Ch`) — seuls les champs texte (`/Tx`) sont listés/éditables, la ligne #43 reste ◐ dans `audit50quest.md`, pas ☑.
+
+**Critère de sortie :** `cargo test --workspace` vert (214 tests), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint.** #43 passe de ☐ (aucune UI) à ◐ (UI fermée pour `/Tx`, `/Btn`/`/Ch` restant hors périmètre) dans `audit50quest.md` — plus aucune ligne du groupe E/F à l'état "moteur fait, zéro UI".
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

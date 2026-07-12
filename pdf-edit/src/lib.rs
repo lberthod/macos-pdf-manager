@@ -763,7 +763,10 @@ impl EditSession {
                 num(&rect_arr[2]),
                 num(&rect_arr[3]),
             ];
-            let value = dict.get("V").and_then(|o| o.as_text_string()).unwrap_or_default();
+            let value = dict
+                .get("V")
+                .and_then(|o| o.as_text_string())
+                .unwrap_or_default();
             out.push(FormFieldInfo {
                 obj_ref: *r,
                 name,

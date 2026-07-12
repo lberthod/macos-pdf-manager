@@ -90,7 +90,7 @@ Légende : ☐ Absent · ◐ Partiel · ☑ Présent — Prio : M Must · S Shou
 
 | N° | Fonctionnalité | Prio | Moteur | Statut | Preuve |
 |---|---|---|---|---|---|
-| 43 | Remplissage AcroForm (texte, cases, listes) | S | ● | ◐ | Champs texte seulement (`set_form_field_value`, testé bout en bout sur `acroform_textfield.pdf`). **Pas de cases à cocher/boutons radio/listes**, aucune UI (pas de clic sur un champ dans `pdf-ui`). **Explicitement non traité au Sprint 20** (nécessite d'abord de localiser/exposer les widgets `/Annots` de type `/Widget` d'une page — un vrai sous-morceau de travail, pas juste un câblage). |
+| 43 | Remplissage AcroForm (texte, cases, listes) | S | ● | ◐ | **UI fermée** : `EditSession::form_fields` liste les champs `/AcroForm/Tx` (nom/rect/valeur), `Session::form_fields_on_current_page`/`set_form_field_value_on_current_page` les exposent, `pdf-ui` dessine un contour cliquable par champ qui ouvre une boîte de dialogue préremplie (réutilise `text_modal`/`PendingTextAction`). **Toujours pas de cases à cocher/boutons radio/listes** (`/Btn`/`/Ch`), seulement `/Tx` — ligne ◐, pas ☑, tant que ces types ne sont pas gérés. |
 | 44 | Aplatir les champs/annotations à l'export | S | ● | ☐ | `export_optimized` est un garbage-collector par reconstruction (objets atteignables), **pas un vrai flatten** (fusion de l'apparence dans le flux de contenu + suppression de l'interactivité). Non implémenté au sens strict. |
 
 ## I · Fichiers, sauvegarde & impression
@@ -144,4 +144,4 @@ Confirmé dans le code : 6a/6b (ajout de texte, remplacement par superposition) 
 
 ### Groupe F (page manipulation) et une bonne partie du groupe E : refermés depuis les Sprints 19-20
 
-Les 6 fonctionnalités de manipulation de pages (33-38) et 3 des 7 lignes d'annotation (26, 30, et la moitié de 32) sont passées de "moteur fait, zéro UI" à câblées dans `pdf-ui` — voir `sprint.md` Sprints 19 et 20. Ce qui reste dans cet état ("moteur prêt, UI absente ou partielle") : #32 (poignées de déplacement/redimensionnement/opacité) et #43 (formulaire au clic, explicitement reporté au Sprint 20 faute d'une fonction de localisation des widgets déjà prête).
+Les 6 fonctionnalités de manipulation de pages (33-38) et 3 des 7 lignes d'annotation (26, 30, et la moitié de 32) sont passées de "moteur fait, zéro UI" à câblées dans `pdf-ui` — voir `sprint.md` Sprints 19 et 20. **#43 (formulaire au clic) fermé à son tour hors sprint dédié** (voir `sprint.md` "Sprint 50") : champs `/Tx` cliquables dans `pdf-ui`, préremplis. Ce qui reste dans cet état ("moteur prêt, UI absente ou partielle") : #32 (poignées de déplacement/redimensionnement/opacité) seulement.

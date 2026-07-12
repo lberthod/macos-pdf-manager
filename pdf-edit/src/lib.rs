@@ -467,6 +467,131 @@ impl EditSession {
         Ok(())
     }
 
+    /// Change la couleur et l'opacité de remplissage/trait d'une annotation
+    /// déjà créée (#32, suite du Sprint 51 — poignées de déplacement/
+    /// redimensionnement) : régénère entièrement son apparence (`/AP /N`)
+    /// selon son `/Subtype`, en conservant sa géométrie actuelle (`/Rect`,
+    /// jamais touché ici). `/Highlight` (rectangle rempli) utilise `/ca`
+    /// (opacité de *remplissage*) sur un nouvel `ExtGState` — comme
+    /// `add_highlight_annotation`, mais `opacity` remplace la constante
+    /// `HIGHLIGHT_FILL_ALPHA` fixe. `/Underline`/`/StrikeOut` (ligne tracée)
+    /// utilisent `/CA` (opacité de *trait*, pas de remplissage — ces deux
+    /// types dessinent une ligne, jamais un aplat). `opacity` dans `[0.0,
+    /// 1.0]`, clampée. **`/FreeText` non pris en charge** : contrairement
+    /// aux trois autres, son apparence encode le texte affiché lui-même
+    /// (pas seulement géométrie+couleur) — le régénérer sans perdre ce
+    /// texte demanderait de le relire depuis le flux `/AP` existant, un
+    /// vrai sous-morceau de travail distinct, hors périmètre de cette passe
+    /// (voir sprint.md).
+    pub fn set_annotation_style(
+        &mut self,
+        page_index: usize,
+        annot_index: usize,
+        color: (f32, f32, f32),
+        opacity: f64,
+    ) -> Result<(), String> {
+        let refs = self.page_annotation_refs(page_index)?;
+        let annot_ref = *refs.get(annot_index).ok_or_else(|| {
+            format!(
+                "annotation index {annot_index} out of bounds (0..{})",
+                refs.len()
+            )
+        })?;
+
+        let before = self.current(annot_ref.num)?;
+        let mut dict = before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "annotation object is not a dictionary".to_string())?;
+
+        let subtype = dict
+            .get("Subtype")
+            .and_then(|o| o.as_name())
+            .unwrap_or("")
+            .to_string();
+        let rect_arr = dict
+            .get("Rect")
+            .and_then(|o| o.as_array())
+            .filter(|r| r.len() >= 4)
+            .ok_or_else(|| "annotation has no usable /Rect".to_string())?;
+        let width = (num(&rect_arr[2]) - num(&rect_arr[0])).abs().max(1.0);
+        let height = (num(&rect_arr[3]) - num(&rect_arr[1])).abs().max(1.0);
+        let opacity = opacity.clamp(0.0, 1.0);
+
+        let mut gs_dict = Dictionary::new();
+        gs_dict.insert("Type", Object::Name("ExtGState".to_string()));
+        let ap_content = match subtype.as_str() {
+            "Highlight" => {
+                gs_dict.insert("ca", Object::Real(opacity));
+                format!(
+                    "/GS0 gs {:.3} {:.3} {:.3} rg 0 0 {width:.3} {height:.3} re f",
+                    color.0, color.1, color.2
+                )
+            }
+            "Underline" | "StrikeOut" => {
+                gs_dict.insert("CA", Object::Real(opacity));
+                let line_y_fraction = if subtype == "Underline" { 0.08 } else { 0.5 };
+                let line_y = height * line_y_fraction;
+                format!(
+                    "/GS0 gs {:.3} {:.3} {:.3} RG 1 w 0 {line_y:.3} m {width:.3} {line_y:.3} l S",
+                    color.0, color.1, color.2
+                )
+            }
+            other => {
+                return Err(format!(
+                    "set_annotation_style: unsupported annotation subtype '{other}' \
+                     (only Highlight/Underline/StrikeOut)"
+                ));
+            }
+        };
+
+        let gs_num = self.alloc_num();
+        self.pending.insert(gs_num, Object::Dictionary(gs_dict));
+
+        let mut ap_resources = Dictionary::new();
+        let mut ext_gstate_dict = Dictionary::new();
+        ext_gstate_dict.insert("GS0", Object::Reference(ObjRef::new(gs_num, 0)));
+        ap_resources.insert("ExtGState", Object::Dictionary(ext_gstate_dict));
+
+        let ap_num = self.alloc_num();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("Type", Object::Name("XObject".to_string()));
+        ap_dict.insert("Subtype", Object::Name("Form".to_string()));
+        ap_dict.insert("Resources", Object::Dictionary(ap_resources));
+        ap_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(width),
+                Object::Real(height),
+            ]),
+        );
+        let ap_stream = Object::Stream(Stream {
+            dict: ap_dict,
+            raw_data: ap_content.into_bytes(),
+        });
+        self.pending.insert(ap_num, ap_stream);
+
+        dict.insert(
+            "C",
+            Object::Array(vec![
+                Object::Real(color.0 as f64),
+                Object::Real(color.1 as f64),
+                Object::Real(color.2 as f64),
+            ]),
+        );
+        let mut ap_ref_dict = Dictionary::new();
+        ap_ref_dict.insert("N", Object::Reference(ObjRef::new(ap_num, 0)));
+        dict.insert("AP", Object::Dictionary(ap_ref_dict));
+
+        let after = Object::Dictionary(dict);
+        self.commit(EditOp {
+            modified: vec![(annot_ref.num, before, after)],
+        });
+        Ok(())
+    }
+
     /// Ajoute la référence `new_annot` à `/Annots` de la page/objet
     /// `page_ref` — que `/Annots` soit absent, un tableau inline dans le
     /// dictionnaire de page, ou une référence vers un objet tableau séparé
@@ -2989,5 +3114,131 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();
+    }
+
+    /// `set_annotation_style` régénère l'apparence d'un `/Highlight` avec
+    /// une nouvelle couleur/opacité — vérifié directement sur le rendu (pas
+    /// seulement sur `/C`/`/AP` du dictionnaire), et la géométrie (`/Rect`)
+    /// reste inchangée.
+    #[test]
+    fn set_annotation_style_changes_highlight_color_and_opacity() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_highlight_annotation(0, [100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0), vec![])
+            .unwrap();
+        session
+            .set_annotation_style(0, 0, (0.2, 0.4, 0.9), 0.7)
+            .unwrap();
+
+        let out_path = write_fixture(b"highlight-style-out");
+        session.save_as(&out_path).unwrap();
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+        let display = Interpreter::run_page_with_annotations(&reopened, &page, &content).unwrap();
+        let path_item = display
+            .items
+            .iter()
+            .rev()
+            .find_map(|i| match i {
+                pdf_core::display::DisplayItem::Path {
+                    fill_color,
+                    fill_alpha,
+                    ..
+                } => Some((*fill_color, *fill_alpha)),
+                _ => None,
+            })
+            .expect("expected a filled path for the highlight appearance");
+        assert_eq!(path_item.0, pdf_core::display::Color::Rgb(0.2, 0.4, 0.9));
+        assert!((path_item.1 - 0.7).abs() < 1e-6);
+
+        // Rect inchangé : seule l'apparence a été régénérée.
+        let annots = reopened.page(0).unwrap().dict.get("Annots").cloned();
+        let annot_ref = reopened.get(&annots.unwrap()).unwrap().as_array().unwrap()[0]
+            .as_reference()
+            .unwrap();
+        let rect: Vec<f64> = reopened
+            .resolve(annot_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("Rect")
+            .and_then(|o| o.as_array())
+            .unwrap()
+            .iter()
+            .map(num)
+            .collect();
+        assert_eq!(rect, vec![100.0, 600.0, 300.0, 630.0]);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// `set_annotation_style` sur un `/Underline` régénère la ligne tracée
+    /// avec une nouvelle couleur/opacité — vérifié sur `stroke_color`/
+    /// `stroke_alpha` du rendu (opacité de *trait*, pas de remplissage,
+    /// contrairement au surlignage).
+    #[test]
+    fn set_annotation_style_changes_underline_color_and_opacity() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_underline_annotation(0, [100.0, 600.0, 300.0, 630.0], (1.0, 0.0, 0.0))
+            .unwrap();
+        session
+            .set_annotation_style(0, 0, (0.0, 0.8, 0.1), 0.5)
+            .unwrap();
+
+        let out_path = write_fixture(b"underline-style-out");
+        session.save_as(&out_path).unwrap();
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+        let display = Interpreter::run_page_with_annotations(&reopened, &page, &content).unwrap();
+        let path_item = display
+            .items
+            .iter()
+            .rev()
+            .find_map(|i| match i {
+                pdf_core::display::DisplayItem::Path {
+                    stroke_color,
+                    stroke_alpha,
+                    ..
+                } => Some((*stroke_color, *stroke_alpha)),
+                _ => None,
+            })
+            .expect("expected a stroked path for the underline appearance");
+        assert_eq!(path_item.0, pdf_core::display::Color::Rgb(0.0, 0.8, 0.1));
+        assert!((path_item.1 - 0.5).abs() < 1e-6);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// `set_annotation_style` refuse explicitement un `/FreeText` (voir la
+    /// doc de la méthode) plutôt que de silencieusement écraser son texte.
+    #[test]
+    fn set_annotation_style_rejects_free_text() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_free_text_annotation(0, [50.0, 50.0, 250.0, 80.0], "Note", 14.0, (0.0, 0.0, 0.0))
+            .unwrap();
+        let err = session
+            .set_annotation_style(0, 0, (1.0, 0.0, 0.0), 1.0)
+            .unwrap_err();
+        assert!(err.contains("FreeText") || err.contains("unsupported"));
+
+        std::fs::remove_file(&path).ok();
     }
 }

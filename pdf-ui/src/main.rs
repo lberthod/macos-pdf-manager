@@ -170,6 +170,18 @@ struct TextInputModal {
     input: String,
 }
 
+/// État de la fenêtre de réglage couleur/opacité d'une annotation (#32,
+/// Sprint 55) — préremplie avec la couleur actuelle de l'annotation (voir
+/// `pdf_app::AnnotationInfo::color`) et une opacité par défaut de 1.0 (pas
+/// lue depuis `/AP`, qui n'est pas exposé jusqu'ici — un réglage explicite
+/// de l'opacité écrase donc toujours la valeur précédente, y compris
+/// `HIGHLIGHT_FILL_ALPHA`).
+struct AnnotationStylePopup {
+    annot_index: usize,
+    color: [f32; 3],
+    opacity: f32,
+}
+
 fn main() -> eframe::Result<()> {
     // Backend `wgpu` plutôt que le `glow` par défaut d'eframe : condition
     // nécessaire pour partager le `Device`/`Queue` d'eframe avec
@@ -361,6 +373,12 @@ struct DocumentTab {
     /// d'option est actuellement ouverte (`None` si aucune) — voir
     /// `handle_choice_field_click`/`show_choice_field_popup`.
     choice_field_popup: Option<String>,
+    /// Fenêtre de réglage couleur/opacité ouverte par le bouton "🎨
+    /// Style…" (#32, Sprint 55) — `None` si aucune. `annot_index` cible
+    /// l'indice dans `self.annotations`, `color`/`opacity` sont éditées en
+    /// direct dans la fenêtre puis appliquées via
+    /// `Session::set_annotation_style_on_current_page`.
+    annotation_style_popup: Option<AnnotationStylePopup>,
     /// Dernier décalage de défilement connu de la `ScrollArea` de la page
     /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
     /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
@@ -452,6 +470,7 @@ impl DocumentTab {
             choice_fields: Vec::new(),
             choice_fields_state: None,
             choice_field_popup: None,
+            annotation_style_popup: None,
             last_scroll_offset: egui::Vec2::ZERO,
             last_scroll_viewport: None,
             pending_scroll_offset: None,
@@ -508,6 +527,7 @@ impl DocumentTab {
         self.selected_annotation = None;
         self.annotation_drag = None;
         self.annotation_drag_preview = None;
+        self.annotation_style_popup = None;
         self.last_scroll_offset = egui::Vec2::ZERO;
         self.last_scroll_viewport = None;
         self.pending_scroll_offset = None;
@@ -1083,6 +1103,96 @@ impl DocumentTab {
         }
     }
 
+    /// Ouvre `self.annotation_style_popup` pour l'annotation `annot_index`
+    /// (bouton "🎨 Style…", #32, Sprint 55) — préremplie avec sa couleur
+    /// actuelle (`AnnotationInfo::color`, blanc par défaut si absente) et
+    /// une opacité de 1.0 (voir la doc de `AnnotationStylePopup` sur
+    /// pourquoi l'opacité n'est pas préremplie depuis le fichier).
+    fn open_annotation_style_popup(&mut self, annot_index: usize) {
+        let color = self
+            .annotations
+            .iter()
+            .find(|a| a.index == annot_index)
+            .and_then(|a| a.color)
+            .map(|(r, g, b)| [r, g, b])
+            .unwrap_or([1.0, 1.0, 1.0]);
+        self.annotation_style_popup = Some(AnnotationStylePopup {
+            annot_index,
+            color,
+            opacity: 1.0,
+        });
+    }
+
+    /// Affiche la fenêtre ouverte par `open_annotation_style_popup`, le cas
+    /// échéant — un sélecteur de couleur (`egui::color_picker`) et un
+    /// curseur d'opacité, appliqués immédiatement à chaque changement (pas
+    /// de bouton "Appliquer" séparé, cohérent avec le reste de #32 qui
+    /// évite les allers-retours).
+    fn show_annotation_style_popup(&mut self, ctx: &egui::Context) {
+        let Some(popup) = &mut self.annotation_style_popup else {
+            return;
+        };
+        let mut close = false;
+        let mut apply = false;
+        let (annot_index, mut color, mut opacity) = (popup.annot_index, popup.color, popup.opacity);
+        egui::Window::new("Style de l'annotation")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Couleur :");
+                    if egui::color_picker::color_edit_button_rgb(ui, &mut color).changed() {
+                        apply = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Opacité :");
+                    if ui
+                        .add(egui::Slider::new(&mut opacity, 0.05..=1.0))
+                        .changed()
+                    {
+                        apply = true;
+                    }
+                });
+                ui.separator();
+                if ui.button("Fermer").clicked() {
+                    close = true;
+                }
+            });
+
+        if let Some(popup) = &mut self.annotation_style_popup {
+            popup.color = color;
+            popup.opacity = opacity;
+        }
+        if apply {
+            let Some(session) = &mut self.session else {
+                return;
+            };
+            let rgb = (color[0], color[1], color[2]);
+            if let Err(e) =
+                session.set_annotation_style_on_current_page(annot_index, rgb, opacity as f64)
+            {
+                self.error = Some(format!("Impossible de changer le style : {e}"));
+            } else {
+                // `invalidate_after_edit` efface `annotation_style_popup` et
+                // `selected_annotation` (comme après n'importe quelle
+                // édition) — on les rouvre/reséectionne immédiatement pour
+                // que l'utilisateur puisse continuer à ajuster sans
+                // recliquer l'annotation.
+                self.invalidate_after_edit();
+                self.selected_annotation = Some(annot_index);
+                self.annotation_style_popup = Some(AnnotationStylePopup {
+                    annot_index,
+                    color,
+                    opacity,
+                });
+            }
+        }
+        if close {
+            self.annotation_style_popup = None;
+        }
+    }
+
     /// Insère une page blanche à `at_index` (bouton "＋ Page", panneau
     /// miniatures, Sprint 19).
     fn insert_blank_page(&mut self, at_index: usize) {
@@ -1233,6 +1343,7 @@ impl DocumentTab {
         self.radio_groups_state = None;
         self.choice_fields_state = None;
         self.choice_field_popup = None;
+        self.annotation_style_popup = None;
         self.refresh_render_worker_document();
     }
 
@@ -2262,6 +2373,26 @@ impl DocumentTab {
                             {
                                 self.delete_selected_annotation();
                             }
+                            // #32 (Sprint 55) : le réglage couleur/opacité
+                            // ne s'applique qu'aux annotations dont
+                            // `set_annotation_style` sait régénérer
+                            // l'apparence (voir sa doc) — pas `/FreeText`,
+                            // dont l'apparence encode le texte lui-même.
+                            if let Some(selected) = self.selected_annotation {
+                                let styleable = self
+                                    .annotations
+                                    .iter()
+                                    .find(|a| a.index == selected)
+                                    .is_some_and(|a| {
+                                        matches!(
+                                            a.subtype.as_str(),
+                                            "Highlight" | "Underline" | "StrikeOut"
+                                        )
+                                    });
+                                if styleable && ui.button("🎨 Style…").clicked() {
+                                    self.open_annotation_style_popup(selected);
+                                }
+                            }
                         });
 
                         if let Some(session) = &self.session {
@@ -2568,6 +2699,7 @@ impl DocumentTab {
 
         self.show_text_modal(ctx);
         self.show_choice_field_popup(ctx);
+        self.show_annotation_style_popup(ctx);
 
         outcome
     }

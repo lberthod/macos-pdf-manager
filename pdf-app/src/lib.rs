@@ -76,6 +76,11 @@ pub struct AnnotationInfo {
     /// `/Subtype` (`"Highlight"`, `"FreeText"`, `"Underline"`,
     /// `"StrikeOut"`...), chaîne vide si absent.
     pub subtype: String,
+    /// `/C` (couleur RGB, ISO 32000-1 §12.5.2), `None` si absent ou pas
+    /// exactement 3 composantes — sert à préremplir la fenêtre de style
+    /// (#32, Sprint 55) avec la couleur actuelle plutôt qu'une valeur par
+    /// défaut arbitraire.
+    pub color: Option<(f32, f32, f32)>,
 }
 
 /// Comme `Object::as_int`/`as_real` mais accepte indifféremment `Integer` et
@@ -465,6 +470,21 @@ impl Session {
         self.refresh_after_edit()
     }
 
+    /// Change la couleur/opacité de l'annotation d'indice `annot_index` de
+    /// la page courante (voir `pdf_edit::EditSession::set_annotation_style`,
+    /// #32 — non pris en charge pour `/FreeText`, voir sa doc) et rafraîchit
+    /// le rendu.
+    pub fn set_annotation_style_on_current_page(
+        &mut self,
+        annot_index: usize,
+        color: (f32, f32, f32),
+        opacity: f64,
+    ) -> Result<(), String> {
+        self.edit
+            .set_annotation_style(self.page_index, annot_index, color, opacity)?;
+        self.refresh_after_edit()
+    }
+
     /// Retire l'annotation d'indice `annot_index` de la page courante (voir
     /// `pdf_edit::EditSession::remove_annotation`) et rafraîchit le rendu.
     pub fn remove_annotation_on_current_page(&mut self, annot_index: usize) -> Result<(), String> {
@@ -519,10 +539,22 @@ impl Session {
                 .and_then(|o| o.as_name())
                 .unwrap_or("")
                 .to_string();
+            let color = dict
+                .get("C")
+                .and_then(|o| o.as_array())
+                .filter(|c| c.len() == 3)
+                .map(|c| {
+                    (
+                        obj_num(&c[0]) as f32,
+                        obj_num(&c[1]) as f32,
+                        obj_num(&c[2]) as f32,
+                    )
+                });
             out.push(AnnotationInfo {
                 index,
                 rect,
                 subtype,
+                color,
             });
         }
         Ok(out)
@@ -1460,6 +1492,50 @@ mod tests {
             .map(obj_num)
             .collect();
         assert_eq!(rect, vec![150.0, 620.0, 350.0, 650.0]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `set_annotation_style_on_current_page` (#32, Sprint 55) change la
+    /// couleur d'un surlignage — vérifié sur `/C` du dictionnaire persisté
+    /// (le rendu pixel par pixel est déjà couvert côté `pdf-edit`, ce test
+    /// couvre seulement le wrapper `pdf-app` et sa persistance).
+    #[test]
+    fn set_annotation_style_on_current_page_changes_color_and_persists() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+        let annots = session.annotations_on_current_page().unwrap();
+
+        session
+            .set_annotation_style_on_current_page(annots[0].index, (0.2, 0.4, 0.9), 0.6)
+            .unwrap();
+
+        session.save_edits_in_place().unwrap();
+        let reopened = pdf_core::Document::open(std::fs::read(&path).unwrap()).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annot_ref = page
+            .dict
+            .get("Annots")
+            .and_then(|o| reopened.get(o).ok())
+            .and_then(|a| a.as_array().map(|v| v.to_vec()))
+            .unwrap();
+        let annot = reopened.get(&annot_ref[0]).unwrap();
+        let color: Vec<f64> = annot
+            .as_dict()
+            .unwrap()
+            .get("C")
+            .and_then(|o| o.as_array())
+            .unwrap()
+            .iter()
+            .map(obj_num)
+            .collect();
+        assert_eq!(color, vec![0.2, 0.4, 0.9]);
 
         std::fs::remove_file(&path).ok();
     }

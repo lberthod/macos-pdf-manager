@@ -376,6 +376,23 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 55 — Couleur/opacité d'annotation (#32)
+
+**Objectif :** dernier manque de #32 (Must) — resté ◐ depuis le Sprint 51 (poignées de déplacement/redimensionnement fermées, pas la couleur/opacité). Ferme la ligne, sauf pour `/FreeText` (limite documentée, acceptée).
+
+- [x] **`pdf-edit::EditSession::set_annotation_style`** (nouveau) régénère entièrement l'apparence (`/AP /N`) d'une annotation selon son `/Subtype`, en conservant sa géométrie actuelle (`/Rect`, jamais touché) : `/Highlight` (rectangle rempli) réutilise le principe de `add_highlight_annotation` — `/ca` de remplissage sur un nouvel `ExtGState` — mais avec une opacité paramétrable plutôt que la constante `HIGHLIGHT_FILL_ALPHA` fixe. `/Underline`/`/StrikeOut` (ligne tracée) utilisent `/CA` — opacité de **trait**, pas de remplissage, ces deux types dessinant une ligne, jamais un aplat (jusqu'ici sans aucune notion d'opacité, contrairement au surlignage). Refuse explicitement `/FreeText` avec un message clair plutôt que de silencieusement écraser son texte (voir "Non fait" ci-dessous). Testé bout en bout **directement sur le rendu** (`fill_color`/`fill_alpha` pour `/Highlight`, `stroke_color`/`stroke_alpha` pour `/Underline`), pas seulement sur `/C`/`/AP` du dictionnaire — plus un test de rejet explicite pour `/FreeText`.
+- [x] **`pdf_app::Session::set_annotation_style_on_current_page`** — wrapper d'une ligne, même schéma que les autres méthodes d'édition. **`AnnotationInfo` étendu** d'un champ `color: Option<(f32, f32, f32)>` (lu depuis `/C`) pour que `pdf-ui` puisse préremplir la fenêtre de style avec la couleur actuelle plutôt qu'une valeur arbitraire.
+- [x] **`pdf-ui`** : bouton "🎨 Style…" à côté de "🗑 Supprimer l'annotation" (actif seulement quand l'annotation sélectionnée a un sous-type pris en charge) ouvre une fenêtre (`show_annotation_style_popup`) avec un sélecteur de couleur (`egui::color_picker::color_edit_button_rgb`) et un curseur d'opacité — chaque changement s'applique immédiatement (pas de bouton "Appliquer" séparé). La sélection est reséectionnée après chaque application (l'édition efface `selected_annotation` comme après n'importe quelle édition, voir `invalidate_after_edit`) pour permettre d'ajuster plusieurs fois sans recliquer l'annotation.
+
+**Non fait dans ce sprint** (la ligne #32 passe quand même à ☑, limite documentée) :
+- **`/FreeText`** : son apparence encode le texte affiché lui-même (pas seulement géométrie+couleur) — le régénérer sans le perdre demanderait de le relire depuis le flux `/AP` existant, un vrai sous-morceau de travail distinct, hors périmètre de cette passe.
+- **Opacité non lue depuis le fichier à l'ouverture de la fenêtre** : la fenêtre de style s'ouvre toujours à 1.0, pas à l'opacité réellement en vigueur (non exposée jusqu'ici côté `pdf-app`/`pdf-edit`, contrairement à la couleur) — un réglage explicite écrase donc toujours la valeur précédente, y compris `HIGHLIGHT_FILL_ALPHA`. Limite mineure : l'utilisateur voit immédiatement le résultat au premier ajustement du curseur.
+- **Vérification interactive** : même limite que les Sprints 51-54.
+
+**Critère de sortie :** `cargo test --workspace` vert (229 tests, +3 `pdf-edit` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint.** #32 passe de ◐ à ☑ dans `audit50quest.md` — couverture Must 81 % → 83 %. Plus aucune ligne du groupe E/F Must à l'état "moteur prêt, UI absente/partielle" (voir aussi #43, fermé au Sprint 54).
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

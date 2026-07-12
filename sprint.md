@@ -356,6 +356,26 @@ Le fossé répété aux Sprints 13-14/15-16/17+ ("l'API `pdf-edit` existe, mais 
 
 ---
 
+## Sprint 54 — Listes/menus déroulants AcroForm (#43, dernier sous-cas)
+
+**Objectif :** dernier sous-cas de #43 — les champs liste/menu déroulant (`/FT /Ch`), à sélection unique (`MultiSelect` non géré, sans objet pour une sélection par indice). Ferme entièrement la ligne #43 dans `audit50quest.md` (◐ → ☑).
+
+- [x] **Fixture `acroform_choice.pdf`** (nouveau, `reportlab.Canvas.acroForm.choice`, `fieldFlags="combo"`, 3 options) : révèle un détail non documentable sans fixture réel — `/Opt` est un tableau de paires `[texte affiché, code]`, mais `/V`/`/DV` valent le **premier** élément de la paire (`"Apple"`), pas le second (`"apple"`, l'export attendu au sens strict d'ISO 32000-1 §12.7.4.4 lu à la lettre). Comportement réel de reportlab, pas une supposition — `choice_fields`/`set_choice_field_value` s'alignent dessus plutôt que sur une lecture théorique de la norme, cohérent avec l'approche pragmatique déjà suivie pour le RC4/AES du Sprint 22.
+- [x] **`pdf_edit::EditSession::set_single_line_text_appearance`** (nouveau, privé) — extrait de `set_form_field_value` (qui ne change pas de comportement) la logique de génération d'apparence texte sur une ligne (police Helvetica non intégrée, taille dérivée de `/Rect`) : factorisation, pas nouvelle fonctionnalité, pour que `set_choice_field_value` la réutilise telle quelle plutôt que de la dupliquer.
+- [x] **`pdf-edit::EditSession::choice_fields`** (nouveau) liste les champs `/Ch` non-`MultiSelect` avec leurs options (`/Opt`, premier élément de chaque paire) et l'indice actuellement sélectionné (comparaison de `/V` aux options).
+- [x] **`pdf-edit::EditSession::set_choice_field_value`** (nouveau) régénère l'apparence pour afficher le libellé choisi (réutilise `set_single_line_text_appearance`) et fixe `/V` à ce même libellé — **contrairement aux cases à cocher/boutons radio**, un champ `/Ch` n'a pas déjà les deux apparences possibles dans `/AP /N` : il faut la synthétiser, comme pour un champ texte. Testé bout en bout : bascule vers une autre option, persistance après réouverture, et vérification qu'au moins un glyphe est rendu par caractère du libellé choisi.
+- [x] **`pdf_app::Session::choice_fields_on_current_page`/`set_choice_field_value_on_current_page`** — wrappers, même schéma que les autres sous-cas de #43.
+- [x] **`pdf-ui`** : contrairement aux cases à cocher/boutons radio (une zone cliquable par option), un champ `/Ch` n'a qu'**une seule** zone cliquable (le champ entier) — un clic ouvre une fenêtre de sélection (`egui::Window`, `show_choice_field_popup`) listant chaque option comme un bouton ; cliquer une option la sélectionne immédiatement et ferme la fenêtre (pas de bouton "Valider" séparé, cohérent avec le clic direct des cases/radio).
+
+**Non fait dans ce sprint** (limites documentées, la ligne #43 passe quand même à ☑ — voir `audit50quest.md`) :
+- **Champs `MultiSelect`** : non listés par `choice_fields` — une sélection unique par indice n'a pas de sens pour eux, un vrai sous-morceau de travail distinct (coordonner plusieurs sélections dans `/V`, un tableau plutôt qu'une chaîne).
+- **Combo éditable** (`Ff` bit `Edit`, l'utilisateur peut taper une valeur hors `/Opt`) : `set_choice_field_value` ne gère que la sélection dans `/Opt`, pas la saisie libre.
+- **Vérification interactive** : même limite que les Sprints 51-53.
+
+**Critère de sortie :** `cargo test --workspace` vert (225 tests, +2 `pdf-edit` +1 `pdf-app`), `cargo clippy --workspace --all-targets` sans avertissement, `cargo fmt --check` propre. **Statut réel : atteint.** #43 passe de ◐ à ☑ dans `audit50quest.md` — les 4 sous-types de champ AcroForm cités par la ligne (texte, cases, boutons radio, listes) ont désormais un chemin `pdf-edit` → `pdf-app` → `pdf-ui` complet et testé bout en bout.
+
+---
+
 ## Notes de suivi
 
 - Les sprints 1 à 12 (Phases 0-3) doivent produire un viewer complet avant tout travail d'édition — voir l'avertissement en tête de [architecture.md](./architecture.md#1-objectif-et-périmètre).

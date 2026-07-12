@@ -106,6 +106,18 @@ pub struct RadioGroupInfo {
     pub options: Vec<RadioOptionInfo>,
 }
 
+/// Champ liste/menu déroulant (`/FT /Ch`, pas `MultiSelect`) visible, tel
+/// que renvoyé par `EditSession::choice_fields` (#43 suite, dernier
+/// sous-cas) — voir sa doc pour la sémantique de `options`/`selected_index`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChoiceFieldInfo {
+    pub obj_ref: ObjRef,
+    pub name: String,
+    pub rect: [f64; 4],
+    pub options: Vec<String>,
+    pub selected_index: Option<usize>,
+}
+
 pub struct EditSession {
     doc: Document,
     /// Objets nouveaux ou mis à jour, pas encore écrits sur disque —
@@ -943,6 +955,30 @@ impl EditSession {
             .cloned()
             .ok_or_else(|| "form field object is not a dictionary".to_string())?;
 
+        self.set_single_line_text_appearance(&mut field_dict, value)?;
+        field_dict.insert("V", Object::String(value.as_bytes().to_vec()));
+
+        let after = Object::Dictionary(field_dict);
+        self.commit(EditOp {
+            modified: vec![(field_ref.num, before, after)],
+        });
+        Ok(())
+    }
+
+    /// Régénère `/AP /N` de `field_dict` pour afficher `text` sur une seule
+    /// ligne (police Helvetica non intégrée, taille dérivée de la hauteur de
+    /// `/Rect`) — factorise ce qui était dupliqué entre `set_form_field_value`
+    /// (champ texte `/Tx`) et `set_choice_field_value` (champ liste/menu
+    /// `/Ch`, #43 suite) : les deux affichent un texte simple, seule la
+    /// source de ce texte diffère (saisie libre vs option choisie dans
+    /// `/Opt`). Insère `/AP` dans `field_dict` mais ne fixe **pas** `/V` —
+    /// à l'appelant, la sémantique diffère entre les deux (chaîne littérale
+    /// pour `/Tx`, contrainte à une valeur de `/Opt` pour `/Ch`).
+    fn set_single_line_text_appearance(
+        &mut self,
+        field_dict: &mut Dictionary,
+        text: &str,
+    ) -> Result<(), String> {
         let rect = field_dict
             .get("Rect")
             .and_then(|o| o.as_array())
@@ -958,7 +994,7 @@ impl EditSession {
         let baseline_y = (height - font_size).max(1.0) / 2.0 + font_size * 0.2;
         let ap_content = format!(
             "/Tx BMC\nq\nBT\n/Helv {font_size:.2} Tf\n0 0 0 rg\n2 {baseline_y:.2} Td\n({}) Tj\nET\nQ\nEMC",
-            escape_pdf_literal(value)
+            escape_pdf_literal(text)
         );
         let mut font_res = Dictionary::new();
         font_res.insert("Helv", Object::Reference(font_ref));
@@ -984,10 +1020,140 @@ impl EditSession {
         });
         self.pending.insert(ap_num, ap_stream);
 
-        field_dict.insert("V", Object::String(value.as_bytes().to_vec()));
         let mut ap_ref_dict = Dictionary::new();
         ap_ref_dict.insert("N", Object::Reference(ObjRef::new(ap_num, 0)));
         field_dict.insert("AP", Object::Dictionary(ap_ref_dict));
+        Ok(())
+    }
+
+    /// Liste les champs liste/menu déroulant (`/FT /Ch`) de
+    /// `/AcroForm/Fields` — le dernier sous-cas de #43. Une option par
+    /// élément de `/Opt` : soit une chaîne directe, soit un tableau à 2
+    /// éléments (ISO 32000-1 §12.7.4.4) — dans les deux cas, seul le
+    /// **premier** élément est utilisé comme libellé affiché **et** comme
+    /// valeur écrite dans `/V` (`set_choice_field_value`), ce qui correspond
+    /// à ce que produit reportlab en pratique (`/V` égal au premier élément
+    /// de la paire `/Opt`, pas au second) — voir le fixture
+    /// `acroform_choice.pdf`. **Exclut les champs `MultiSelect`** (`Ff` bit
+    /// 22) : une sélection unique par indice n'a pas de sens pour eux.
+    pub fn choice_fields(&self) -> Result<Vec<ChoiceFieldInfo>, String> {
+        let root = self.doc.root().map_err(|e| e.to_string())?;
+        let Some(acroform_obj) = root.get("AcroForm") else {
+            return Ok(Vec::new());
+        };
+        let acroform = self.doc.get(acroform_obj).map_err(|e| e.to_string())?;
+        let Some(acroform_dict) = acroform.as_dict() else {
+            return Ok(Vec::new());
+        };
+        let Some(fields_obj) = acroform_dict.get("Fields") else {
+            return Ok(Vec::new());
+        };
+        let fields = self.doc.get(fields_obj).map_err(|e| e.to_string())?;
+        let Some(field_refs) = fields.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        const MULTISELECT_FLAG: i64 = 1 << 21; // Bit 22, ISO 32000-1 tableau 228.
+        let mut out = Vec::new();
+        for field_obj in field_refs {
+            let Object::Reference(r) = field_obj else {
+                continue;
+            };
+            let resolved = self.current(r.num)?;
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get("FT").and_then(|o| o.as_name()) != Some("Ch") {
+                continue;
+            }
+            if dict.get("Ff").and_then(|o| o.as_int()).unwrap_or(0) & MULTISELECT_FLAG != 0 {
+                continue;
+            }
+            let Some(name) = dict.get("T").and_then(|o| o.as_text_string()) else {
+                continue;
+            };
+            let Some(rect_arr) = dict
+                .get("Rect")
+                .and_then(|o| o.as_array())
+                .filter(|r| r.len() >= 4)
+            else {
+                continue;
+            };
+            let rect = [
+                num(&rect_arr[0]),
+                num(&rect_arr[1]),
+                num(&rect_arr[2]),
+                num(&rect_arr[3]),
+            ];
+            let Some(opt) = dict.get("Opt").and_then(|o| o.as_array()) else {
+                continue;
+            };
+            let options: Vec<String> = opt
+                .iter()
+                .filter_map(|entry| match entry {
+                    Object::String(_) => entry.as_text_string().map(|s| s.to_string()),
+                    Object::Array(pair) => pair
+                        .first()
+                        .and_then(|o| o.as_text_string())
+                        .map(|s| s.to_string()),
+                    _ => None,
+                })
+                .collect();
+            if options.is_empty() {
+                continue;
+            }
+            let selected_index = dict
+                .get("V")
+                .and_then(|o| o.as_text_string())
+                .and_then(|v| options.iter().position(|opt| opt.as_str() == v));
+            out.push(ChoiceFieldInfo {
+                obj_ref: *r,
+                name,
+                rect,
+                options,
+                selected_index,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Sélectionne l'option `option_index` du champ liste/menu déroulant
+    /// `field_name` (voir `choice_fields`) : régénère l'apparence pour
+    /// afficher son libellé et fixe `/V` à ce même libellé (voir la doc de
+    /// `choice_fields` sur pourquoi le libellé plutôt qu'une valeur d'export
+    /// séparée).
+    pub fn set_choice_field_value(
+        &mut self,
+        field_name: &str,
+        option_index: usize,
+    ) -> Result<(), String> {
+        let field_ref = self.find_form_field(field_name)?;
+        let before = self.current(field_ref.num)?;
+        let mut field_dict = before
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "form field object is not a dictionary".to_string())?;
+
+        let opt = field_dict
+            .get("Opt")
+            .and_then(|o| o.as_array())
+            .ok_or_else(|| format!("field '{field_name}' has no /Opt"))?;
+        let label = opt
+            .get(option_index)
+            .and_then(|entry| match entry {
+                Object::String(_) => entry.as_text_string().map(|s| s.to_string()),
+                Object::Array(pair) => pair
+                    .first()
+                    .and_then(|o| o.as_text_string())
+                    .map(|s| s.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!("option index {option_index} out of bounds for '{field_name}'")
+            })?;
+
+        self.set_single_line_text_appearance(&mut field_dict, &label)?;
+        field_dict.insert("V", Object::String(label.into_bytes()));
 
         let after = Object::Dictionary(field_dict);
         self.commit(EditOp {
@@ -2751,6 +2917,74 @@ mod tests {
         assert_eq!(
             selected_count, 1,
             "exactly one radio widget should remain checked"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// `choice_fields` retrouve le champ liste/menu du fixture (3 options,
+    /// "Apple" déjà sélectionnée à la génération, `/Opt` en paires
+    /// `[libellé, code]` dont seul le premier élément est utilisé — voir la
+    /// doc de `choice_fields`).
+    #[test]
+    fn choice_fields_lists_the_field_with_initial_selection() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_choice.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let session = EditSession::open(&path).unwrap();
+
+        let fields = session.choice_fields().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "fruit_choice");
+        assert_eq!(fields[0].options, vec!["Apple", "Banana", "Cherry"]);
+        assert_eq!(fields[0].selected_index, Some(0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `set_choice_field_value` change la sélection et régénère l'apparence
+    /// (au moins un glyphe rendu) ; `/V` et la sélection persistent après
+    /// réouverture.
+    #[test]
+    fn set_choice_field_value_switches_and_persists() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_choice.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_choice_field_value("fruit_choice", 2).unwrap();
+        assert_eq!(session.choice_fields().unwrap()[0].selected_index, Some(2));
+
+        let out_path = write_fixture(b"choice-switch-out");
+        session.save_as(&out_path).unwrap();
+
+        let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
+        let root = reopened.root().unwrap();
+        let acroform = reopened.get(root.get("AcroForm").unwrap()).unwrap();
+        let fields = reopened
+            .get(acroform.as_dict().unwrap().get("Fields").unwrap())
+            .unwrap();
+        let field_ref = fields.as_array().unwrap()[0].as_reference().unwrap();
+        let field = reopened.resolve(field_ref).unwrap();
+        assert_eq!(
+            field
+                .as_dict()
+                .unwrap()
+                .get("V")
+                .and_then(|o| o.as_text_string()),
+            Some("Cherry".to_string())
+        );
+
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+        let display = Interpreter::run_page_with_annotations(&reopened, &page, &content).unwrap();
+        let glyph_count = display
+            .items
+            .iter()
+            .filter(|i| matches!(i, pdf_core::display::DisplayItem::Glyph { .. }))
+            .count();
+        assert!(
+            glyph_count >= "Cherry".len(),
+            "expected at least one glyph per character of the selected option, got {glyph_count}"
         );
 
         std::fs::remove_file(&path).ok();

@@ -349,6 +349,18 @@ struct DocumentTab {
     radio_groups: Vec<pdf_edit::RadioGroupInfo>,
     /// (page affichée) pour laquelle `radio_groups` est à jour.
     radio_groups_state: Option<usize>,
+    /// Champs liste/menu déroulant de la page courante (Sprint 54, #43
+    /// suite, dernier sous-cas) — contrairement à une case à cocher/un
+    /// bouton radio, une seule zone cliquable par champ (pas une par
+    /// option) : un clic ouvre `choice_field_popup` plutôt que de basculer
+    /// directement un état.
+    choice_fields: Vec<pdf_edit::ChoiceFieldInfo>,
+    /// (page affichée) pour laquelle `choice_fields` est à jour.
+    choice_fields_state: Option<usize>,
+    /// Nom du champ liste/menu déroulant dont la fenêtre de sélection
+    /// d'option est actuellement ouverte (`None` si aucune) — voir
+    /// `handle_choice_field_click`/`show_choice_field_popup`.
+    choice_field_popup: Option<String>,
     /// Dernier décalage de défilement connu de la `ScrollArea` de la page
     /// unique (Sprint 21, #9 — pincement centré sur le curseur) — mis à jour
     /// à chaque frame depuis `ScrollAreaOutput::state.offset`, réutilisé au
@@ -437,6 +449,9 @@ impl DocumentTab {
             checkbox_fields_state: None,
             radio_groups: Vec::new(),
             radio_groups_state: None,
+            choice_fields: Vec::new(),
+            choice_fields_state: None,
+            choice_field_popup: None,
             last_scroll_offset: egui::Vec2::ZERO,
             last_scroll_viewport: None,
             pending_scroll_offset: None,
@@ -956,6 +971,103 @@ impl DocumentTab {
         true
     }
 
+    /// Recalcule `self.choice_fields` si la page affichée a changé depuis le
+    /// dernier appel — même schéma que `ensure_radio_groups` (Sprint 54).
+    fn ensure_choice_fields(&mut self) {
+        let Some(session) = &self.session else {
+            self.choice_fields.clear();
+            return;
+        };
+        let page_index = session.page_index();
+        if self.choice_fields_state == Some(page_index) {
+            return;
+        }
+        self.choice_fields = session.choice_fields_on_current_page().unwrap_or_default();
+        self.choice_fields_state = Some(page_index);
+    }
+
+    /// Ouvre `self.choice_field_popup` pour le champ de `self.choice_fields`
+    /// dont le rect contient le prochain simple clic sur la page (Sprint 54,
+    /// #43 suite) — contrairement à une case à cocher/un bouton radio,
+    /// une seule zone cliquable par champ propose une liste d'options
+    /// plutôt que de basculer directement un état (voir
+    /// `show_choice_field_popup`).
+    fn handle_choice_field_click(
+        &mut self,
+        response: &egui::Response,
+        media_box: [f64; 4],
+        scale: f64,
+    ) -> bool {
+        if !response.clicked() {
+            return false;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return false;
+        };
+        let (px, py) = screen_to_page(pos, response.rect, media_box, scale);
+        let Some(field) = self
+            .choice_fields
+            .iter()
+            .find(|f| px >= f.rect[0] && px <= f.rect[2] && py >= f.rect[1] && py <= f.rect[3])
+        else {
+            return false;
+        };
+        self.choice_field_popup = Some(field.name.clone());
+        true
+    }
+
+    /// Affiche la fenêtre de sélection d'option ouverte par
+    /// `handle_choice_field_click` (Sprint 54, #43 suite), le cas échéant —
+    /// une option par bouton, cliquer une la sélectionne immédiatement et
+    /// ferme la fenêtre (pas de bouton "Valider" séparé).
+    fn show_choice_field_popup(&mut self, ctx: &egui::Context) {
+        let Some(field_name) = self.choice_field_popup.clone() else {
+            return;
+        };
+        let Some(field) = self
+            .choice_fields
+            .iter()
+            .find(|f| f.name == field_name)
+            .cloned()
+        else {
+            self.choice_field_popup = None;
+            return;
+        };
+
+        let mut close = false;
+        let mut chosen: Option<usize> = None;
+        egui::Window::new(format!("Choisir : {field_name}"))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                for (index, option) in field.options.iter().enumerate() {
+                    let selected = field.selected_index == Some(index);
+                    if ui.selectable_label(selected, option).clicked() {
+                        chosen = Some(index);
+                    }
+                }
+                ui.separator();
+                if ui.button("Annuler").clicked() {
+                    close = true;
+                }
+            });
+
+        if let Some(option_index) = chosen {
+            if let Some(session) = &mut self.session {
+                match session.set_choice_field_value_on_current_page(&field_name, option_index) {
+                    Ok(()) => self.invalidate_after_edit(),
+                    Err(e) => {
+                        self.error = Some(format!("Impossible de sélectionner l'option : {e}"))
+                    }
+                }
+            }
+            close = true;
+        }
+        if close {
+            self.choice_field_popup = None;
+        }
+    }
+
     /// Supprime l'annotation actuellement sélectionnée (`self.selected_annotation`,
     /// bouton "🗑 Supprimer l'annotation", #32).
     fn delete_selected_annotation(&mut self) {
@@ -1119,6 +1231,8 @@ impl DocumentTab {
         self.form_fields_state = None;
         self.checkbox_fields_state = None;
         self.radio_groups_state = None;
+        self.choice_fields_state = None;
+        self.choice_field_popup = None;
         self.refresh_render_worker_document();
     }
 
@@ -2315,6 +2429,7 @@ impl DocumentTab {
             self.ensure_form_fields();
             self.ensure_checkbox_fields();
             self.ensure_radio_groups();
+            self.ensure_choice_fields();
 
             // Clonée (bon marché : `TextureHandle` est un handle partagé)
             // pour ne pas garder de prêt sur `self.texture` pendant qu'on
@@ -2397,18 +2512,30 @@ impl DocumentTab {
                             );
                         }
 
+                        if !self.choice_fields.is_empty() {
+                            draw_choice_field_outlines(
+                                ui,
+                                &response,
+                                &self.choice_fields,
+                                media_box,
+                                scale,
+                            );
+                        }
+
                         // Le mode "📝 Ajouter texte" (#30) intercepte le
                         // simple clic à la place de la sélection/l'annotation
                         // (voir la doc de `handle_add_text_click`) — les deux
                         // usages ne doivent jamais se marcher dessus sur le
                         // même clic. Un clic tombant dans un champ de
                         // formulaire (#Sprint 23), une case à cocher (Sprint
-                        // 52) ou un bouton radio (Sprint 53) a priorité sur la
+                        // 52), un bouton radio (Sprint 53) ou un champ
+                        // liste/menu déroulant (Sprint 54) a priorité sur la
                         // sélection/l'annotation, pour la même raison.
                         if self.add_text_mode {
                             self.handle_add_text_click(&response, media_box, scale);
                         } else if !self.handle_checkbox_field_click(&response, media_box, scale)
                             && !self.handle_radio_group_click(&response, media_box, scale)
+                            && !self.handle_choice_field_click(&response, media_box, scale)
                             && !self.handle_form_field_click(&response, media_box, scale)
                         {
                             // Un glissement sur la sélection courante (#32,
@@ -2440,6 +2567,7 @@ impl DocumentTab {
         });
 
         self.show_text_modal(ctx);
+        self.show_choice_field_popup(ctx);
 
         outcome
     }
@@ -2739,6 +2867,29 @@ fn draw_radio_group_outlines(
                 egui::Stroke::new(1.0, CHECKBOX_FIELD_OUTLINE_COLOR),
             );
         }
+    }
+}
+
+/// Dessine un contour par champ liste/menu déroulant de `fields` (Sprint 54,
+/// #43 suite) — comme `draw_form_field_outlines`, une seule zone cliquable
+/// par champ (pas une par option, contrairement à `draw_radio_group_outlines`)
+/// puisqu'un clic ouvre une fenêtre de sélection plutôt que de basculer
+/// directement un état.
+fn draw_choice_field_outlines(
+    ui: &egui::Ui,
+    image_response: &egui::Response,
+    fields: &[pdf_edit::ChoiceFieldInfo],
+    media_box: [f64; 4],
+    scale: f64,
+) {
+    let painter = ui.painter();
+    for field in fields {
+        let screen_rect = page_rect_to_screen(field.rect, image_response.rect, media_box, scale);
+        painter.rect_stroke(
+            screen_rect,
+            0.0,
+            egui::Stroke::new(1.0, FORM_FIELD_OUTLINE_COLOR),
+        );
     }
 }
 

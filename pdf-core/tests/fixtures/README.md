@@ -17,6 +17,7 @@
 - `type0_cid_truetype.pdf` — texte "AB" en police composite **`/Type0`/`CIDFontType2`** (`/Encoding /Identity-H`, `/CIDToGIDMap /Identity`) : sous-ensemble TrueType Monaco réel (2 glyphes) extrait via `fonttools subset --text="AB"`, dont les GID (renumérotés par le sous-ensembleur) servent directement de codes 2 octets dans le flux de contenu (`<0001 0002>` — cas réel le plus courant, où le CID est le GID directement plutôt que passer par un `/CIDToGIDMap` explicite). Construit **à la main avec pikepdf** (comme `embedded_cff_font.pdf`), avec un `/ToUnicode` (`beginbfchar` GID -> `A`/`B`) et un `/W` donnant une largeur distincte à chaque GID (`/DW` sert de repli). Premier fixture réel `/Type0` du corpus (les autres tests composites de `pdf-core::font`/`interp` restent synthétiques) — sert de non-régression bout en bout pour `font.rs::cid_glyph_outline`/`cid_metrics` et `interp::show_text` sur un vrai PDF produit par un outil tiers.
 - `acroform_checkbox.pdf` — page avec une case à cocher AcroForm simple (`reportlab.Canvas.acroForm.checkbox`, `/FT /Btn`, `Ff 2` — pas de bit `Pushbutton`/`Radio`, un seul widget qui est aussi le champ). `/AP /N` est un dictionnaire d'états (`/Off`, `/Yes`) plutôt qu'un flux unique, `/AS /Off` initialement. Sert de fixture de bout en bout pour `pdf-edit::EditSession::checkbox_fields`/`set_checkbox_field_value` (Sprint 52, #43 suite) : coche/décoche en ne touchant que `/AS`+`/V`, sans régénérer `/AP` (contrairement au champ texte, dont l'apparence est synthétisée depuis zéro).
 - `acroform_radio.pdf` — page avec un groupe de 2 boutons radio AcroForm (`reportlab.Canvas.acroForm.radio`, deux appels avec le même `name`, options `"red"` sélectionnée initialement et `"blue"`). Le champ parent (`/FT /Btn`, `Ff` avec le bit `Radio` posé) n'a pas de `/Rect` propre, seuls ses deux `/Kids` (les widgets) en ont un — chacun avec son propre `/AP /N` (`/Off` + son propre nom d'état, `"red"`/`"blue"`) et son propre `/AS`. Sert de fixture de bout en bout pour `pdf-edit::EditSession::radio_groups`/`set_radio_group_value` (Sprint 53, #43 suite) : bascule `/AS` de chaque widget-enfant (un seul reste coché) et `/V` du champ parent, sans régénérer aucune apparence.
+- `acroform_choice.pdf` — page avec un champ liste/menu déroulant AcroForm (`reportlab.Canvas.acroForm.choice`, `/FT /Ch`, `fieldFlags="combo"`, 3 options `[(display, code), ...]`). `/Opt` est un tableau de paires `[texte affiché, code]` mais `/V`/`/DV` valent le **premier** élément de la paire (`"Apple"`, pas `"apple"`) — comportement réel de reportlab, pas forcément la lecture qu'on ferait de l'ordre `/Opt` d'ISO 32000-1 §12.7.4.4 à la lettre. Sert de fixture de bout en bout pour `pdf-edit::EditSession::choice_fields`/`set_choice_field_value` (Sprint 54, #43 suite, dernier sous-cas) : contrairement aux cases à cocher/boutons radio, ce type de champ **régénère** son apparence (texte simple, comme un champ `/Tx`) plutôt que de basculer un `/AS` déjà présent dans `/AP /N`.
 
 Régénération (nécessite un venv avec `pikepdf` + `reportlab`) :
 
@@ -252,6 +253,23 @@ c14.showPage()
 c14.save()
 with Pdf.open(io.BytesIO(buf14.getvalue())) as pdf:
     pdf.save("acroform_radio.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
+
+# acroform_choice.pdf
+buf15 = io.BytesIO()
+c15 = canvas.Canvas(buf15, pagesize=letter)
+c15.drawString(72, 750, "Simple AcroForm choice field test")
+c15.acroForm.choice(
+    name="fruit_choice",
+    value="apple",
+    options=[("apple", "Apple"), ("banana", "Banana"), ("cherry", "Cherry")],
+    x=72, y=650, width=150, height=20,
+    fieldFlags="combo",
+    borderStyle="inset",
+)
+c15.showPage()
+c15.save()
+with Pdf.open(io.BytesIO(buf15.getvalue())) as pdf:
+    pdf.save("acroform_choice.pdf", object_stream_mode=ObjectStreamMode.disable, qdf=True, static_id=True)
 ```
 
 - `bold_italic_standard_fonts.pdf` — cinq lignes en polices standard non embarquées **hors Helvetica plain** (`Times-Bold`, `Times-Italic`, `Courier-BoldOblique`, `Helvetica-BoldOblique`, `Symbol`) : exerce la sélection de face gras/italique de la substitution système (`.ttc` avec choix de face) au-delà du seul fixture Helvetica déjà couvert.

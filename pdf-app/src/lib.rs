@@ -667,6 +667,47 @@ impl Session {
         self.refresh_after_edit()
     }
 
+    /// Liste les champs liste/menu déroulant de la page courante (voir
+    /// `pdf_edit::EditSession::choice_fields`, #43 suite, dernier sous-cas)
+    /// — même filtrage par `/Annots` que `form_fields_on_current_page`.
+    pub fn choice_fields_on_current_page(&self) -> Result<Vec<pdf_edit::ChoiceFieldInfo>, String> {
+        let page = self.doc.page(self.page_index).map_err(|e| e.to_string())?;
+        let Some(annots_obj) = page.dict.get("Annots") else {
+            return Ok(Vec::new());
+        };
+        let annots = self.doc.get(annots_obj).map_err(|e| e.to_string())?;
+        let Some(refs) = annots.as_array() else {
+            return Ok(Vec::new());
+        };
+        let page_nums: std::collections::HashSet<u32> = refs
+            .iter()
+            .filter_map(|o| match o {
+                Object::Reference(r) => Some(r.num),
+                _ => None,
+            })
+            .collect();
+
+        Ok(self
+            .edit
+            .choice_fields()?
+            .into_iter()
+            .filter(|f| page_nums.contains(&f.obj_ref.num))
+            .collect())
+    }
+
+    /// Sélectionne l'option `option_index` du champ liste/menu déroulant
+    /// `field_name` de la page courante (voir
+    /// `pdf_edit::EditSession::set_choice_field_value`) et rafraîchit
+    /// immédiatement le rendu.
+    pub fn set_choice_field_value_on_current_page(
+        &mut self,
+        field_name: &str,
+        option_index: usize,
+    ) -> Result<(), String> {
+        self.edit.set_choice_field_value(field_name, option_index)?;
+        self.refresh_after_edit()
+    }
+
     /// Insère une page blanche à `at_index` (Sprint 19, câblage `pdf-ui` de
     /// `pdf_edit::EditSession::insert_blank_page`) — reprend le `MediaBox` de
     /// la page courante si le document en a au moins une, sinon une page
@@ -1499,6 +1540,29 @@ mod tests {
         let groups = session.radio_groups_on_current_page().unwrap();
         assert!(!groups[0].options[0].selected);
         assert!(groups[0].options[1].selected);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `choice_fields_on_current_page`/`set_choice_field_value_on_current_page`
+    /// (#43 suite, Sprint 54, dernier sous-cas) — même schéma que le groupe
+    /// radio ci-dessus, mais pour un champ liste/menu déroulant `/Ch`.
+    #[test]
+    fn choice_fields_on_current_page_lists_and_switches_selection() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_choice.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        let fields = session.choice_fields_on_current_page().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "fruit_choice");
+        assert_eq!(fields[0].selected_index, Some(0));
+
+        session
+            .set_choice_field_value_on_current_page("fruit_choice", 1)
+            .unwrap();
+        let fields = session.choice_fields_on_current_page().unwrap();
+        assert_eq!(fields[0].selected_index, Some(1));
 
         std::fs::remove_file(&path).ok();
     }

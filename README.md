@@ -30,11 +30,12 @@ Le `.dmg` et l'app qu'il contient sont **signés (Developer ID Application) et n
 - **Manipuler les pages** : réordonner par glisser-déposer, supprimer, pivoter, insérer (page vierge, image JPEG, autre PDF), fusionner un document, extraire une sélection de pages vers un nouveau fichier.
 - **Imprimer** : délégation à Aperçu (dialogue système, aperçu, sélection de pages).
 - **Onglets multi-documents** : plusieurs PDF ouverts dans une seule fenêtre.
-- **Ouvrir des PDF chiffrés** (mot de passe utilisateur vide) : RC4, AES-128 et AES-256 gérés.
+- **Ouvrir des PDF chiffrés** (mot de passe utilisateur vide ou réel, avec fenêtre de saisie) : RC4, AES-128 et AES-256 gérés.
+- **Vérifier une signature numérique** (`/Sig`, PKCS#7/CMS détaché) : intégrité cryptographique du contenu signé, détection d'une modification après signature — pas de chaîne de confiance/révocation.
 
 > ⚠️ L'édition chirurgicale du texte existant (modifier un glyphe déjà présent dans le flux de contenu, plutôt que le masquer et le redessiner par superposition) reste hors périmètre : un PDF est une description de rendu (glyphes positionnés), pas un format éditable — voir [architecture.md](./architecture.md#73-édition-du-texte-existant--le-vrai-défi) pour le détail de cette limite et l'approche par phases retenue.
 
-Ce qui ne fonctionne pas encore : Quick Look, formes/notes/signatures, Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, accessibilité VoiceOver du contenu de page. Voir [architecture.md](./architecture.md) pour la cible et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour le détail du fonctionnement interne.
+Ce qui ne fonctionne pas encore : Quick Look, formes/notes, production de signature (la vérification, elle, est faite — voir ci-dessus), Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, accessibilité VoiceOver du contenu de page. Voir [architecture.md](./architecture.md) pour la cible et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour le détail du fonctionnement interne.
 
 ## Structure du projet
 
@@ -117,7 +118,7 @@ cargo run -p pdf-ui -- chemin/vers/fichier.pdf
 cargo run --bin pdf-cli -- dump chemin/vers/fichier.pdf
 ```
 
-Fixtures de test dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)) : 25 PDF réels et structurellement variés (rotation, chiffrement RC4/AES-256, CJK avec polices composites, formulaires, corruptions diverses, JPEG RGB/CMYK, PDF/A-like...).
+Fixtures de test dans [pdf-core/tests/fixtures/](./pdf-core/tests/fixtures/) (voir leur [README](./pdf-core/tests/fixtures/README.md)) : 30 PDF réels et structurellement variés (rotation, chiffrement RC4/AES-256/mot de passe réel, signature numérique, CJK avec polices composites, formulaires, corruptions diverses, JPEG RGB/CMYK, PDF/A-like...).
 
 Deux suites comparent le rendu à une image de référence sous seuil de tolérance :
 
@@ -132,5 +133,5 @@ cargo test -p pdf-render-gpu --test cross_backend  # CPU vs GPU
 - Codecs génériques implémentés : `flate2` (Flate), `zune-jpeg` (DCTDecode/JPEG, RGB et CMYK), plus un décodeur LZW et des prédicteurs PNG/TIFF écrits maison. Contours de glyphes via `ttf-parser` (TrueType et CFF/Type1C, polices simples et composites `/Type0`/CID). Rendu CPU via `tiny-skia`, rendu GPU via `wgpu`+`lyon` en parité fonctionnelle.
 - Déchiffrement `/Encrypt` via des primitives cryptographiques auditées (`md-5`, `sha2`, `aes`, `cbc`) plutôt que réimplémentées à la main, sauf RC4 (algorithme trivial, chiffrement obsolète, validé contre le vecteur de test RFC officiel).
 - Codecs pas encore implémentés : CCITT, JBIG2, JPX. Police pas encore supportée : Type1 historique (`/FontFile`, pré-CFF).
-- UI : `egui`/`eframe` avec chrome natif macOS (`objc2`/`objc2-app-kit` : `NSMenu`, `NSApplication.appearance`), thread de rendu en arrière-plan dédié pour les miniatures/le défilement continu.
+- UI : `egui`/`eframe`, avec chrome natif macOS (`objc2`/`objc2-app-kit` : `NSMenu`, `NSApplication.appearance`) isolé derrière `#[cfg(target_os = "macos")]` — `pdf-ui` compile aussi sur les autres plateformes (menu natif et packaging `.app`/`.dmg` alors indisponibles). Thread de rendu en arrière-plan dédié pour les miniatures/le défilement continu.
 - Packaging : `cargo-bundle` + `hdiutil`, signé (Developer ID Application, hardened runtime) et notarisé par Apple — voir [Distribution & notarisation](#distribution--notarisation).

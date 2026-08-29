@@ -1,3 +1,7 @@
+// Pas de console Windows derrière la fenêtre en release (garde la console
+// en debug pour les logs `eprintln!`).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Viewer PDF (egui) — architecture.md §8.1 : "commencer le prototype en
 //! egui pour valider les flux, migrer le chrome vers natif ensuite". Ce
 //! binaire parle à `pdf-app::Session` pour l'état de session (document
@@ -49,10 +53,12 @@
 //! hauteur de ligne du défilement continu dérivée de la page 0 uniquement
 //! (documents à pages de tailles hétérogènes mal gérés).
 
+#[cfg(target_os = "macos")]
 mod native_menu;
 mod render_worker;
 
 use eframe::egui;
+#[cfg(target_os = "macos")]
 use native_menu::{MenuCommand, NativeMenu};
 use pdf_app::Session;
 use render_worker::{RenderKind, RenderWorker};
@@ -99,6 +105,166 @@ const FORM_FIELD_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 140,
 /// teinte que `FORM_FIELD_OUTLINE_COLOR` (même famille "champ de
 /// formulaire"), un remplissage translucide indique en plus l'état coché.
 const CHECKBOX_FIELD_OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 140, 200);
+
+/// Palette de couleurs de l'application (mode sombre) — voir `apply_theme`.
+/// Choisie pour un contraste net texte/fond (le thème `egui::Visuals::dark()`
+/// par défaut utilisait des gris moyens qui rendaient plusieurs commandes
+/// difficiles à distinguer d'un état désactivé).
+mod theme {
+    use egui::Color32;
+
+    pub const BACKGROUND: Color32 = Color32::from_rgb(0x11, 0x13, 0x18);
+    pub const PANEL: Color32 = Color32::from_rgb(0x1A, 0x1D, 0x24);
+    pub const SURFACE: Color32 = Color32::from_rgb(0x21, 0x25, 0x2D);
+    pub const HOVERED: Color32 = Color32::from_rgb(0x27, 0x2B, 0x35);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xF4, 0xF5, 0xF7);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x9C, 0xA3, 0xAF);
+    pub const ACCENT: Color32 = Color32::from_rgb(0x4F, 0x8C, 0xFF);
+    // Pas de `SUCCESS` pour l'instant : rien n'affiche encore de
+    // confirmation de sauvegarde/succès dans cette passe — à ajouter avec
+    // ce ton (#3CCB8E) le jour où une telle confirmation existe, plutôt que
+    // de garder une constante inutilisée.
+    pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x5C, 0x65);
+    pub const BORDER: Color32 = Color32::from_rgb(0x30, 0x35, 0x41);
+}
+
+/// Applique la palette `theme` et des réglages d'espacement/de taille de
+/// contrôle cohérents (boutons d'au moins 32px de haut, coins arrondis,
+/// espacements par pas de 8/12/16px) — appelé une fois au démarrage et à
+/// chaque bascule clair/sombre (`native_menu::toggle_dark_mode`). Le mode
+/// clair reste le thème `egui::Visuals::light()` par défaut (aucune palette
+/// dédiée demandée pour l'instant) mais reçoit les mêmes réglages de taille.
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    let mut visuals = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+
+    if dark {
+        visuals.override_text_color = None;
+        visuals.window_fill = theme::PANEL;
+        visuals.panel_fill = theme::PANEL;
+        visuals.extreme_bg_color = theme::BACKGROUND;
+        visuals.faint_bg_color = theme::SURFACE;
+        visuals.code_bg_color = theme::SURFACE;
+        visuals.hyperlink_color = theme::ACCENT;
+        visuals.error_fg_color = theme::DANGER;
+        visuals.warn_fg_color = egui::Color32::from_rgb(0xE0, 0xA8, 0x3C);
+        visuals.selection.bg_fill = theme::ACCENT;
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+
+        // Boutons/commandes au repos : un fond nettement plus clair que le
+        // panneau qui les porte, pour qu'ils se lisent comme des surfaces
+        // cliquables plutôt que du texte plat (plainte initiale : "Miniatures/
+        // Signets/Continu ressemblent à du texte, pas à des panneaux
+        // interactifs").
+        visuals.widgets.noninteractive.bg_fill = theme::PANEL;
+        visuals.widgets.noninteractive.fg_stroke =
+            egui::Stroke::new(1.0_f32, theme::TEXT_SECONDARY);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, theme::BORDER);
+
+        visuals.widgets.inactive.bg_fill = theme::SURFACE;
+        visuals.widgets.inactive.weak_bg_fill = theme::SURFACE;
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, theme::BORDER);
+
+        visuals.widgets.hovered.bg_fill = theme::HOVERED;
+        visuals.widgets.hovered.weak_bg_fill = theme::HOVERED;
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, theme::ACCENT);
+
+        visuals.widgets.active.bg_fill = theme::ACCENT;
+        visuals.widgets.active.weak_bg_fill = theme::ACCENT;
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, theme::ACCENT);
+
+        visuals.widgets.open.bg_fill = theme::HOVERED;
+        visuals.widgets.open.weak_bg_fill = theme::HOVERED;
+        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+        visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, theme::ACCENT);
+    }
+
+    let rounding = egui::Rounding::same(6.0);
+    for widgets in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widgets.rounding = rounding;
+    }
+    visuals.window_rounding = egui::Rounding::same(8.0);
+    visuals.menu_rounding = egui::Rounding::same(8.0);
+
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    // Contrôles d'au moins 32px de haut (la plainte "boutons minuscules,
+    // difficiles à identifier rapidement" venait pour partie de la hauteur
+    // par défaut d'`egui`, ~18-20px) et un espacement généreux par pas de
+    // 8/12/16px plutôt que les 3-4px par défaut.
+    style.spacing.interact_size.y = 32.0;
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.window_margin = egui::Margin::same(12.0);
+    ctx.set_style(style);
+}
+
+/// Sépare un groupe logique de contrôles de la barre d'outils (Ouvrir,
+/// navigation, zoom, sélection...) du précédent par un trait vertical.
+///
+/// Version précédente : ces groupes étaient enveloppés dans un `Frame`
+/// (fond `theme::SURFACE`, coins arrondis) niché dans un `ui.horizontal(...)`
+/// intermédiaire, à l'intérieur du conteneur `horizontal_wrapped` de la barre
+/// d'outils. Ça produisait une belle "carte" par groupe — mais ne passait
+/// **jamais** à la ligne (bug constaté à l'écran, pas seulement théorique) :
+/// `ui.horizontal(...)` calcule sa taille "désirée" comme l'espace *restant*
+/// sur la ligne courante (`available_size_before_wrap`), donc pour le calcul
+/// de retour à la ligne du parent, un tel groupe composite "tient" toujours
+/// exactement dans ce qu'il reste — par construction, jamais en trop — et ne
+/// déclenche donc jamais de retour à la ligne. Seuls les widgets "feuille"
+/// (`ui.button`, `ui.label`, `ui.separator`...), dont la taille réelle est
+/// connue **avant** d'être placés, participent correctement au calcul de
+/// `horizontal_wrapped`. D'où l'abandon du `Frame` composite : chaque bouton
+/// est ajouté directement sur la `Ui` en cours, seul un `ui.separator()` (lui
+/// aussi un widget feuille, donc fiable pour le retour à la ligne) marque la
+/// frontière entre deux groupes — un groupe individuel peut désormais se
+/// couper en plein milieu si la fenêtre est très étroite (compromis accepté :
+/// mieux vaut un groupe coupé qu'une barre qui déborde silencieusement hors
+/// de la fenêtre sans jamais revenir à la ligne).
+fn toolbar_group<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.separator();
+    add_contents(ui)
+}
+
+/// Remplace `ui.add_enabled_ui(enabled, ...)` **à l'intérieur d'un
+/// `horizontal_wrapped`** — `add_enabled_ui` est un `Ui::scope` déguisé, donc
+/// souffre exactement du même défaut que l'ancien `Frame` de `toolbar_group`
+/// (voir sa doc) : le second bug rapporté sur cette barre d'outils (le
+/// bouton "Rechercher" compressé en une colonne d'une lettre par ligne,
+/// reproduit par `real_toolbar_never_paints_outside_a_narrow_window`) venait
+/// de là, pas du premier correctif. Ici, `add_contents` s'exécute
+/// directement sur la `Ui` reçue — aucune sous-`Ui` n'est créée, donc chaque
+/// bouton/étiquette ajouté à l'intérieur reste un widget "feuille" ordinaire
+/// pour le calcul de retour à la ligne du parent. `ui.set_enabled`/`is_enabled`
+/// appliquent juste l'effet visuel (grisé, non cliquable) sans toucher à la
+/// disposition ; l'état précédent est restauré après coup pour ne pas
+/// contaminer les groupes suivants, qui partagent la même `Ui`.
+#[allow(deprecated)]
+fn with_enabled<R>(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let was_enabled = ui.is_enabled();
+    ui.set_enabled(was_enabled && enabled);
+    let result = add_contents(ui);
+    ui.set_enabled(was_enabled);
+    result
+}
 /// Taille de police par défaut du texte ajouté/remplacé (Sprint 20) — pas de
 /// réglage utilisateur pour l'instant, comme `pdf-cli add-text`/`replace-text`.
 const DEFAULT_TEXT_FONT_SIZE: f64 = 14.0;
@@ -215,6 +381,7 @@ fn main() -> eframe::Result<()> {
         "PapyrusPDF",
         options,
         Box::new(|cc| {
+            apply_theme(&cc.egui_ctx, true);
             let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
                 pdf_render_gpu::GpuRenderer::from_shared(rs.device.clone(), rs.queue.clone())
             });
@@ -281,6 +448,10 @@ struct DocumentTab {
     /// champ ne se corrige/reformatte sous ses yeux à chaque frappe.
     goto_page_input: String,
     search_query: String,
+    /// La ligne de recherche est masquée par défaut et ne prend de place
+    /// dans la barre d'outils que quand elle sert (bouton "Rechercher" ou
+    /// ⌘F) — évite qu'elle n'occupe une ligne entière en permanence.
+    search_bar_open: bool,
     /// Index des pages (0-based) contenant `search_query`, dans l'ordre du
     /// document ; `None` tant qu'aucune recherche n'a été lancée.
     search_results: Option<Vec<usize>>,
@@ -451,6 +622,7 @@ impl DocumentTab {
             error: None,
             goto_page_input: String::new(),
             search_query: String::new(),
+            search_bar_open: false,
             search_results: None,
             search_cursor: 0,
             highlighted_query: String::new(),
@@ -1608,6 +1780,7 @@ impl DocumentTab {
             )
         });
         if focus_search {
+            self.search_bar_open = true;
             ctx.memory_mut(|m| {
                 m.request_focus(egui::Id::new(SEARCH_FIELD_ID));
             });
@@ -1801,21 +1974,21 @@ impl DocumentTab {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui
-                        .button("＋ Page")
+                        .button("+ Page")
                         .on_hover_text("Insérer une page vierge après la page courante")
                         .clicked()
                     {
                         self.insert_blank_page(current + 1);
                     }
                     if ui
-                        .button("🖼 Image…")
+                        .button("+ Image…")
                         .on_hover_text("Insérer une image JPEG comme nouvelle page")
                         .clicked()
                     {
                         self.insert_image_page_dialog(current + 1);
                     }
                     if ui
-                        .button("📎 PDF…")
+                        .button("Fusionner PDF…")
                         .on_hover_text("Fusionner un autre PDF à la fin du document")
                         .clicked()
                     {
@@ -1824,7 +1997,7 @@ impl DocumentTab {
                 });
                 if !self.thumbnail_selection.is_empty()
                     && ui
-                        .button(format!("✂ Extraire ({})…", self.thumbnail_selection.len()))
+                        .button(format!("Extraire ({})…", self.thumbnail_selection.len()))
                         .clicked()
                 {
                     self.extract_selection_dialog();
@@ -1868,14 +2041,14 @@ impl DocumentTab {
                                             ui.horizontal(|ui| {
                                                 ui.label(format!("{}", index + 1));
                                                 if ui
-                                                    .small_button("🗑")
+                                                    .small_button("Suppr.")
                                                     .on_hover_text("Supprimer cette page")
                                                     .clicked()
                                                 {
                                                     delete_requested = Some(index);
                                                 }
                                                 if ui
-                                                    .small_button("↻")
+                                                    .small_button("Pivoter")
                                                     .on_hover_text("Pivoter de 90°")
                                                     .clicked()
                                                 {
@@ -2346,23 +2519,34 @@ impl DocumentTab {
 
         self.handle_keyboard_shortcuts(ctx);
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            // Défilement horizontal plutôt que retour à la ligne
-            // (`horizontal_wrapped`) : avec beaucoup de boutons (page, zoom,
-            // sélection, undo/redo...), le retour à la ligne réorganisait le
-            // groupement visuel de façon imprévisible selon la largeur
-            // (boutons isolés, grands espaces vides). Un simple défilement
-            // horizontal garde l'ordre et le regroupement stables — on
-            // molette/glisse pour voir la suite si la fenêtre est étroite,
-            // plutôt que de voir la barre se réarranger.
-            egui::ScrollArea::horizontal()
-                .id_salt("toolbar_row_main")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(8.0, 6.0)))
+            .show(ctx, |ui| {
+                // Disposition responsive : chaque groupe logique de contrôles
+                // (navigation, zoom, sélection...) est construit dans son
+                // propre `ui.horizontal(...)`, une sous-`Ui` qu'`egui` traite
+                // comme un seul bloc indivisible pour la mise en page. En
+                // enveloppant l'ensemble dans `horizontal_wrapped`, une fenêtre
+                // trop étroite fait passer des groupes entiers à la ligne
+                // suivante plutôt que de forcer un défilement horizontal (mauvaise
+                // ergonomie sur une barre d'outils) ou de couper un groupe en
+                // plein milieu (ce qui arriverait avec un `horizontal_wrapped`
+                // à plat, bouton par bouton).
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                    toolbar_group(ui, |ui| {
                         // "Ouvrir…" ouvre toujours un **nouvel onglet**
                         // (Sprint 49) plutôt que de remplacer le document de
-                        // cet onglet — voir `DocumentTabOutcome`.
-                        if ui.button("Ouvrir…").clicked() {
+                        // cet onglet — voir `DocumentTabOutcome`. Mise en
+                        // avant visuelle (fond accent) : c'est l'action
+                        // principale de la barre d'outils, elle ne doit pas
+                        // se fondre parmi les autres boutons.
+                        let open_button = egui::Button::new(
+                            egui::RichText::new("Ouvrir…").color(theme::TEXT_PRIMARY),
+                        )
+                        .fill(theme::ACCENT);
+                        if ui.add(open_button).clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("PDF", &["pdf"])
                                 .pick_file()
@@ -2370,31 +2554,45 @@ impl DocumentTab {
                                 outcome.open_in_new_tab = Some(path);
                             }
                         }
-                        ui.add_enabled_ui(self.session.is_some(), |ui| {
-                            if ui.button("📄 Exporter le texte…").clicked() {
-                                self.export_text_dialog();
+                    });
+
+                    let (page_index, page_count) = self
+                        .session
+                        .as_ref()
+                        .map(|s| (s.page_index(), s.page_count()))
+                        .unwrap_or((0, 0));
+                    let has_doc = self.session.is_some();
+
+                    toolbar_group(ui, |ui| {
+                        with_enabled(ui, has_doc, |ui| {
+                            // `Button::selected` (plutôt que `toggle_value`,
+                            // qui dessine une `SelectableLabel` sans fond au
+                            // repos) pour que ces panneaux se lisent comme de
+                            // vraies commandes cliquables, pas du texte plat.
+                            if ui
+                                .add(egui::Button::new("Miniatures").selected(self.show_thumbnails))
+                                .clicked()
+                            {
+                                self.show_thumbnails = !self.show_thumbnails;
+                            }
+                            if ui
+                                .add(egui::Button::new("Signets").selected(self.show_outline))
+                                .clicked()
+                            {
+                                self.show_outline = !self.show_outline;
+                            }
+                            if ui
+                                .add(egui::Button::new("Continu").selected(self.continuous_scroll))
+                                .clicked()
+                            {
+                                self.continuous_scroll = !self.continuous_scroll;
                             }
                         });
+                    });
 
-                        ui.separator();
-
-                        let (page_index, page_count) = self
-                            .session
-                            .as_ref()
-                            .map(|s| (s.page_index(), s.page_count()))
-                            .unwrap_or((0, 0));
-                        let has_doc = self.session.is_some();
-
-                        ui.add_enabled_ui(has_doc, |ui| {
-                            ui.toggle_value(&mut self.show_thumbnails, "🖼 Miniatures");
-                            ui.toggle_value(&mut self.show_outline, "📑 Signets");
-                            ui.toggle_value(&mut self.continuous_scroll, "📜 Continu");
-                        });
-
-                        ui.separator();
-
-                        ui.add_enabled_ui(has_doc && page_index > 0, |ui| {
-                            if ui.button("◀ Précédente").clicked() {
+                    toolbar_group(ui, |ui| {
+                        with_enabled(ui, has_doc && page_index > 0, |ui| {
+                            if ui.button("< Précédente").clicked() {
                                 if let Some(session) = &mut self.session {
                                     session.prev_page();
                                     self.scroll_to_page = Some(session.page_index());
@@ -2417,48 +2615,75 @@ impl DocumentTab {
                             }
                             ui.label(format!("/ {}", page_count.max(1)));
                         } else {
-                            ui.label("Aucun document");
+                            ui.weak("Aucun document");
                         }
-                        ui.add_enabled_ui(has_doc && page_index + 1 < page_count, |ui| {
-                            if ui.button("Suivante ▶").clicked() {
+                        with_enabled(ui, has_doc && page_index + 1 < page_count, |ui| {
+                            if ui.button("Suivante >").clicked() {
                                 if let Some(session) = &mut self.session {
                                     session.next_page();
                                     self.scroll_to_page = Some(session.page_index());
                                 }
                             }
                         });
+                    });
 
-                        ui.separator();
-
-                        ui.add_enabled_ui(has_doc, |ui| {
-                            if ui.button("－").clicked() {
+                    toolbar_group(ui, |ui| {
+                        with_enabled(ui, has_doc, |ui| {
+                            if ui.button("-").on_hover_text("Zoom arrière").clicked() {
                                 self.set_zoom(self.zoom - 0.25);
                             }
                             ui.label(format!("{:.0}%", self.zoom * 100.0));
-                            if ui.button("＋").clicked() {
+                            if ui.button("+").on_hover_text("Zoom avant").clicked() {
                                 self.set_zoom(self.zoom + 0.25);
                             }
+                            // Les préréglages de zoom (taille réelle, ajuster à
+                            // la largeur/à la page) sont des actions ponctuelles
+                            // plutôt que des contrôles consultés en continu —
+                            // regroupés dans un menu déroulant pour ne pas
+                            // occuper trois boutons en permanence sur la ligne.
+                            ui.menu_button("Zoom…", |ui| {
+                                if ui.button("Taille réelle (100 %)").clicked() {
+                                    self.set_zoom(1.0);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Ajuster à la largeur").clicked() {
+                                    self.fit_width_requested = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Ajuster à la page").clicked() {
+                                    self.fit_page_requested = true;
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+                    });
+
+                    toolbar_group(ui, |ui| {
+                        with_enabled(ui, has_doc, |ui| {
+                            // Ligne de recherche masquée par défaut (voir
+                            // `search_bar_open`) : ce bouton la fait
+                            // apparaître/disparaître plutôt que de lui
+                            // réserver une ligne entière en permanence.
                             if ui
-                                .button("Réinitialiser")
-                                .on_hover_text("Taille réelle (100 %)")
+                                .add(egui::Button::new("Rechercher").selected(self.search_bar_open))
                                 .clicked()
                             {
-                                self.set_zoom(1.0);
-                            }
-                            if ui.button("↔ Ajuster à la largeur").clicked() {
-                                self.fit_width_requested = true;
-                            }
-                            if ui.button("↕ Ajuster à la page").clicked() {
-                                self.fit_page_requested = true;
+                                self.search_bar_open = !self.search_bar_open;
+                                if self.search_bar_open {
+                                    ui.memory_mut(|m| {
+                                        m.request_focus(egui::Id::new(SEARCH_FIELD_ID));
+                                    });
+                                }
                             }
                         });
+                    });
 
-                        if !self.selection_text.is_empty() {
-                            ui.separator();
-                            if ui.button("📋 Copier").clicked() {
+                    if !self.selection_text.is_empty() {
+                        toolbar_group(ui, |ui| {
+                            if ui.button("Copier").clicked() {
                                 ui.output_mut(|o| o.copied_text = self.selection_text.clone());
                             }
-                            if ui.button("🖍 Surligner").clicked() {
+                            if ui.button("Surligner").clicked() {
                                 self.highlight_selection();
                             }
                             if ui.button("Souligner").clicked() {
@@ -2467,17 +2692,25 @@ impl DocumentTab {
                             if ui.button("Barrer").clicked() {
                                 self.strikeout_selection();
                             }
-                            if ui.button("✏ Remplacer…").clicked() {
+                            if ui.button("Remplacer…").clicked() {
                                 self.open_replace_text_modal();
                             }
-                        }
+                        });
+                    }
 
-                        ui.add_enabled_ui(has_doc, |ui| {
-                            ui.separator();
-                            ui.toggle_value(&mut self.add_text_mode, "📝 Ajouter texte")
-                                .on_hover_text("Cliquer sur la page pour placer un nouveau texte");
+                    toolbar_group(ui, |ui| {
+                        with_enabled(ui, has_doc, |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Ajouter texte").selected(self.add_text_mode),
+                                )
+                                .on_hover_text("Cliquer sur la page pour placer un nouveau texte")
+                                .clicked()
+                            {
+                                self.add_text_mode = !self.add_text_mode;
+                            }
                             if self.selected_annotation.is_some()
-                                && ui.button("🗑 Supprimer l'annotation").clicked()
+                                && ui.button("Supprimer l'annotation").clicked()
                             {
                                 self.delete_selected_annotation();
                             }
@@ -2497,63 +2730,76 @@ impl DocumentTab {
                                             "Highlight" | "Underline" | "StrikeOut"
                                         )
                                     });
-                                if styleable && ui.button("🎨 Style…").clicked() {
+                                if styleable && ui.button("Style…").clicked() {
                                     self.open_annotation_style_popup(selected);
                                 }
                             }
                         });
+                    });
 
-                        if let Some(session) = &self.session {
-                            ui.separator();
-                            let (can_undo, can_redo) =
-                                (session.can_undo_edit(), session.can_redo_edit());
-                            ui.add_enabled_ui(can_undo, |ui| {
-                                if ui.button("↶ Annuler").clicked() {
+                    if let Some(session) = &self.session {
+                        let (can_undo, can_redo) =
+                            (session.can_undo_edit(), session.can_redo_edit());
+                        toolbar_group(ui, |ui| {
+                            with_enabled(ui, can_undo, |ui| {
+                                if ui.button("Annuler").clicked() {
                                     self.undo_edit();
                                 }
                             });
-                            ui.add_enabled_ui(can_redo, |ui| {
-                                if ui.button("↷ Rétablir").clicked() {
+                            with_enabled(ui, can_redo, |ui| {
+                                if ui.button("Rétablir").clicked() {
                                     self.redo_edit();
                                 }
                             });
-                            if ui.button("💾 Enregistrer").clicked() {
+                            if ui.button("Enregistrer").clicked() {
                                 self.save_in_place();
                             }
-                            if ui.button("🖨 Imprimer…").clicked() {
-                                self.print_document();
-                            }
-                            if ui.button("🗜 Optimiser…").clicked() {
-                                self.export_optimized_dialog();
-                            }
-                        }
+                            // Actions secondaires (peu fréquentes une fois le
+                            // document ouvert) regroupées dans un menu déroulant
+                            // pour dégager la ligne principale.
+                            ui.menu_button("Plus…", |ui| {
+                                if ui.button("Exporter le texte…").clicked() {
+                                    self.export_text_dialog();
+                                    ui.close_menu();
+                                }
+                                if ui.button("Imprimer…").clicked() {
+                                    self.print_document();
+                                    ui.close_menu();
+                                }
+                                if ui.button("Optimiser…").clicked() {
+                                    self.export_optimized_dialog();
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+                    }
 
-                        if let Some(session) = &self.session {
-                            ui.separator();
-                            ui.label(
-                                session
-                                    .path()
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy(),
-                            );
-                        }
-                    });
+                    if let Some(session) = &self.session {
+                        ui.weak(
+                            session
+                                .path()
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                        );
+                    }
                 });
 
-            egui::ScrollArea::horizontal()
-                .id_salt("toolbar_row_search")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                if self.search_bar_open {
+                    ui.add_space(4.0);
+
+                    ui.horizontal_wrapped(|ui| {
                         let has_doc = self.session.is_some();
-                        ui.add_enabled_ui(has_doc, |ui| {
+                        with_enabled(ui, has_doc, |ui| {
                             let response = ui.add(
                                 egui::TextEdit::singleline(&mut self.search_query)
-                                    .id(egui::Id::new(SEARCH_FIELD_ID)),
+                                    .id(egui::Id::new(SEARCH_FIELD_ID))
+                                    .hint_text("Rechercher dans le document…")
+                                    .desired_width(180.0),
                             );
                             let submitted = response.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if ui.button("🔍 Rechercher").clicked() || submitted {
+                            if ui.button("Rechercher").clicked() || submitted {
                                 self.run_search();
                             }
                         });
@@ -2567,17 +2813,29 @@ impl DocumentTab {
                                     self.search_cursor + 1,
                                     results.len()
                                 ));
-                                if ui.button("◀ Précédent").clicked() {
+                                if ui
+                                    .button("< Précédent")
+                                    .on_hover_text("Occurrence précédente")
+                                    .clicked()
+                                {
                                     self.jump_to_match(-1);
                                 }
-                                if ui.button("Suivant ▶").clicked() {
+                                if ui
+                                    .button("Suivant >")
+                                    .on_hover_text("Occurrence suivante")
+                                    .clicked()
+                                {
                                     self.jump_to_match(1);
                                 }
                             }
                         }
+
+                        if ui.small_button("Fermer").clicked() {
+                            self.search_bar_open = false;
+                        }
                     });
-                });
-        });
+                }
+            });
 
         if self.show_thumbnails {
             if let Some(clicked) = self.show_thumbnail_panel(ctx) {
@@ -2599,12 +2857,49 @@ impl DocumentTab {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::RED, err);
+                ui.colored_label(theme::DANGER, err);
                 return;
             }
             if self.session.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Ouvrez un fichier PDF pour commencer.");
+                // Écran de démarrage : un vrai point d'entrée (titre, action
+                // principale, rappel du glisser-déposer déjà géré au niveau
+                // de `ViewerApp::update`) plutôt qu'une simple ligne de texte
+                // gris perdue au milieu de l'écran.
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() / 2.0 - 110.0).max(24.0));
+                    ui.heading(
+                        egui::RichText::new("Ouvrez votre premier document")
+                            .size(22.0)
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Modifiez, annotez et signez vos PDF simplement.")
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                    ui.add_space(20.0);
+                    let open_button = egui::Button::new(
+                        egui::RichText::new("Ouvrir un PDF")
+                            .size(15.0)
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                    .fill(theme::ACCENT)
+                    .min_size(egui::vec2(180.0, 38.0))
+                    .rounding(egui::Rounding::same(8.0));
+                    if ui.add(open_button).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PDF", &["pdf"])
+                            .pick_file()
+                        {
+                            self.open_path(path);
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("ou déposez un fichier PDF ici")
+                            .color(theme::TEXT_SECONDARY)
+                            .italics(),
+                    );
                 });
                 return;
             }
@@ -2997,7 +3292,7 @@ fn draw_annotation_outlines(
             annot.rect
         };
         let screen_rect = page_rect_to_screen(rect, image_response.rect, media_box, scale);
-        let width = if is_selected { 2.5 } else { 1.0 };
+        let width = if is_selected { 2.5_f32 } else { 1.0_f32 };
         painter.rect_stroke(
             screen_rect,
             0.0,
@@ -3045,7 +3340,7 @@ fn draw_form_field_outlines(
         painter.rect_stroke(
             egui::Rect::from_min_max(min, max),
             0.0,
-            egui::Stroke::new(1.0, FORM_FIELD_OUTLINE_COLOR),
+            egui::Stroke::new(1.0_f32, FORM_FIELD_OUTLINE_COLOR),
         );
     }
 }
@@ -3074,7 +3369,7 @@ fn draw_checkbox_field_outlines(
         painter.rect_stroke(
             screen_rect,
             0.0,
-            egui::Stroke::new(1.0, CHECKBOX_FIELD_OUTLINE_COLOR),
+            egui::Stroke::new(1.0_f32, CHECKBOX_FIELD_OUTLINE_COLOR),
         );
     }
 }
@@ -3105,7 +3400,7 @@ fn draw_radio_group_outlines(
             painter.rect_stroke(
                 screen_rect,
                 0.0,
-                egui::Stroke::new(1.0, CHECKBOX_FIELD_OUTLINE_COLOR),
+                egui::Stroke::new(1.0_f32, CHECKBOX_FIELD_OUTLINE_COLOR),
             );
         }
     }
@@ -3129,7 +3424,7 @@ fn draw_choice_field_outlines(
         painter.rect_stroke(
             screen_rect,
             0.0,
-            egui::Stroke::new(1.0, FORM_FIELD_OUTLINE_COLOR),
+            egui::Stroke::new(1.0_f32, FORM_FIELD_OUTLINE_COLOR),
         );
     }
 }
@@ -3166,6 +3461,7 @@ struct ViewerApp {
     /// les plateformes non macOS ou si l'installation a échoué, auquel cas
     /// seuls la barre d'outils `egui` et le glisser-déposer restent
     /// utilisables pour ouvrir un fichier.
+    #[cfg(target_os = "macos")]
     native_menu: Option<NativeMenu>,
 }
 
@@ -3175,6 +3471,7 @@ impl ViewerApp {
             tabs: vec![DocumentTab::new(initial_path, gpu.clone())],
             active: 0,
             gpu,
+            #[cfg(target_os = "macos")]
             native_menu: None,
         }
     }
@@ -3282,6 +3579,7 @@ impl eframe::App for ViewerApp {
         // d'événements `winit`/AppKit a fini son propre démarrage (qui
         // installe un menu par défaut), donc la nôtre ne se fait plus
         // écraser — voir la doc de `main` et `NativeMenu::install`.
+        #[cfg(target_os = "macos")]
         if self.native_menu.is_none() {
             if let Some(mtm) = objc2::MainThreadMarker::new() {
                 self.native_menu = Some(NativeMenu::install(mtm));
@@ -3293,7 +3591,10 @@ impl eframe::App for ViewerApp {
         // callback Objective-C lui-même, pour ne coupler `MenuTarget` qu'à
         // un canal MPSC plutôt qu'à l'état `egui`. Routées vers l'onglet
         // actif, sauf `OpenDocument`/`CloseTab` qui agissent sur la liste
-        // d'onglets elle-même (Sprint 49).
+        // d'onglets elle-même (Sprint 49). Sur les plateformes non macOS,
+        // il n'y a pas de menu natif : ouverture/enregistrement/impression
+        // restent accessibles via la barre d'outils `egui`.
+        #[cfg(target_os = "macos")]
         if let Some(menu) = &self.native_menu {
             for cmd in menu.drain_commands() {
                 match cmd {
@@ -3310,11 +3611,7 @@ impl eframe::App for ViewerApp {
                     MenuCommand::ToggleDarkMode => {
                         if let Some(mtm) = objc2::MainThreadMarker::new() {
                             let dark = native_menu::toggle_dark_mode(mtm);
-                            ctx.set_visuals(if dark {
-                                egui::Visuals::dark()
-                            } else {
-                                egui::Visuals::light()
-                            });
+                            apply_theme(ctx, dark);
                         }
                     }
                     MenuCommand::Save => self.tabs[self.active].save_in_place(),
@@ -3339,6 +3636,173 @@ impl eframe::App for ViewerApp {
         let outcome = self.tabs[self.active].update_content(ctx);
         if let Some(path) = outcome.open_in_new_tab {
             self.open_new_tab(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Vérifie, sans fenêtre ni session graphique (juste `egui::Context` en
+    /// mémoire), que des groupes de boutons construits avec `toolbar_group`
+    /// passent réellement à la ligne suivante dans une largeur étroite,
+    /// plutôt que de déborder silencieusement hors de la zone visible —
+    /// exactement le bug rapporté (une carte `Frame` imbriquée dans
+    /// `ui.horizontal(...)` ne déclenchait jamais de retour à la ligne, voir
+    /// la doc de `toolbar_group`). Remplace une vérification à l'écran
+    /// impossible à faire de façon fiable et respectueuse de la vie privée
+    /// depuis cet environnement (pas de fenêtre isolée disponible).
+    #[test]
+    fn toolbar_groups_wrap_within_a_narrow_width() {
+        let ctx = egui::Context::default();
+        let narrow_width = 300.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(narrow_width, 600.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut row_tops = std::collections::BTreeSet::new();
+        let mut max_right = 0.0f32;
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for group in 0..6 {
+                        toolbar_group(ui, |ui| {
+                            for item in 0..3 {
+                                let response = ui.button(format!("Item {group}-{item}"));
+                                row_tops.insert(response.rect.top() as i32);
+                                max_right = max_right.max(response.rect.right());
+                            }
+                        });
+                    }
+                });
+            });
+        });
+
+        assert!(
+            row_tops.len() > 1,
+            "les groupes auraient dû se répartir sur plusieurs lignes dans {narrow_width}px de large, tout est resté sur une seule ligne (tops observés : {row_tops:?})"
+        );
+        assert!(
+            max_right <= narrow_width + 1.0,
+            "du contenu déborde de la largeur disponible : {max_right} > {narrow_width}"
+        );
+    }
+
+    /// Comme ci-dessus, mais sur le **vrai** `DocumentTab::update_content`
+    /// plutôt qu'une reconstitution simplifiée — un utilisateur a rapporté
+    /// un débordement persistant (le bouton "Rechercher" se retrouvant
+    /// compressé en une colonne d'une lettre par ligne) que le test
+    /// synthétique ci-dessus ne capturait pas, exactement le genre d'écart
+    /// entre "le principe marche" et "le vrai code marche" que seul un test
+    /// sur le code réel peut détecter. Sans document ouvert (`DocumentTab::new`
+    /// avec aucun chemin), la plupart des chemins de rendu coûteux
+    /// (miniatures, page courante, GPU) sont déjà court-circuités par
+    /// `has_doc == false`, donc ce test tourne sans session graphique ni GPU.
+    #[test]
+    fn real_toolbar_never_paints_outside_a_narrow_window() {
+        let ctx = egui::Context::default();
+        for width in [804.0_f32, 480.0, 320.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            };
+
+            let mut tab = DocumentTab::new(None, None);
+            let output = ctx.run(input, |ctx| {
+                let _ = tab.update_content(ctx);
+            });
+
+            let mut max_right = 0.0f32;
+            let mut offender = None;
+            for clipped in &output.shapes {
+                if let Some(rect) = clipped
+                    .shape
+                    .visual_bounding_rect()
+                    .is_finite()
+                    .then(|| clipped.shape.visual_bounding_rect())
+                {
+                    if rect.right() > max_right {
+                        max_right = rect.right();
+                        offender = Some(rect);
+                    }
+                }
+            }
+
+            assert!(
+                max_right <= width + 1.0,
+                "à {width}px de large, du contenu réel de la barre d'outils déborde jusqu'à x={max_right} (rect fautif : {offender:?})"
+            );
+        }
+    }
+
+    /// Même vérification qu'au-dessus, mais avec un document réellement
+    /// ouvert : `has_doc == true` active des groupes supplémentaires
+    /// (navigation de page, zoom, annuler/rétablir/enregistrer/menu "Plus…",
+    /// nom de fichier) qui restent masqués/désactivés dans le test précédent
+    /// — sans backend GPU (`gpu: None`), le rendu de page retombe sur le
+    /// chemin CPU (`pdf-render`), donc pas besoin d'une session graphique.
+    #[test]
+    fn real_toolbar_with_open_document_never_paints_outside_a_narrow_window() {
+        let ctx = egui::Context::default();
+        let fixture = std::path::Path::new("../pdf-core/tests/fixtures/minimal.pdf");
+        assert!(fixture.exists(), "fixture manquante : {fixture:?}");
+
+        for width in [804.0_f32, 480.0, 320.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            };
+
+            let mut tab = DocumentTab::new(Some(fixture.to_path_buf()), None);
+            assert!(
+                tab.session.is_some(),
+                "le fixture aurait dû s'ouvrir sans erreur"
+            );
+            let output = ctx.run(input, |ctx| {
+                let _ = tab.update_content(ctx);
+            });
+
+            // Limité aux formes bornées par la `TopBottomPanel` de la barre
+            // d'outils (son `clip_rect` reste confiné à sa propre hauteur,
+            // courte) — la page PDF elle-même, rendue dans le `CentralPanel`
+            // en dessous (`clip_rect` s'étendant jusqu'au bas de la fenêtre),
+            // fait légitimement plus large que la fenêtre à 100% de zoom
+            // (612pt pour `minimal.pdf`) : son propre défilement horizontal
+            // gère ce cas, ce n'est pas le bug de barre d'outils recherché
+            // ici.
+            const TOOLBAR_CLIP_HEIGHT_LIMIT: f32 = 250.0;
+            let mut max_right = 0.0f32;
+            let mut offender = None;
+            for clipped in &output.shapes {
+                if clipped.clip_rect.bottom() >= TOOLBAR_CLIP_HEIGHT_LIMIT {
+                    continue;
+                }
+                let rect = clipped.shape.visual_bounding_rect();
+                if !rect.is_finite() {
+                    continue;
+                }
+                if rect.right() > max_right {
+                    max_right = rect.right();
+                    offender = Some(rect);
+                }
+            }
+
+            assert!(
+                max_right <= width + 1.0,
+                "avec un document ouvert, à {width}px de large, la barre d'outils déborde jusqu'à x={max_right} (rect fautif : {offender:?})"
+            );
         }
     }
 }

@@ -18,6 +18,11 @@ eframe = { version = "0.29", features = ["wgpu"] }
 egui = "0.29"
 wgpu = "22"
 rfd = "0.15"
+
+# objc2 (menu natif NSMenu, native_menu.rs) : uniquement macOS. Sur les
+# autres plateformes, ce n'est ni disponible ni nécessaire — main.rs gate
+# tout usage derrière #[cfg(target_os = "macos")].
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSWindow", "NSRunningApplication", "NSEvent", "NSAppearance"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString"] }

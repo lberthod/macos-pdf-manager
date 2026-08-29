@@ -34,7 +34,7 @@ Le `.dmg` et l'app qu'il contient sont **signés (Developer ID Application) et n
 
 > ⚠️ L'édition chirurgicale du texte existant (modifier un glyphe déjà présent dans le flux de contenu, plutôt que le masquer et le redessiner par superposition) reste hors périmètre : un PDF est une description de rendu (glyphes positionnés), pas un format éditable — voir [architecture.md](./architecture.md#73-édition-du-texte-existant--le-vrai-défi) pour le détail de cette limite et l'approche par phases retenue.
 
-Ce qui ne fonctionne pas encore : Quick Look, formes/notes/signatures, remplissage de formulaire au clic (le moteur le sait faire, pas encore câblé dans l'interface), Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, PDF chiffré avec un vrai mot de passe (pas de dialogue de saisie), accessibilité VoiceOver. Voir [STATUS.md](./STATUS.md) et [audit50quest.md](./audit50quest.md) pour le détail précis, fonctionnalité par fonctionnalité.
+Ce qui ne fonctionne pas encore : Quick Look, formes/notes/signatures, Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, accessibilité VoiceOver du contenu de page. Voir [architecture.md](./architecture.md) pour la cible et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour le détail du fonctionnement interne.
 
 ## Structure du projet
 
@@ -99,11 +99,8 @@ hdiutil verify PapyrusPDF.dmg                 # intégrité du disque image
 ## Documentation
 
 - [architecture.md](./architecture.md) — document d'architecture cible : principes, découpage en couches du moteur PDF, choix techniques, modèle de données, risques.
-- [sprint.md](./sprint.md) — plan de sprints, coché sprint par sprint avec le statut réel de chaque item.
-- [STATUS.md](./STATUS.md) — état précis du projet à date : ce qui marche, ce qui est simulé/placeholder, ce qui manque, avec pointeurs vers le code.
-- [audit50quest.md](./audit50quest.md) — audit ligne par ligne contre une grille de 50 fonctionnalités attendues d'un viewer/éditeur PDF, avec score de couverture.
-- [analyse_sprint.md](./analyse_sprint.md) — plan d'action dérivé de cet audit.
 - [docs/EXPLICATION.md](./docs/EXPLICATION.md) — explication détaillée du fonctionnement interne du moteur, couche par couche.
+- [AUDIT_FIXES.md](./AUDIT_FIXES.md) — problèmes trouvés lors du dernier audit de sécurité/qualité et étapes de correction.
 
 ## Développement
 

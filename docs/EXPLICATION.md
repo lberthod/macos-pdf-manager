@@ -1,7 +1,7 @@
 # Comment fonctionne le moteur — explication détaillée
 
 **Dernière mise à jour :** 2026-07-04
-**Public :** développeur qui rejoint le projet et veut comprendre précisément ce que fait chaque couche, avec les vrais noms de fichiers/fonctions et le cheminement exact des données. Complément de [architecture.md](../architecture.md) (la cible à long terme) et [STATUS.md](../STATUS.md) (l'état à date).
+**Public :** développeur qui rejoint le projet et veut comprendre précisément ce que fait chaque couche, avec les vrais noms de fichiers/fonctions et le cheminement exact des données. Complément de [architecture.md](../architecture.md) (la cible à long terme).
 
 ---
 
@@ -224,7 +224,7 @@ Points d'implémentation notables :
 
 ## 15. Ce qu'il faut savoir avant de contribuer
 
-- **Chaque limitation est documentée là où elle vit** : en tête de module (`//!`) et dans [STATUS.md](../STATUS.md). Si vous levez une limitation, mettez à jour les deux.
+- **Chaque limitation est documentée là où elle vit** : en tête de module (`//!`).
 - **Le corpus de test** ([pdf-core/tests/fixtures/](../pdf-core/tests/fixtures/)) est généré par script (reportlab + pikepdf + fonttools, recette dans son README) — ne modifiez pas les `.pdf` à la main, les tests d'intégration en dépendent octet par octet (`include_bytes!`).
 - **Tests de rendu par comparaison pixel** : `pdf-render/tests/golden.rs` compare chaque fixture visuel à une image de référence (`pdf-render/tests/golden/*.png`) sous seuil de tolérance ; `pdf-render-gpu/tests/cross_backend.rs` compare le rendu CPU et GPU entre eux. Si un changement de rendu est intentionnel, régénérer les références avec `UPDATE_GOLDEN=1 cargo test -p pdf-render --test golden` puis relire le diff d'image dans la PR avant de merger — ne jamais régénérer sans avoir vérifié visuellement que le nouveau rendu est correct.
 - **CI** : `cargo fmt --check`, `clippy -D warnings`, `cargo test` sur `macos-latest` ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Le test de substitution système suppose macOS.

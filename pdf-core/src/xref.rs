@@ -54,13 +54,12 @@ pub fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
     let mut table = XrefTable::default();
     let mut trailer = Dictionary::new();
     let mut next_offset = Some(start_offset);
-    let mut visited = Vec::new();
+    let mut visited = std::collections::HashSet::new();
 
     while let Some(offset) = next_offset {
-        if visited.contains(&offset) {
+        if !visited.insert(offset) {
             break; // évite les boucles /Prev malformées
         }
-        visited.push(offset);
 
         match parse_xref_section(data, offset) {
             Ok((section_table, section_trailer)) => {
@@ -191,15 +190,27 @@ fn parse_xref_stream_section(data: &[u8], offset: usize) -> Result<(XrefTable, D
         .and_then(|o| o.as_array())
         .ok_or_else(|| PdfError::MissingKey("W".into()))?
         .iter()
-        .map(|o| o.as_int().unwrap_or(0) as usize)
-        .collect();
+        .map(|o| match o.as_int() {
+            // Une largeur négative est invalide (ISO 32000-1 §7.5.8.2, /W ne
+            // contient que des entiers >= 0) ; un cast direct en `usize`
+            // s'enroulerait vers une valeur énorme et ferait déborder
+            // `record_len` plus bas (panique en build debug/fuzz).
+            Some(n) if n >= 0 => Ok(n as usize),
+            _ => Err(PdfError::InvalidXref(
+                "/W entries must be non-negative integers".into(),
+            )),
+        })
+        .collect::<Result<_>>()?;
     if widths.len() != 3 {
         return Err(PdfError::InvalidXref(
             "/W must have exactly 3 entries".into(),
         ));
     }
     let (w0, w1, w2) = (widths[0], widths[1], widths[2]);
-    let record_len = w0 + w1 + w2;
+    let record_len = w0
+        .checked_add(w1)
+        .and_then(|sum| sum.checked_add(w2))
+        .ok_or_else(|| PdfError::InvalidXref("/W entries overflow".into()))?;
 
     let size = dict.get_int("Size").unwrap_or(0);
     let index: Vec<i64> = match dict.get("Index").and_then(|o| o.as_array()) {
@@ -408,4 +419,37 @@ fn parse_header_backwards(data: &[u8], obj_pos: usize) -> Option<(u32, usize)> {
     let num_str = std::str::from_utf8(&data[num_start..num_end]).ok()?;
     let num: u32 = num_str.parse().ok()?;
     Some((num, num_start))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `AUDIT_FIXES.md` #2 : une largeur `/W` négative s'enroulait autrefois
+    /// en un `usize` énorme lors du cast, faisant déborder `record_len`
+    /// (panique en build debug/fuzz). Vérifie que c'est maintenant rejeté
+    /// proprement avec une erreur, sans jamais paniquer.
+    #[test]
+    fn negative_w_entry_is_rejected_instead_of_overflowing() {
+        let body = "1 0 obj\n<< /Type /XRef /W [1 -1 1] /Size 1 /Index [0 1] /Length 0 >>\nstream\n\nendstream\nendobj\n";
+        let data = body.as_bytes();
+        let err = parse_xref_stream_section(data, 0).unwrap_err();
+        assert!(matches!(err, PdfError::InvalidXref(_)));
+    }
+
+    /// Largeurs valides mais qui, additionnées via un `+` nu, auraient pu
+    /// déborder `usize` sur une plateforme 32 bits ou avec des valeurs
+    /// extrêmes ; vérifie que le `checked_add` renvoie une erreur propre
+    /// plutôt que de paniquer (debug) ou de s'enrouler silencieusement
+    /// (release).
+    #[test]
+    fn overflowing_w_sum_is_rejected_instead_of_wrapping() {
+        let body = format!(
+            "1 0 obj\n<< /Type /XRef /W [{max} {max} {max}] /Size 1 /Index [0 1] /Length 0 >>\nstream\n\nendstream\nendobj\n",
+            max = i64::MAX
+        );
+        let data = body.as_bytes();
+        let err = parse_xref_stream_section(data, 0).unwrap_err();
+        assert!(matches!(err, PdfError::InvalidXref(_)));
+    }
 }

@@ -24,6 +24,8 @@ pub enum PdfError {
     Encrypted,
     #[error("incorrect password for this encrypted PDF")]
     IncorrectPassword,
+    #[error("cyclic reference detected while resolving object stream {0}")]
+    CyclicReference(u32),
 }
 
 pub type Result<T> = std::result::Result<T, PdfError>;

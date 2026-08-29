@@ -8,7 +8,7 @@ use crate::parser::Parser;
 use crate::writer::{write_indirect_object, write_object};
 use crate::xref::{find_startxref_offset, parse_xref_chain, XrefEntry, XrefTable};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub struct Document {
     data: Vec<u8>,
@@ -18,6 +18,11 @@ pub struct Document {
     /// Contexte de déchiffrement (`/Encrypt`, Sprint 22/58, voir `crypt.rs`)
     /// — `None` pour un document non chiffré.
     decryption: Option<Decryptor>,
+    /// Numéros d'object stream en cours de résolution (`resolve_compressed`) —
+    /// garde anti-cycle : un xref stream forgé peut déclarer un objet comme
+    /// compressé dans lui-même (ou un cycle A→B→A), ce qui bouclerait
+    /// indéfiniment sans cette détection (stack overflow, DoS).
+    resolving_streams: RefCell<HashSet<u32>>,
 }
 
 impl Document {
@@ -45,6 +50,7 @@ impl Document {
             trailer,
             cache: RefCell::new(BTreeMap::new()),
             decryption: None,
+            resolving_streams: RefCell::new(HashSet::new()),
         };
 
         if let Some(encrypt_obj) = doc.trailer.get("Encrypt").cloned() {
@@ -144,6 +150,18 @@ impl Document {
     /// architecture.md §4.2. L'en-tête du flux décodé liste `/N` paires
     /// `(numéro d'objet, offset relatif à /First)`.
     fn resolve_compressed(&self, stream_num: u32, index: u32) -> Result<Object> {
+        if !self.resolving_streams.borrow_mut().insert(stream_num) {
+            // Déjà en cours de résolution plus haut dans la pile d'appel :
+            // l'objet stream se référence lui-même (directement ou via un
+            // cycle), résoudre à nouveau boucherait indéfiniment.
+            return Err(PdfError::CyclicReference(stream_num));
+        }
+        let result = self.resolve_compressed_inner(stream_num, index);
+        self.resolving_streams.borrow_mut().remove(&stream_num);
+        result
+    }
+
+    fn resolve_compressed_inner(&self, stream_num: u32, index: u32) -> Result<Object> {
         let stream_obj = self.resolve(ObjRef::new(stream_num, 0))?;
         let Object::Stream(stream) = stream_obj else {
             return Err(PdfError::InvalidObject(
@@ -332,6 +350,66 @@ mod tests {
         );
         bytes.extend_from_slice(xref.as_bytes());
         bytes
+    }
+
+    /// `AUDIT_FIXES.md` #1 : un xref stream forgé peut déclarer un objet
+    /// comme compressé dans lui-même (`resolve(N)` -> `resolve_compressed(N)`
+    /// -> `resolve(N)` -> ...). Avant le correctif, ceci récursait
+    /// indéfiniment jusqu'au stack overflow ; on vérifie ici que `resolve`
+    /// renvoie une erreur `CyclicReference` au lieu de crasher.
+    #[test]
+    fn resolve_rejects_object_stream_that_references_itself() {
+        let mut xref = XrefTable::default();
+        xref.entries.insert(
+            5,
+            XrefEntry::Compressed {
+                stream_num: 5,
+                index: 0,
+            },
+        );
+        let doc = Document {
+            data: Vec::new(),
+            xref,
+            trailer: Dictionary::new(),
+            cache: RefCell::new(BTreeMap::new()),
+            decryption: None,
+            resolving_streams: RefCell::new(HashSet::new()),
+        };
+
+        let err = doc.resolve(ObjRef::new(5, 0)).unwrap_err();
+        assert!(matches!(err, PdfError::CyclicReference(5)));
+    }
+
+    /// Même défaut que ci-dessus, mais sur un cycle à deux objets (A -> B ->
+    /// A) plutôt qu'une auto-référence directe.
+    #[test]
+    fn resolve_rejects_two_object_reference_cycle() {
+        let mut xref = XrefTable::default();
+        xref.entries.insert(
+            1,
+            XrefEntry::Compressed {
+                stream_num: 2,
+                index: 0,
+            },
+        );
+        xref.entries.insert(
+            2,
+            XrefEntry::Compressed {
+                stream_num: 1,
+                index: 0,
+            },
+        );
+        let doc = Document {
+            data: Vec::new(),
+            xref,
+            trailer: Dictionary::new(),
+            cache: RefCell::new(BTreeMap::new()),
+            decryption: None,
+            resolving_streams: RefCell::new(HashSet::new()),
+        };
+
+        let err = doc.resolve(ObjRef::new(1, 0)).unwrap_err();
+        assert!(matches!(err, PdfError::CyclicReference(_)));
     }
 
     #[test]

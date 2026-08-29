@@ -102,6 +102,7 @@ hdiutil verify PapyrusPDF.dmg                 # intégrité du disque image
 - [architecture.md](./architecture.md) — document d'architecture cible : principes, découpage en couches du moteur PDF, choix techniques, modèle de données, risques.
 - [docs/EXPLICATION.md](./docs/EXPLICATION.md) — explication détaillée du fonctionnement interne du moteur, couche par couche.
 - [AUDIT_FIXES.md](./AUDIT_FIXES.md) — problèmes trouvés lors du dernier audit de sécurité/qualité et étapes de correction.
+- [ROADMAP_IMPROVEMENT.md](./ROADMAP_IMPROVEMENT.md) — écarts face à Acrobat/Foxit/PDF Expert/Preview (OCR, caviardage, accessibilité, codecs...) et plan concret pour les combler.
 
 ## Développement
 

@@ -66,6 +66,21 @@ pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
         )));
     }
 
+    // Plafond de sanité (AUDIT_FIXES_2026-09-03.md #11) : `/Width`/`/Height`
+    // forgés (ex. 100000×100000) feraient sinon tenter une allocation de
+    // plusieurs Go pour `rgba` ci-dessous à partir d'un flux minuscule —
+    // `checked_mul` en plus, `width as u64 * height as u64` peut à la limite
+    // approcher `u64::MAX` pour des `/Width`/`/Height` proches d'`u32::MAX`.
+    const MAX_IMAGE_PIXELS: u64 = 64_000_000;
+    let pixel_count_u64 = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or_else(|| PdfError::DecodeError("image dimensions overflow".to_string()))?;
+    if pixel_count_u64 > MAX_IMAGE_PIXELS {
+        return Err(PdfError::DecodeError(format!(
+            "image too large: {width}x{height} exceeds the {MAX_IMAGE_PIXELS} pixel limit"
+        )));
+    }
+
     let declared_color_space = resolve_color_space(doc, &stream.dict)?;
 
     let decoded = decode_stream(stream)?;
@@ -77,7 +92,7 @@ pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
     // disposition réelle des octets décodés ne correspond plus au
     // `/ColorSpace` déclaré (`DeviceCMYK`) : on fait confiance à ce que le
     // décodeur a effectivement produit plutôt qu'à la déclaration PDF.
-    let pixel_count = width as usize * height as usize;
+    let pixel_count = pixel_count_u64 as usize;
     let color_space = if declared_color_space == ColorSpaceKind::Cmyk
         && decoded.len() >= pixel_count * 3
         && decoded.len() < pixel_count * 4
@@ -96,7 +111,7 @@ pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
         )));
     }
 
-    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
     for pixel in decoded[..expected_len].chunks_exact(components) {
         let (r, g, b) = match color_space {
             ColorSpaceKind::Gray => (pixel[0], pixel[0], pixel[0]),
@@ -226,6 +241,46 @@ mod tests {
         assert_eq!(ColorSpaceKind::Gray.components(), 1);
         assert_eq!(ColorSpaceKind::Rgb.components(), 3);
         assert_eq!(ColorSpaceKind::Cmyk.components(), 4);
+    }
+
+    fn empty_doc() -> Document {
+        let body = concat!(
+            "%PDF-1.7\n",
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+        );
+        let mut bytes = body.as_bytes().to_vec();
+        let off1 = 9;
+        let off2 = bytes.windows(7).position(|w| w == b"2 0 obj").unwrap();
+        let xref_offset = bytes.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+        Document::open(bytes).unwrap()
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #11 : une `/Width`/`/Height` forgée
+    /// (100000×100000) doit être rejetée avant de tenter d'allouer le bitmap
+    /// RGBA correspondant (40 Go), pas seulement échouer plus tard faute de
+    /// données suffisantes dans le flux.
+    #[test]
+    fn decode_image_rejects_absurd_dimensions_instead_of_allocating_gigabytes() {
+        let doc = empty_doc();
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name("XObject".to_string()));
+        dict.insert("Subtype", Object::Name("Image".to_string()));
+        dict.insert("Width", Object::Integer(100_000));
+        dict.insert("Height", Object::Integer(100_000));
+        dict.insert("BitsPerComponent", Object::Integer(8));
+        dict.insert("ColorSpace", Object::Name("DeviceRGB".to_string()));
+        let stream = Stream {
+            dict,
+            raw_data: Vec::new(),
+        };
+
+        let err = decode_image(&doc, &stream).unwrap_err();
+        assert!(matches!(err, PdfError::DecodeError(_)));
     }
 
     #[test]

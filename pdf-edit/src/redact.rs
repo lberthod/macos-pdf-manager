@@ -56,7 +56,7 @@ impl Rect {
 
     /// Intersection stricte (un simple contact sur un bord ne compte pas —
     /// évite de retirer un voisin immédiat par un souci d'arrondi flottant).
-    fn intersects(&self, other: &Rect) -> bool {
+    pub(crate) fn intersects(&self, other: &Rect) -> bool {
         self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
     }
 
@@ -72,6 +72,21 @@ impl Rect {
         }
         Some(r)
     }
+}
+
+/// Un bloc de contenu marqué (`BDC`/`BMC` … `EMC`) en cours d'imbrication.
+/// `has_actual_text_like_key` est vrai si son dictionnaire de propriétés
+/// porte `/ActualText`, `/Alt`, `/E` ou `/Lang` (ISO 32000-1 §14.9.3, §14.9.4) :
+/// ces clés portent une représentation textuelle du contenu marqué qui existe
+/// **indépendamment** des opérateurs de peinture qu'il contient (accessibilité,
+/// OCR taggé) — retirer l'opérateur de peinture retiré ne suffit donc pas, il
+/// faut retirer le bloc entier. `any_removed` accumule si un opérateur de
+/// peinture a été retiré n'importe où à l'intérieur (y compris dans un bloc
+/// imbriqué), pour décider à `EMC` s'il faut retirer tout le bloc.
+struct MarkedContentFrame {
+    start_idx: usize,
+    has_actual_text_like_key: bool,
+    any_removed: bool,
 }
 
 #[derive(Clone)]
@@ -245,6 +260,36 @@ fn resolve_font(
     font
 }
 
+/// Dictionnaire de propriétés d'un `BDC /Tag <props> BDC` — `<props>` est
+/// soit un dictionnaire inline, soit un `Name` qui référence une entrée de
+/// `/Properties` dans les ressources de la page (ISO 32000-1 §14.6.2).
+fn marked_content_properties(
+    doc: &Document,
+    resources: &Dictionary,
+    ops: &[Object],
+) -> Option<Dictionary> {
+    match ops.get(1)? {
+        Object::Dictionary(d) => Some(d.clone()),
+        Object::Name(name) => {
+            let cat_obj = resources.get("Properties")?;
+            let cat_dict = doc.get(cat_obj).ok()?;
+            let cat_dict = cat_dict.as_dict()?;
+            let entry = cat_dict.get(name)?;
+            doc.get(entry).ok()?.as_dict().cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Vrai si `dict` porte une des clés qui font qu'un bloc de contenu marqué
+/// ne peut pas être réduit à ses seuls opérateurs de peinture (voir
+/// `MarkedContentFrame`).
+fn has_actual_text_like_key(dict: &Dictionary) -> bool {
+    ["ActualText", "Alt", "E", "Lang"]
+        .iter()
+        .any(|key| dict.get(key).is_some())
+}
+
 /// Retire du flux de contenu décodé `content` tout opérateur de peinture
 /// (texte, chemin, image/formulaire `XObject`) dont la zone occupée
 /// intersecte `target` (espace page), et reconstruit un flux valide avec les
@@ -256,11 +301,17 @@ pub(crate) fn redact_content_stream(
     page_resources: &Dictionary,
     target: Rect,
 ) -> Result<(Vec<u8>, bool), String> {
-    // Heuristique volontairement prudente (voir la doc de module) : un faux
-    // positif ("BI" apparaissant dans une chaîne de texte quelconque) fait
-    // juste échouer inutilement une redaction par ailleurs sûre — un faux
-    // négatif serait bien plus grave, donc le déséquilibre est assumé.
-    if content.windows(2).any(|w| w == b"BI") {
+    let instructions = parse_content_stream(content).map_err(|e| e.to_string())?;
+
+    // Le flux est déjà tokenisé à ce stade (`BI` est une instruction à part
+    // entière, voir `parse_content_stream`) : plus besoin d'un scan d'octets
+    // bruts, qui donnait de faux positifs sur `(BIENVENUE) Tj`, `/GS0BI gs`,
+    // ou tout flux binaire de police Type3 contenant la séquence `BI` par
+    // hasard (AUDIT_FIXES_2026-09-03.md #16). Les images en ligne ne sont
+    // toujours pas prises en charge : leur présence réelle fait échouer
+    // l'opération avec un message explicite plutôt que de risquer de laisser
+    // du contenu non vérifié.
+    if instructions.iter().any(|i| i.operator == "BI") {
         return Err(
             "cette page contient des images en ligne (BI/ID/EI) : le caviardage ne les prend pas \
              encore en charge, opération refusée par prudence plutôt que de risquer de laisser du \
@@ -268,8 +319,6 @@ pub(crate) fn redact_content_stream(
                 .to_string(),
         );
     }
-
-    let instructions = parse_content_stream(content).map_err(|e| e.to_string())?;
 
     let mut gs = GState::default();
     let mut gs_stack: Vec<GState> = Vec::new();
@@ -290,6 +339,7 @@ pub(crate) fn redact_content_stream(
 
     let mut keep = vec![true; instructions.len()];
     let mut redacted_anything = false;
+    let mut mc_stack: Vec<MarkedContentFrame> = Vec::new();
 
     let show_text = |bytes: &[u8],
                      gs: &GState,
@@ -360,6 +410,9 @@ pub(crate) fn redact_content_stream(
                     if show_text(s, &gs, &mut text_matrix, &mut font_cache) {
                         keep[idx] = false;
                         redacted_anything = true;
+                        for frame in mc_stack.iter_mut() {
+                            frame.any_removed = true;
+                        }
                     }
                 }
             }
@@ -371,6 +424,9 @@ pub(crate) fn redact_content_stream(
                     if show_text(s, &gs, &mut text_matrix, &mut font_cache) {
                         keep[idx] = false;
                         redacted_anything = true;
+                        for frame in mc_stack.iter_mut() {
+                            frame.any_removed = true;
+                        }
                     }
                 }
             }
@@ -384,6 +440,9 @@ pub(crate) fn redact_content_stream(
                     if show_text(s, &gs, &mut text_matrix, &mut font_cache) {
                         keep[idx] = false;
                         redacted_anything = true;
+                        for frame in mc_stack.iter_mut() {
+                            frame.any_removed = true;
+                        }
                     }
                 }
             }
@@ -413,6 +472,9 @@ pub(crate) fn redact_content_stream(
                     if any_hit {
                         keep[idx] = false;
                         redacted_anything = true;
+                        for frame in mc_stack.iter_mut() {
+                            frame.any_removed = true;
+                        }
                     }
                 }
             }
@@ -457,6 +519,9 @@ pub(crate) fn redact_content_stream(
                             keep[path_idx] = false;
                         }
                         redacted_anything = true;
+                        for frame in mc_stack.iter_mut() {
+                            frame.any_removed = true;
+                        }
                     }
                 }
                 path_points.clear();
@@ -464,10 +529,64 @@ pub(crate) fn redact_content_stream(
             }
             "Do" => {
                 if let Some(Object::Name(name)) = ops.first() {
-                    if let Some(bbox) = xobject_bbox(doc, page_resources, name, &gs.ctm) {
-                        if target.intersects(&bbox) {
-                            keep[idx] = false;
-                            redacted_anything = true;
+                    match xobject_bbox(doc, page_resources, name, &gs.ctm) {
+                        Some(bbox) => {
+                            if target.intersects(&bbox) {
+                                keep[idx] = false;
+                                redacted_anything = true;
+                                for frame in mc_stack.iter_mut() {
+                                    frame.any_removed = true;
+                                }
+                            }
+                        }
+                        // XObject introuvable, `/BBox` absent ou `/Subtype`
+                        // inattendu : impossible de savoir si sa zone
+                        // occupée croise `target`. Le conserver serait
+                        // fail-open (AUDIT_FIXES_2026-09-03.md #4) — plus
+                        // sûr de refuser l'opération entière que de risquer
+                        // de laisser du contenu non vérifié dans la sortie.
+                        None => {
+                            return Err(format!(
+                                "XObject /{name} : boîte inconnue, caviardage refusé"
+                            ))
+                        }
+                    }
+                }
+            }
+            "sh" => {
+                // Peint le clip courant avec un ombrage (ISO 32000-1
+                // §8.7.4.3) : sans suivi du clip (voir la doc de module),
+                // impossible de calculer sa zone occupée réelle. Traité
+                // comme couvrant toute la page — donc toujours retiré dès
+                // que `target` est non vide, cohérent avec la sur-suppression
+                // assumée pour `Do` ci-dessus (AUDIT_FIXES_2026-09-03.md #4).
+                keep[idx] = false;
+                redacted_anything = true;
+                for frame in mc_stack.iter_mut() {
+                    frame.any_removed = true;
+                }
+            }
+            "BDC" => {
+                let has_actual_text_like_key = marked_content_properties(doc, page_resources, ops)
+                    .is_some_and(|props| has_actual_text_like_key(&props));
+                mc_stack.push(MarkedContentFrame {
+                    start_idx: idx,
+                    has_actual_text_like_key,
+                    any_removed: false,
+                });
+            }
+            "BMC" => mc_stack.push(MarkedContentFrame {
+                start_idx: idx,
+                has_actual_text_like_key: false,
+                any_removed: false,
+            }),
+            "EMC" => {
+                if let Some(frame) = mc_stack.pop() {
+                    if frame.has_actual_text_like_key && frame.any_removed {
+                        keep[frame.start_idx..=idx].fill(false);
+                        redacted_anything = true;
+                        if let Some(parent) = mc_stack.last_mut() {
+                            parent.any_removed = true;
                         }
                     }
                 }
@@ -571,5 +690,63 @@ mod tests {
         let target = Rect::new(0.0, 0.0, 10.0, 10.0);
         let err = redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap_err();
         assert!(err.contains("images en ligne"));
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #4 : un `Tj` retiré à l'intérieur d'un bloc
+    /// de contenu marqué `/ActualText` doit faire retirer le bloc entier
+    /// (`BDC`..`EMC`), sinon la valeur `/ActualText` — qui porte le vrai
+    /// texte indépendamment du glyphe affiché — resterait dans le flux.
+    #[test]
+    fn removes_the_whole_marked_content_block_when_its_actual_text_leaks() {
+        let doc = empty_doc();
+        let content = b"BT /F1 12 Tf 100 100 Td /Span << /ActualText (secret) >> BDC (x) Tj EMC ET";
+        let target = Rect::new(90.0, 90.0, 300.0, 120.0);
+        let (out, redacted) =
+            redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap();
+        assert!(redacted);
+        assert!(!out.windows(6).any(|w| w == b"secret"));
+        assert!(!out.windows(2).any(|w| w == b"Tj"));
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #4 : `sh` (ombrage sur le clip courant) n'a
+    /// pas de zone occupée calculable sans suivi du clip — toujours retiré
+    /// plutôt que conservé par défaut (fail-open).
+    #[test]
+    fn removes_shading_operator_by_default() {
+        let doc = empty_doc();
+        let content = b"q 0 0 100 100 re W n /Sh0 sh Q";
+        let target = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let (out, redacted) =
+            redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap();
+        assert!(redacted);
+        assert!(!out.windows(2).any(|w| w == b"sh"));
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #4 : un `Do` dont `xobject_bbox` ne peut pas
+    /// être déterminé (ressource introuvable) doit faire échouer l'opération,
+    /// pas la laisser passer silencieusement (fail-open).
+    #[test]
+    fn rejects_a_do_operator_with_unknown_xobject() {
+        let doc = empty_doc();
+        let content = b"/Missing Do";
+        let target = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let err = redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap_err();
+        assert!(err.contains("Missing"));
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #16 : la séquence d'octets "BI" apparaissant
+    /// dans une chaîne de texte (ou tout autre contexte qui n'est pas
+    /// l'opérateur `BI` d'une vraie image inline) ne doit plus faire échouer
+    /// le caviardage — seule une véritable instruction `BI` doit le faire
+    /// (voir `refuses_pages_with_inline_images` ci-dessus).
+    #[test]
+    fn does_not_reject_the_literal_bytes_bi_inside_unrelated_content() {
+        let doc = empty_doc();
+        let content = b"BT /F1 12 Tf 700 700 Td (BIENVENUE) Tj ET";
+        let target = Rect::new(0.0, 0.0, 10.0, 10.0); // hors zone du texte
+        let (out, redacted) =
+            redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap();
+        assert!(!redacted);
+        assert!(out.windows(2).any(|w| w == b"Tj"));
     }
 }

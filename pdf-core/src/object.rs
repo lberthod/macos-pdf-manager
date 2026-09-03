@@ -35,6 +35,10 @@ impl Dictionary {
         self.0.insert(key.into(), value);
     }
 
+    pub fn remove(&mut self, key: &str) -> Option<Object> {
+        self.0.remove(key)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&Name, &Object)> {
         self.0.iter()
     }
@@ -124,7 +128,9 @@ impl Object {
         };
         if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
             let units: Vec<u16> = bytes[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             return Some(

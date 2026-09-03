@@ -6,12 +6,18 @@ use crate::filters::decode_stream;
 use crate::object::{Dictionary, ObjRef, Object};
 use crate::parser::Parser;
 use crate::writer::{write_indirect_object, write_object};
-use crate::xref::{find_startxref_offset, parse_xref_chain, XrefEntry, XrefTable};
+use crate::xref::{find_startxref_offset, parse_xref_chain, XrefEntry, XrefKind, XrefTable};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 pub struct Document {
-    data: Vec<u8>,
+    /// `Arc<[u8]>` plutôt que `Vec<u8>` (AUDIT_FIXES_2026-09-03.md O1) : les
+    /// octets d'origine sont en pratique lus une fois puis partagés entre
+    /// plusieurs `Document` sur le même fichier (`pdf_app::Session::doc` et
+    /// `pdf_edit::EditSession::doc` en particulier) — un `Arc` permet à
+    /// l'appelant de cloner la référence (O(1)) plutôt que le contenu.
+    data: Arc<[u8]>,
     xref: XrefTable,
     trailer: Dictionary,
     cache: RefCell<BTreeMap<u32, Object>>,
@@ -23,6 +29,10 @@ pub struct Document {
     /// compressé dans lui-même (ou un cycle A→B→A), ce qui bouclerait
     /// indéfiniment sans cette détection (stack overflow, DoS).
     resolving_streams: RefCell<HashSet<u32>>,
+    /// Forme (classique ou flux) de la section xref la plus récente du
+    /// document tel qu'ouvert — voir `XrefKind` et `save_incremental`
+    /// (AUDIT_FIXES_2026-09-03.md #14).
+    xref_kind: XrefKind,
 }
 
 impl Document {
@@ -33,7 +43,7 @@ impl Document {
     /// `open_with_password` — celui-ci renvoie `PdfError::IncorrectPassword`
     /// plutôt qu'un succès trompeur (voir la doc de module de `crypt` pour
     /// le bug que ça corrigeait avant le Sprint 58, `audit50quest.md` #50).
-    pub fn open(data: Vec<u8>) -> Result<Self> {
+    pub fn open(data: impl Into<Arc<[u8]>>) -> Result<Self> {
         Self::open_with_password(data, b"")
     }
 
@@ -42,8 +52,15 @@ impl Document {
     /// 32000-1 §7.6.4.3.2 ; en pratique un mot de passe ASCII simple couvre
     /// la quasi-totalité des cas réels, pas de conversion d'encodage faite
     /// ici). Sans effet sur un document non chiffré.
-    pub fn open_with_password(data: Vec<u8>, password: &[u8]) -> Result<Self> {
-        let (xref, trailer) = parse_xref_chain(&data)?;
+    ///
+    /// `data: impl Into<Arc<[u8]>>` accepte aussi bien un `Vec<u8>` que
+    /// tout simplement un `Arc<[u8]>` — pour ce dernier cas, l'appelant
+    /// (typiquement `pdf_app::Session::open_with_password`) peut cloner la
+    /// référence plutôt que le contenu pour ouvrir plusieurs `Document` sur
+    /// les mêmes octets (AUDIT_FIXES_2026-09-03.md O1).
+    pub fn open_with_password(data: impl Into<Arc<[u8]>>, password: &[u8]) -> Result<Self> {
+        let data = data.into();
+        let (xref, trailer, xref_kind) = parse_xref_chain(&data)?;
         let mut doc = Self {
             data,
             xref,
@@ -51,6 +68,7 @@ impl Document {
             cache: RefCell::new(BTreeMap::new()),
             decryption: None,
             resolving_streams: RefCell::new(HashSet::new()),
+            xref_kind,
         };
 
         if let Some(encrypt_obj) = doc.trailer.get("Encrypt").cloned() {
@@ -91,6 +109,16 @@ impl Document {
 
     pub fn object_count(&self) -> usize {
         self.xref.entries.len()
+    }
+
+    /// Vrai si le document a un dictionnaire `/Encrypt` (chiffrement RC4/AES,
+    /// quel que soit le mot de passe utilisé pour l'ouvrir). `save_incremental`
+    /// écrit les nouveaux objets en clair sans mettre à jour `/Encrypt`/`/ID` :
+    /// tant que ça n'est pas corrigé (AUDIT_FIXES_2026-09-03.md #6), l'édition
+    /// d'un document chiffré doit être refusée en amont plutôt que produire un
+    /// fichier corrompu ou une perte silencieuse des modifications.
+    pub fn is_encrypted(&self) -> bool {
+        self.decryption.is_some()
     }
 
     /// Octets bruts du fichier tel qu'ouvert (avant toute résolution
@@ -253,7 +281,11 @@ impl Document {
             .cloned()
             .ok_or_else(|| PdfError::MissingKey("Root".into()))?;
 
-        let mut out = self.data.clone();
+        // `to_vec()`, pas `self.data.clone()` : `data` est un `Arc<[u8]>`
+        // (partagé, immuable) depuis AUDIT_FIXES_2026-09-03.md O1 — cloner
+        // l'`Arc` ne donnerait qu'une référence de plus, pas un tampon
+        // mutable dans lequel ajouter les nouveaux objets ci-dessous.
+        let mut out = self.data.to_vec();
         if !out.ends_with(b"\n") {
             out.push(b'\n');
         }
@@ -265,42 +297,128 @@ impl Document {
         }
         offsets.sort_by_key(|(num, _)| *num);
 
-        let xref_offset = out.len();
-        out.extend_from_slice(b"xref\n");
-        let mut i = 0;
-        while i < offsets.len() {
-            let mut j = i;
-            while j + 1 < offsets.len() && offsets[j + 1].0 == offsets[j].0 + 1 {
-                j += 1;
-            }
-            let start_num = offsets[i].0;
-            let count = j - i + 1;
-            out.extend_from_slice(format!("{start_num} {count}\n").as_bytes());
-            for entry in &offsets[i..=j] {
-                // Format ISO 32000-1 §7.5.4 : 10 chiffres, espace, 5
-                // chiffres, espace, 'n', espace, fin de ligne (20 octets) —
-                // notre propre parseur ne l'exige pas (il tokenise plutôt
-                // que de lire à largeur fixe) mais d'autres lecteurs si.
-                out.extend_from_slice(format!("{:010} 00000 n \n", entry.1).as_bytes());
-            }
-            i = j + 1;
-        }
-
         let max_existing = self.xref.entries.keys().copied().max().unwrap_or(0);
         let max_new = offsets.last().map(|(num, _)| *num).unwrap_or(0);
-        let size = max_existing.max(max_new) + 1;
 
-        let mut trailer_dict = Dictionary::new();
-        trailer_dict.insert("Size", Object::Integer(size as i64));
-        trailer_dict.insert("Root", root_obj);
-        trailer_dict.insert("Prev", Object::Integer(prev_offset as i64));
+        match self.xref_kind {
+            XrefKind::Classic => {
+                let xref_offset = out.len();
+                out.extend_from_slice(b"xref\n");
+                for (start_num, group) in xref_row_groups(&offsets) {
+                    out.extend_from_slice(format!("{start_num} {}\n", group.len()).as_bytes());
+                    for &(_, offset) in group {
+                        // Format ISO 32000-1 §7.5.4 : 10 chiffres, espace, 5
+                        // chiffres, espace, 'n', espace, fin de ligne (20
+                        // octets) — notre propre parseur ne l'exige pas (il
+                        // tokenise plutôt que de lire à largeur fixe) mais
+                        // d'autres lecteurs si.
+                        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+                    }
+                }
 
-        out.extend_from_slice(b"trailer\n");
-        write_object(&Object::Dictionary(trailer_dict), &mut out);
-        out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+                let size = max_existing.max(max_new) + 1;
+                let mut trailer_dict = Dictionary::new();
+                trailer_dict.insert("Size", Object::Integer(size as i64));
+                trailer_dict.insert("Root", root_obj);
+                trailer_dict.insert("Prev", Object::Integer(prev_offset as i64));
+                self.copy_id_and_info(&mut trailer_dict);
+
+                out.extend_from_slice(b"trailer\n");
+                write_object(&Object::Dictionary(trailer_dict), &mut out);
+                out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+            }
+            XrefKind::Stream => {
+                // ISO 32000-1 §7.5.8 : une mise à jour incrémentale d'un
+                // document dont la dernière section xref est déjà un flux
+                // doit elle-même être un flux, pas une table classique
+                // chaînée par `/Prev` vers un flux (AUDIT_FIXES_2026-09-03.md
+                // #14) — tolérée par notre propre parseur, mais pas garantie
+                // par la spec, et refusée/« réparée » par des lecteurs
+                // stricts.
+                let xref_obj_num = max_existing.max(max_new) + 1;
+                let size = xref_obj_num + 1;
+
+                let xref_offset = out.len();
+                let mut all_offsets = offsets;
+                all_offsets.push((xref_obj_num, xref_offset));
+
+                let mut index = Vec::new();
+                let mut raw = Vec::new();
+                for (start_num, group) in xref_row_groups(&all_offsets) {
+                    index.push(Object::Integer(start_num as i64));
+                    index.push(Object::Integer(group.len() as i64));
+                    for &(_, offset) in group {
+                        raw.push(1u8); // type 1 : objet non compressé, offset direct.
+                        raw.extend_from_slice(&(offset as u32).to_be_bytes());
+                        raw.extend_from_slice(&0u16.to_be_bytes()); // génération 0.
+                    }
+                }
+
+                let mut xref_dict = Dictionary::new();
+                xref_dict.insert("Type", Object::Name("XRef".to_string()));
+                xref_dict.insert(
+                    "W",
+                    Object::Array(vec![
+                        Object::Integer(1),
+                        Object::Integer(4),
+                        Object::Integer(2),
+                    ]),
+                );
+                xref_dict.insert("Index", Object::Array(index));
+                xref_dict.insert("Size", Object::Integer(size as i64));
+                xref_dict.insert("Root", root_obj);
+                xref_dict.insert("Prev", Object::Integer(prev_offset as i64));
+                self.copy_id_and_info(&mut xref_dict);
+                xref_dict.insert("Length", Object::Integer(raw.len() as i64));
+
+                write_indirect_object(
+                    xref_obj_num,
+                    0,
+                    &Object::Stream(crate::object::Stream {
+                        dict: xref_dict,
+                        raw_data: raw,
+                    }),
+                    &mut out,
+                );
+                out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+            }
+        }
 
         Ok(out)
     }
+
+    /// Recopie `/ID` et `/Info` du trailer fusionné (voir `parse_xref_chain`)
+    /// vers `dict`, s'ils sont présents — un lecteur strict peut exiger `/ID`
+    /// sur toute mise à jour incrémentale (AUDIT_FIXES_2026-09-03.md #14) ;
+    /// ne régénère pas le second élément d'`/ID` (recommandé par ISO 32000-1
+    /// §14.4 à chaque révision, mais pas requis, et hors périmètre de ce
+    /// correctif — voir sa doc).
+    fn copy_id_and_info(&self, dict: &mut Dictionary) {
+        if let Some(id) = self.trailer.get("ID") {
+            dict.insert("ID", id.clone());
+        }
+        if let Some(info) = self.trailer.get("Info") {
+            dict.insert("Info", info.clone());
+        }
+    }
+}
+
+/// Groupe `offsets` (déjà trié par numéro d'objet) en plages contiguës,
+/// telles qu'attendues par une section xref classique (`N count`) ou l'entrée
+/// `/Index` d'un flux xref — factorisé entre les deux formats
+/// (`save_incremental`).
+fn xref_row_groups(offsets: &[(u32, usize)]) -> Vec<(u32, &[(u32, usize)])> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < offsets.len() {
+        let mut j = i;
+        while j + 1 < offsets.len() && offsets[j + 1].0 == offsets[j].0 + 1 {
+            j += 1;
+        }
+        groups.push((offsets[i].0, &offsets[i..=j]));
+        i = j + 1;
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -368,12 +486,13 @@ mod tests {
             },
         );
         let doc = Document {
-            data: Vec::new(),
+            data: Arc::from(Vec::new()),
             xref,
             trailer: Dictionary::new(),
             cache: RefCell::new(BTreeMap::new()),
             decryption: None,
             resolving_streams: RefCell::new(HashSet::new()),
+            xref_kind: XrefKind::Classic,
         };
 
         let err = doc.resolve(ObjRef::new(5, 0)).unwrap_err();
@@ -400,12 +519,13 @@ mod tests {
             },
         );
         let doc = Document {
-            data: Vec::new(),
+            data: Arc::from(Vec::new()),
             xref,
             trailer: Dictionary::new(),
             cache: RefCell::new(BTreeMap::new()),
             decryption: None,
             resolving_streams: RefCell::new(HashSet::new()),
+            xref_kind: XrefKind::Classic,
         };
 
         let err = doc.resolve(ObjRef::new(1, 0)).unwrap_err();
@@ -469,6 +589,70 @@ mod tests {
         assert_eq!(marker_ref, new_ref);
         let marker_value = reopened.resolve(marker_ref).unwrap();
         assert_eq!(marker_value.as_int(), Some(999));
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #14 : une sauvegarde incrémentale sur un
+    /// document dont la dernière section xref est déjà un flux (`/Type
+    /// /XRef`) doit elle-même écrire un flux xref — pas une table classique
+    /// chaînée par `/Prev` vers un flux, tolérée par notre propre parseur
+    /// mais pas garantie par ISO 32000-1 §7.5.8.
+    #[test]
+    fn save_incremental_on_an_xref_stream_document_writes_another_xref_stream() {
+        let original = include_bytes!("../tests/fixtures/multipage_xref_stream.pdf").to_vec();
+        let doc = Document::open(original.clone()).unwrap();
+        let next_num = doc.next_free_object_num();
+
+        let new_bytes = doc
+            .save_incremental(&[(ObjRef::new(next_num, 0), Object::Integer(42))])
+            .unwrap();
+        assert!(new_bytes.starts_with(&original));
+
+        // La dernière section (`startxref`) doit pointer sur un objet
+        // `<< /Type /XRef ... >>`, pas sur le mot-clé `xref` d'une table
+        // classique. `find_startxref_offset` renvoie déjà l'entier lu après
+        // le mot-clé `startxref` (l'offset visé), pas la position du
+        // mot-clé lui-même.
+        let xref_offset = find_startxref_offset(&new_bytes).unwrap();
+        let tail = &new_bytes[xref_offset..];
+        let tail_str = String::from_utf8_lossy(&tail[..tail.len().min(200)]);
+        assert!(
+            tail_str.contains("/Type") && tail_str.contains("/XRef"),
+            "the last xref section must be a stream object, got: {tail_str:?}"
+        );
+
+        let reopened = Document::open(new_bytes).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), doc.page_count().unwrap());
+        assert!(
+            reopened.trailer.get("ID").is_some(),
+            "the merged trailer must still carry /ID after an incremental save"
+        );
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md O1 : `Document::open`/`open_with_password`
+    /// accepte un `Arc<[u8]>` déjà construit par l'appelant (pas seulement
+    /// un `Vec<u8>` fraîchement lu) — condition nécessaire pour que
+    /// `pdf_app::Session` puisse ouvrir son propre `Document` et celui
+    /// d'`EditSession` sur les *mêmes* octets sans les dupliquer. Vérifié
+    /// ici par `Arc::strong_count` : deux `Document` construits à partir de
+    /// clones du même `Arc` doivent tous deux garder la référence en vie,
+    /// pas en faire chacun une copie indépendante.
+    #[test]
+    fn open_shares_the_underlying_bytes_via_arc_rather_than_copying() {
+        let bytes: Arc<[u8]> = minimal_pdf().into();
+        assert_eq!(Arc::strong_count(&bytes), 1);
+
+        let doc1 = Document::open(bytes.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&bytes), 2);
+
+        let doc2 = Document::open(bytes.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&bytes), 3);
+
+        assert_eq!(doc1.page_count().unwrap(), doc2.page_count().unwrap());
+
+        drop(doc1);
+        assert_eq!(Arc::strong_count(&bytes), 2);
+        drop(doc2);
+        assert_eq!(Arc::strong_count(&bytes), 1);
     }
 
     #[test]

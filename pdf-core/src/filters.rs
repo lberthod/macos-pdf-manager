@@ -53,12 +53,29 @@ pub fn decode_stream(stream: &Stream) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Taille maximale (en octets) qu'un unique étage de décodage (`flate_decode`,
+/// et par construction toute la chaîne : `decode_stream` rappelle chaque
+/// filtre séparément, donc ce plafond s'applique à *chaque* étage) s'autorise
+/// à produire. Une "bombe Flate" (quelques Ko forgés qui décompressent en
+/// plusieurs Go) épuiserait sinon la mémoire disponible à partir d'un fichier
+/// minuscule (AUDIT_FIXES_2026-09-03.md #11).
+const MAX_DECODED_LEN: u64 = 256 * 1024 * 1024;
+
 fn flate_decode(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(data);
+    // `take(MAX_DECODED_LEN + 1)` plutôt que `MAX_DECODED_LEN` : sans le `+1`,
+    // un flux dont la sortie fait exactement la taille limite s'arrêterait
+    // silencieusement à la limite sans qu'on puisse distinguer "juste assez
+    // gros" de "tronqué parce que trop gros".
+    let mut decoder = ZlibDecoder::new(data).take(MAX_DECODED_LEN + 1);
     let mut out = Vec::new();
     decoder
         .read_to_end(&mut out)
         .map_err(|e| PdfError::DecodeError(format!("FlateDecode: {e}")))?;
+    if out.len() as u64 > MAX_DECODED_LEN {
+        return Err(PdfError::DecodeError(
+            "FlateDecode: decoded stream too large".to_string(),
+        ));
+    }
     Ok(out)
 }
 
@@ -265,9 +282,38 @@ fn apply_predictor(data: &[u8], parms: &Dictionary) -> Result<Vec<u8>> {
         .unwrap_or(8) as usize;
     let columns = parms.get("Columns").and_then(|o| o.as_int()).unwrap_or(1) as usize;
 
+    // Bornes de sanité (AUDIT_FIXES_2026-09-03.md #11) : sans elles,
+    // `/Columns` absurdement grand (ex. `1 << 40`) fait déborder
+    // `columns * bits_per_pixel` (`checked_mul` ci-dessous le rejette plutôt
+    // que de paniquer en debug ou de silencieusement wrapper en release) et
+    // allouer un `row_bytes`/`prev_row` de plusieurs To. Aucun flux réel
+    // n'a besoin de plus de 64 composantes, un `/BitsPerComponent` hors de
+    // l'ensemble ISO 32000-1 §7.4.4.3 `{1,2,4,8,16}`, ou plus d'un million de
+    // colonnes (~4 Go par ligne 4 composantes/16 bits, déjà bien au-delà de
+    // tout usage réel).
+    if !(1..=64).contains(&colors) {
+        return Err(PdfError::DecodeError(format!(
+            "predictor: unsupported /Colors {colors}"
+        )));
+    }
+    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
+        return Err(PdfError::DecodeError(format!(
+            "predictor: unsupported /BitsPerComponent {bpc}"
+        )));
+    }
+    const MAX_COLUMNS: usize = 1 << 20;
+    if columns > MAX_COLUMNS {
+        return Err(PdfError::DecodeError(format!(
+            "predictor: /Columns {columns} exceeds the {MAX_COLUMNS} limit"
+        )));
+    }
+
     let bits_per_pixel = colors * bpc;
     let bytes_per_pixel = bits_per_pixel.div_ceil(8).max(1);
-    let row_bytes = (columns * bits_per_pixel).div_ceil(8);
+    let row_bits = columns
+        .checked_mul(bits_per_pixel)
+        .ok_or_else(|| PdfError::DecodeError("predictor: row size overflow".to_string()))?;
+    let row_bytes = row_bits.div_ceil(8);
 
     if predictor == 2 {
         return Ok(tiff_predictor(data, row_bytes, bytes_per_pixel));
@@ -361,6 +407,49 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let decoded = flate_decode(&compressed).unwrap();
         assert_eq!(decoded, b"Hello, PDF!");
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #11 : une "bombe Flate" (quelques Ko qui
+    /// décompressent en plusieurs centaines de Mo) doit échouer vite et sans
+    /// épuiser la mémoire disponible, pas décompresser jusqu'au bout.
+    #[test]
+    fn flate_decode_rejects_a_decompression_bomb() {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        // 300 Mo de zéros compressent à un ratio > 1000:1 (quelques centaines
+        // de Ko) — bien au-dessus de `MAX_DECODED_LEN` (256 Mo) une fois
+        // décompressés, à partir d'un fichier minuscule.
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..300 {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        assert!(
+            compressed.len() < 2_000_000,
+            "fixture should compress well, got {} bytes",
+            compressed.len()
+        );
+
+        let result = flate_decode(&compressed);
+        assert!(
+            result.is_err(),
+            "a 300 MiB decompression bomb must be rejected"
+        );
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #11 : `/Columns` absurdement grand (ici
+    /// proche d'`u64::MAX` une fois multiplié par `/BitsPerComponent`) ne
+    /// doit ni paniquer (débordement arithmétique) ni tenter d'allouer un
+    /// `row_bytes`/`prev_row` de plusieurs To.
+    #[test]
+    fn apply_predictor_rejects_absurd_columns_without_overflow_or_huge_allocation() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(15));
+        parms.insert("Colors", Object::Integer(1));
+        parms.insert("BitsPerComponent", Object::Integer(8));
+        parms.insert("Columns", Object::Integer(1 << 40));
+
+        let err = apply_predictor(&[], &parms).unwrap_err();
+        assert!(matches!(err, PdfError::DecodeError(_)));
     }
 
     #[test]

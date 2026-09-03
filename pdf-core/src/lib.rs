@@ -7,6 +7,7 @@
 //! streams (PDF 1.5+), filtres autres que ceux listés dans `filters`,
 //! interpréteur de flux de contenu, rendu, polices, édition.
 
+pub mod atomic_write;
 pub mod content;
 pub mod crypt;
 pub mod display;
@@ -26,6 +27,7 @@ pub mod signature;
 pub mod writer;
 pub mod xref;
 
+pub use atomic_write::write_atomic;
 pub use document::Document;
 pub use error::{PdfError, Result};
 pub use object::{Dictionary, Name, ObjRef, Object, Stream};

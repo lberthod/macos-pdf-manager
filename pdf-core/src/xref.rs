@@ -22,6 +22,21 @@ pub struct XrefTable {
     pub entries: BTreeMap<u32, XrefEntry>,
 }
 
+/// Forme de la section xref la plus récente d'un document (celle visée par
+/// `startxref`, avant de suivre `/Prev`) — `pub(crate)` : sert à
+/// `Document::save_incremental` (AUDIT_FIXES_2026-09-03.md #14) pour décider
+/// s'il faut chaîner une nouvelle section classique ou un nouveau flux xref
+/// (`/Type /XRef`). ISO 32000-1 §7.5.8 attend un flux xref pour toute mise à
+/// jour d'un document qui en utilise déjà un : une section classique
+/// chaînée par `/Prev` vers un flux xref est certes tolérée en lecture par
+/// la plupart des lecteurs (dont le nôtre), mais pas garantie par la spec,
+/// et refusée ou "réparée" par des lecteurs stricts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XrefKind {
+    Classic,
+    Stream,
+}
+
 /// Cherche `startxref` en partant de la fin du fichier et lit l'offset qui
 /// suit. `pub(crate)` : réutilisé par `document::save_incremental` (Sprint
 /// 13-14) pour retrouver l'offset auquel chaîner via `/Prev` la nouvelle
@@ -47,9 +62,13 @@ pub(crate) fn find_startxref_offset(data: &[u8]) -> Result<usize> {
 /// Parse la table xref (classique ou stream) à l'offset donné, en suivant
 /// les chaînes `/Prev` (et `/XRefStm` pour les mises à jour hybrides) pour
 /// les mises à jour incrémentales.
-pub fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
+pub(crate) fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary, XrefKind)> {
     let Ok(start_offset) = find_startxref_offset(data) else {
-        return reconstruct_by_scan(data);
+        return reconstruct_by_scan(data).map(|(t, d)| (t, d, XrefKind::Classic));
+    };
+    let kind = match Lexer::with_pos(data, start_offset).next_token() {
+        Ok(Some(Token::Keyword(kw))) if kw == "xref" => XrefKind::Classic,
+        _ => XrefKind::Stream,
     };
     let mut table = XrefTable::default();
     let mut trailer = Dictionary::new();
@@ -83,10 +102,10 @@ pub fn parse_xref_chain(data: &[u8]) -> Result<(XrefTable, Dictionary)> {
     }
 
     if table.entries.is_empty() {
-        return reconstruct_by_scan(data);
+        return reconstruct_by_scan(data).map(|(t, d)| (t, d, XrefKind::Classic));
     }
 
-    Ok((table, trailer))
+    Ok((table, trailer, kind))
 }
 
 /// Distingue une section xref classique (`xref` ... `trailer`) d'un

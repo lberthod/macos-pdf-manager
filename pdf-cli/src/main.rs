@@ -6,6 +6,10 @@ use std::fs;
 use std::process::ExitCode;
 
 fn print_usage() {
+    // AUDIT_FIXES_2026-09-03.md #18 : toute commande qui écrit un `<out...>`
+    // ci-dessous l'écrase sans confirmation si le fichier existe déjà — pas
+    // de `--force` requis, et pas de sauvegarde de l'ancien contenu.
+    eprintln!("note: any <out...> argument below is overwritten without confirmation if it already exists");
     eprintln!("usage: pdf-cli dump <file.pdf>");
     eprintln!("       pdf-cli render-info <file.pdf> [page_index]");
     eprintln!("       pdf-cli render <file.pdf> <out.png> [page_index]");
@@ -286,7 +290,7 @@ fn run_split_args(args: &[String]) -> Option<pdf_core::Result<()>> {
             let bytes = fs::read(input).map_err(|e| e.to_string())?;
             let doc = Document::open(bytes).map_err(|e| e.to_string())?;
             let extracted = pdf_edit::extract_pages(&doc, &indices)?;
-            fs::write(out, extracted).map_err(|e| e.to_string())?;
+            pdf_core::write_atomic(out, &extracted).map_err(|e| e.to_string())?;
             println!(
                 "Extracted {} page(s) from {input}, saved to {out}",
                 indices.len()
@@ -304,7 +308,7 @@ fn run_optimize(input: &str, out: &str) -> Result<(), String> {
     let bytes = fs::read(input).map_err(|e| e.to_string())?;
     let doc = Document::open(bytes).map_err(|e| e.to_string())?;
     let optimized = pdf_edit::export_optimized(&doc)?;
-    fs::write(out, optimized).map_err(|e| e.to_string())?;
+    pdf_core::write_atomic(out, &optimized).map_err(|e| e.to_string())?;
     println!("Optimized {input}, saved to {out}");
     Ok(())
 }
@@ -548,6 +552,19 @@ fn run_verify_signatures(path: &str) -> pdf_core::Result<()> {
             pdf_core::SignatureStatus::Malformed => {
                 println!(
                     "  Status: MALFORMED — /Contents is not a valid detached PKCS#7 signature"
+                );
+            }
+            pdf_core::SignatureStatus::ModifiedAfterSigning => {
+                println!(
+                    "  Status: SIGNED, THEN MODIFIED — an incremental update was appended after \
+                     signing; the originally signed content is intact, but the file no longer \
+                     matches what was signed"
+                );
+            }
+            pdf_core::SignatureStatus::CoversPartialFile => {
+                println!(
+                    "  Status: INVALID — /ByteRange does not cover the whole file as expected \
+                     (forged or unsupported)"
                 );
             }
         }

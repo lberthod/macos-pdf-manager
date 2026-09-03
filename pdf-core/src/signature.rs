@@ -136,6 +136,22 @@ pub enum SignatureStatus {
     /// `/Contents` n'a pas pu être décodé comme PKCS#7/CMS détaché valide
     /// (fichier corrompu, ou gestionnaire de signature non standard).
     Malformed,
+    /// Le hachage sur `/ByteRange` est cohérent (voir `Valid`), mais
+    /// `/ByteRange` ne couvre pas tout le fichier jusqu'à `%%EOF` : une mise
+    /// à jour incrémentale a été ajoutée après la signature (page modifiée,
+    /// champ de formulaire, JavaScript…) — l'« incremental saving attack »
+    /// classique contre les vérificateurs qui ne confrontent `/ByteRange` qu'à
+    /// lui-même (AUDIT_FIXES_2026-09-03.md #7). Le contenu signé à l'origine
+    /// est resté intact ; c'est ce qui a été *ajouté après* qui n'est pas
+    /// couvert par la signature.
+    ModifiedAfterSigning,
+    /// `/ByteRange` ne couvre pas la forme attendue « tout le fichier sauf
+    /// `/Contents` » (ne commence pas à l'offset 0, le "trou" ne correspond
+    /// pas exactement à la chaîne hexadécimale `/Contents`, ou saute une
+    /// portion du fichier) — trop suspect pour être traité comme
+    /// `ModifiedAfterSigning` : refuse de prétendre à une intégrité qui n'a
+    /// pas pu être établie sur la forme attendue.
+    CoversPartialFile,
 }
 
 impl Document {
@@ -239,11 +255,90 @@ impl SignatureField {
     }
 }
 
+/// Tolérance en octets de fin de ligne après la fin nominale de la seconde
+/// plage de `/ByteRange` — un fichier légitime se termine généralement par
+/// `%%EOF` suivi de `\r\n`/`\n`, que `/ByteRange` n'inclut pas toujours selon
+/// l'outil de signature.
+const TRAILING_WHITESPACE_TOLERANCE: usize = 2;
+
+/// Confronte `/ByteRange` à la taille réelle du fichier et à la forme
+/// attendue "tout le fichier sauf la chaîne hexadécimale `/Contents`"
+/// (AUDIT_FIXES_2026-09-03.md #7) — sans ça, seules les deux plages déclarées
+/// sont hachées : rien n'empêche une mise à jour incrémentale ajoutée après
+/// coup de rester non détectée, ou `/ByteRange` de sauter une portion du
+/// milieu du fichier. Renvoie `Some(status)` si `byte_range` est rejeté à ce
+/// stade (avant même de tenter de décoder `/Contents`), `None` s'il a la
+/// forme attendue et que la vérification cryptographique peut se poursuivre.
+fn check_byte_range_covers_the_file(
+    byte_range: &[(usize, usize); 2],
+    document_bytes: &[u8],
+) -> Option<SignatureStatus> {
+    let (a0, l0) = byte_range[0];
+    let (a1, l1) = byte_range[1];
+    let total_len = document_bytes.len();
+
+    if a0 != 0 {
+        return Some(SignatureStatus::CoversPartialFile);
+    }
+    let Some(gap_start) = a0.checked_add(l0) else {
+        return Some(SignatureStatus::Malformed);
+    };
+    if gap_start > a1 {
+        return Some(SignatureStatus::CoversPartialFile);
+    }
+    let Some(end) = a1.checked_add(l1) else {
+        return Some(SignatureStatus::Malformed);
+    };
+    if end > total_len {
+        return Some(SignatureStatus::CoversPartialFile);
+    }
+    if end < total_len {
+        let trailing = &document_bytes[end..total_len];
+        let within_tolerance = total_len - end <= TRAILING_WHITESPACE_TOLERANCE
+            && trailing.iter().all(|b| b.is_ascii_whitespace());
+        if !within_tolerance {
+            return Some(SignatureStatus::ModifiedAfterSigning);
+        }
+    }
+
+    let Some(hole) = document_bytes.get(gap_start..a1) else {
+        return Some(SignatureStatus::Malformed);
+    };
+    if !hole_is_a_plausible_contents_placeholder(hole) {
+        return Some(SignatureStatus::CoversPartialFile);
+    }
+
+    None
+}
+
+/// Vrai si `hole` (les octets entre les deux plages de `/ByteRange`) a la
+/// forme d'une chaîne hexadécimale PDF délimitée par `<`/`>` ne contenant que
+/// des chiffres hexadécimaux et des blancs — la forme attendue pour
+/// `/Contents` lui-même, jamais retrouvée si une mise à jour incrémentale a
+/// inséré un autre objet entre les deux plages couvertes.
+fn hole_is_a_plausible_contents_placeholder(hole: &[u8]) -> bool {
+    let Some((&first, rest)) = hole.split_first() else {
+        return false;
+    };
+    let Some((&last, inner)) = rest.split_last() else {
+        return false;
+    };
+    first == b'<'
+        && last == b'>'
+        && inner
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() || b.is_ascii_whitespace())
+}
+
 fn verify_pkcs7_detached(
     contents: &[u8],
     document_bytes: &[u8],
     byte_range: &[(usize, usize); 2],
 ) -> SignatureStatus {
+    if let Some(status) = check_byte_range_covers_the_file(byte_range, document_bytes) {
+        return status;
+    }
+
     let Some(total) = der_object_len(contents) else {
         return SignatureStatus::Malformed;
     };
@@ -471,17 +566,78 @@ mod tests {
     /// données venant du fichier).
     #[test]
     fn verify_rejects_truncated_contents_without_panicking() {
-        let field = SignatureField {
-            field_name: "X".to_string(),
-            signer_name: None,
-            reason: None,
-            location: None,
-            signing_time: None,
-            contents: vec![0x30, 0x03], // en-tête SEQUENCE annonçant 3 octets, aucun.
-            byte_range: [(0, 1), (0, 1)],
-        };
         let bytes = include_bytes!("../tests/fixtures/signed_document.pdf").to_vec();
         let doc = Document::open(bytes).unwrap();
+        // Un `/ByteRange` valide (repris du fixture réellement signé) : ce
+        // test cible spécifiquement la robustesse de `der_object_len` face à
+        // un `/Contents` tronqué, pas la validation de `/ByteRange` (voir
+        // `verify_rejects_a_forged_byte_range_that_skips_part_of_the_file`
+        // pour celle-ci).
+        let real_field = doc.signature_fields().unwrap().into_iter().next().unwrap();
+        let field = SignatureField {
+            contents: vec![0x30, 0x03], // en-tête SEQUENCE annonçant 3 octets, aucun.
+            ..real_field
+        };
         assert_eq!(field.verify(&doc), SignatureStatus::Malformed);
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #7 : une mise à jour incrémentale ajoutée
+    /// après une signature valide (JavaScript, champ modifié…) ne doit plus
+    /// être rapportée `Valid` — seules les deux plages déclarées par
+    /// `/ByteRange` étaient jusqu'ici hachées, sans jamais être confrontées à
+    /// la taille réelle du fichier.
+    #[test]
+    fn verify_detects_an_incremental_update_appended_after_signing() {
+        let bytes = include_bytes!("../tests/fixtures/signed_document.pdf").to_vec();
+        let doc = Document::open(bytes.clone()).unwrap();
+        let field = doc.signature_fields().unwrap().into_iter().next().unwrap();
+
+        // Un ajout incrémental minimal (n'importe quel objet suffit : c'est
+        // sa seule présence après la fin couverte par `/ByteRange` qui doit
+        // être détectée, pas son contenu).
+        let mut appended = bytes.clone();
+        appended.extend_from_slice(
+            b"\n999 0 obj\n<< /Type /Catalog >>\nendobj\nxref\n0 1\n0000000000 65535 f \n\
+              trailer\n<< /Size 1 >>\nstartxref\n0\n%%EOF\n",
+        );
+        let modified_doc = Document::open(appended).unwrap();
+
+        assert_eq!(
+            field.verify(&modified_doc),
+            SignatureStatus::ModifiedAfterSigning
+        );
+        // Le fichier d'origine, lui, reste intact.
+        assert_eq!(
+            field.verify(&doc),
+            SignatureStatus::Valid {
+                signer: Some("Test Signer".to_string())
+            }
+        );
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #7 : un `/ByteRange` forgé qui saute une
+    /// portion du milieu du fichier (au lieu de couvrir tout sauf
+    /// `/Contents`) ne doit pas non plus être traité comme une simple
+    /// modification a posteriori (`ModifiedAfterSigning`) — la forme même de
+    /// `/ByteRange` est suspecte, pas seulement son étendue.
+    #[test]
+    fn verify_rejects_a_forged_byte_range_that_skips_part_of_the_file() {
+        let bytes = include_bytes!("../tests/fixtures/signed_document.pdf").to_vec();
+        let doc = Document::open(bytes).unwrap();
+        let real_field = doc.signature_fields().unwrap().into_iter().next().unwrap();
+
+        let [(a0, l0), (a1, l1)] = real_field.byte_range;
+        // Réduit la première plage de 100 octets sans toucher à la seconde :
+        // le "trou" entre les deux plages n'est alors plus exactement la
+        // chaîne hexadécimale `/Contents`, mais englobe aussi 100 octets de
+        // contenu réel du fichier.
+        let forged_field = SignatureField {
+            byte_range: [(a0, l0.saturating_sub(100)), (a1, l1)],
+            ..real_field
+        };
+        assert_eq!(
+            forged_field.verify(&doc),
+            SignatureStatus::CoversPartialFile
+        );
     }
 }

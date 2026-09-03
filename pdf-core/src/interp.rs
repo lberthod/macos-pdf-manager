@@ -1358,7 +1358,7 @@ mod tests {
         // (voir pdf-core/tests/fixtures/README.md) : le canal alpha ne doit
         // donc pas être resté à 255 partout (ce qui indiquerait que le
         // /SMask a été ignoré).
-        let alphas: Vec<u8> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
+        let alphas: Vec<u8> = image.rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
         assert!(alphas.iter().any(|&a| a < 250));
     }
 

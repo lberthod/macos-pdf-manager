@@ -19,8 +19,30 @@
 //! - La rotation de page (`/Rotate`, voir `render_page_rotated`) est
 //!   appliquée en aval de la rasterisation via une matrice, pas nativement
 //!   par tiny-skia.
+//! - Pas de mode de fusion (`/BM`, ISO 32000-1 §11.3.5) autre que
+//!   source-over — un vrai lecteur applique `Multiply` pour les surlignages,
+//!   par exemple (voir `pdf-edit::EditSession::add_highlight_annotation`,
+//!   qui compense par une opacité constante plutôt qu'un vrai mode de
+//!   fusion, approximation documentée là).
+//! - Pas de traits pointillés (`Stroke` ne porte jamais de motif `d0`/`d1`)
+//!   ni d'ombrages/motifs (`sh`, `/Pattern` — absents de `DisplayItem`, donc
+//!   jamais émis par l'interpréteur en amont).
+//! - Modes de rendu de texte (`Tr`, ISO 32000-1 §9.3.3) non distingués :
+//!   `DisplayItem::Glyph` n'a pas de champ `render_mode`, donc `Tr 3`
+//!   (invisible — très courant sur une couche de texte OCR superposée à une
+//!   image scannée) et `Tr 7` (clip only) sont peints comme `Tr 0` (rempli),
+//!   au lieu de ne rien peindre — AUDIT_FIXES_2026-09-03.md #20 identifie
+//!   `Tr 3` comme la priorité pour une future passe (impact visible direct :
+//!   texte OCR qui apparaît par-dessus l'image qu'il est censé décrire).
 
 use std::rc::Rc;
+
+/// Nombre maximal de pixels (largeur × hauteur) qu'un rendu s'autorise à
+/// allouer. Un `/MediaBox` forgé (ex. 100000×100000) ferait sinon tenter une
+/// allocation de plusieurs dizaines de Go — `Pixmap::new` ne peut pas
+/// détecter l'échec d'une telle allocation par avance. ≈ 7000×7000, largement
+/// suffisant pour un A0 à 200 dpi.
+pub const MAX_RENDER_PIXELS: u64 = 50_000_000;
 
 use pdf_core::display::{
     ClipStack, Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp,
@@ -73,6 +95,9 @@ pub fn render_page_rotated(
     };
     let width = out_w.round().max(1.0) as u32;
     let height = out_h.round().max(1.0) as u32;
+    if (width as u64) * (height as u64) > MAX_RENDER_PIXELS {
+        return None;
+    }
 
     // Espace utilisateur PDF (origine bas-gauche) -> espace "device" non
     // pivoté (origine haut-gauche, taille de page) -> espace pixmap final
@@ -314,11 +339,11 @@ fn draw_image(
 /// Convertit du RGBA8 "straight" en prémultiplié (format attendu par
 /// `tiny_skia::Pixmap`/`PixmapRef`), sans copie si l'image est déjà opaque.
 fn premultiply_if_needed(rgba: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if rgba.chunks_exact(4).all(|p| p[3] == 255) {
+    if rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255) {
         return std::borrow::Cow::Borrowed(rgba);
     }
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         let a = pixel[3] as u32;
         pixel[0] = ((pixel[0] as u32 * a) / 255) as u8;
         pixel[1] = ((pixel[1] as u32 * a) / 255) as u8;
@@ -847,5 +872,15 @@ mod tests {
             ),
             (255, 255, 255)
         );
+    }
+
+    /// Une `/MediaBox` forgée à 100000×100000 pt demanderait un pixmap de
+    /// plusieurs dizaines de Go sans le plafond `MAX_RENDER_PIXELS` : doit
+    /// échouer proprement (`None`), pas tenter l'allocation.
+    #[test]
+    fn huge_media_box_is_rejected_instead_of_allocating_gigabytes() {
+        let display = DisplayList { items: vec![] };
+        let result = render_page(&display, [0.0, 0.0, 100_000.0, 100_000.0]);
+        assert!(result.is_none());
     }
 }

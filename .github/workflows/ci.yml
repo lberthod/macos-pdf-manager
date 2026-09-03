@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Hebdomadaire (AUDIT_FIXES_2026-09-03.md #18) : le fuzzing n'était
+    # jusqu'ici jamais exécuté en continu, seulement à la main.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +18,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -25,3 +30,33 @@ jobs:
         run: cargo build --workspace
       - name: Test
         run: cargo test --workspace
+
+  audit:
+    runs-on: macos-latest
+    # Non-bloquant pour l'instant (voir AUDIT_FIXES_2026-09-03.md #17) :
+    # à rendre bloquant une fois les avertissements connus triés.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  fuzz:
+    # Uniquement sur le déclencheur planifié (et manuel) : un run de fuzzing
+    # de plusieurs minutes n'a pas sa place sur chaque push/PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz parse_document (10 min)
+        run: cargo +nightly fuzz run parse_document -- -max_total_time=600
+        working-directory: fuzz
+      - name: Fuzz render_document (5 min)
+        run: cargo +nightly fuzz run render_document -- -max_total_time=300
+        working-directory: fuzz

@@ -141,6 +141,12 @@ impl GpuRenderer {
         GpuRenderer(GpuContext { device, queue })
     }
 
+    /// Même garde que `pdf_render::MAX_RENDER_PIXELS` (pas de dépendance
+    /// entre les deux crates de rendu pour une seule constante) : un
+    /// `/MediaBox` forgé ferait sinon demander une texture GPU de
+    /// plusieurs dizaines de Go, ou dépassant les limites du device.
+    pub const MAX_RENDER_PIXELS: u64 = 50_000_000;
+
     pub fn render_page(&self, display: &DisplayList, media_box: [f64; 4]) -> Option<RenderedPage> {
         self.render_page_scaled(display, media_box, 1.0)
     }
@@ -174,6 +180,13 @@ impl GpuRenderer {
         } else {
             (unrotated_w, unrotated_h)
         };
+        if (width as u64) * (height as u64) > Self::MAX_RENDER_PIXELS {
+            return None;
+        }
+        let max_dim = self.0.device.limits().max_texture_dimension_2d;
+        if width > max_dim || height > max_dim {
+            return None;
+        }
 
         self.0.render(display, media_box, rotate, width, height)
     }
@@ -751,6 +764,14 @@ impl GpuContext {
         // chaque passe.
         const SAMPLE_COUNT: u32 = 4;
 
+        // Une texture qui dépasse les limites du device (après le contrôle
+        // de `MAX_RENDER_PIXELS` et `max_texture_dimension_2d` dans
+        // `render_page_rotated`, mais en dernier recours pour tout autre cas
+        // de validation wgpu) déclenche par défaut un panic via
+        // `on_uncaptured_error`. Capturer l'erreur de validation ici la
+        // transforme en `None` côté appelant.
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pdf-render-gpu-target"),
             size: wgpu::Extent3d {
@@ -805,6 +826,10 @@ impl GpuContext {
             view_formats: &[],
         });
         let stencil_view = stencil.create_view(&wgpu::TextureViewDescriptor::default());
+
+        if pollster::block_on(self.device.pop_error_scope()).is_some() {
+            return None;
+        }
 
         let solid_shader = self
             .device

@@ -64,6 +64,13 @@ fn write_dictionary(dict: &Dictionary, out: &mut Vec<u8>) {
     out.extend_from_slice(b" >>");
 }
 
+/// Chiffres hexadécimaux majuscules — AUDIT_FIXES_2026-09-03.md O2 :
+/// `write_name`/`write_hex_string` formataient un `format!("{b:02X}")` (donc
+/// une `String` allouée) par octet ; sensible pour les flux d'apparence et
+/// les chaînes UTF-16 longues, et pour `export_optimized` qui réécrit tout
+/// le fichier. Une table de correspondance directe évite l'allocation.
+const HEX: [u8; 16] = *b"0123456789ABCDEF";
+
 fn write_name(name: &str, out: &mut Vec<u8>) {
     out.push(b'/');
     for &b in name.as_bytes() {
@@ -76,7 +83,9 @@ fn write_name(name: &str, out: &mut Vec<u8>) {
         if is_regular {
             out.push(b);
         } else {
-            out.extend_from_slice(format!("#{b:02X}").as_bytes());
+            out.push(b'#');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0x0f) as usize]);
         }
     }
 }
@@ -84,7 +93,8 @@ fn write_name(name: &str, out: &mut Vec<u8>) {
 fn write_hex_string(bytes: &[u8], out: &mut Vec<u8>) {
     out.push(b'<');
     for &b in bytes {
-        out.extend_from_slice(format!("{b:02X}").as_bytes());
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
     }
     out.push(b'>');
 }

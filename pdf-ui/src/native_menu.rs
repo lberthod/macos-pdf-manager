@@ -67,6 +67,12 @@ pub enum MenuCommand {
     /// n'a plus le même sens que fermer *l'onglet actif*. `performClose:`
     /// reste disponible sur `⇧⌘W` pour fermer réellement la fenêtre.
     CloseTab,
+    /// "Quitter PapyrusPDF" (`⌘Q`, AUDIT_FIXES_2026-09-03.md #8) — routé vers
+    /// une cible réelle plutôt que le `terminate:` standard de `NSApplication`
+    /// (cible `nil`), pour que `ViewerApp::update` puisse d'abord vérifier
+    /// s'il reste des éditions non enregistrées et proposer la même invite
+    /// de confirmation que pour fermer un onglet.
+    Quit,
 }
 
 struct MenuTargetIvars {
@@ -121,6 +127,11 @@ define_class!(
         fn close_tab(&self, _sender: Option<&AnyObject>) {
             let _ = self.ivars().sender.send(MenuCommand::CloseTab);
         }
+
+        #[unsafe(method(quitApp:))]
+        fn quit_app(&self, _sender: Option<&AnyObject>) {
+            let _ = self.ivars().sender.send(MenuCommand::Quit);
+        }
     }
 );
 
@@ -153,7 +164,7 @@ impl NativeMenu {
         let app = NSApplication::sharedApplication(mtm);
         let main_menu = NSMenu::new(mtm);
 
-        main_menu.addItem(&app_menu_item(mtm));
+        main_menu.addItem(&app_menu_item(mtm, target_obj));
         main_menu.addItem(&file_menu_item(mtm, target_obj));
         main_menu.addItem(&edit_menu_item(mtm, target_obj));
         main_menu.addItem(&view_menu_item(mtm, target_obj));
@@ -203,16 +214,17 @@ fn item_with_action(
     item
 }
 
-fn app_menu_item(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+fn app_menu_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuItem> {
     let submenu = NSMenu::new(mtm);
-    // Cible `None` : "terminate:" est envoyé le long de la chaîne de
-    // répondeurs, `NSApplication` (en bout de chaîne) l'implémente déjà.
+    // Cible réelle plutôt que `terminate:`/`nil` (voir la doc de
+    // `MenuCommand::Quit`) : `ViewerApp::update` doit pouvoir vérifier les
+    // éditions non enregistrées avant de laisser le processus se terminer.
     submenu.addItem(&item_with_action(
         mtm,
         "Quitter PapyrusPDF",
-        sel!(terminate:),
+        sel!(quitApp:),
         "q",
-        None,
+        Some(target),
     ));
     let item = NSMenuItem::new(mtm);
     item.setSubmenu(Some(&submenu));

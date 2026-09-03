@@ -1,0 +1,14 @@
+# Config de `cargo audit` — reprend les mêmes exceptions que `deny.toml` à
+# la racine (voir ses commentaires pour la justification de chaque entrée,
+# AUDIT_FIXES_2026-09-03.md #17). `cargo audit` ne lit pas `deny.toml`
+# (format propre à `cargo-deny`), d'où ce fichier séparé.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0257",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0192",
+]

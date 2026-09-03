@@ -1,0 +1,64 @@
+# cargo-deny configuration — AUDIT_FIXES_2026-09-03.md #17.
+#
+# `cargo audit`/`cargo deny check` ne sont pas encore bloquants en CI (voir
+# le job `audit`, non bloquant, dans .github/workflows/ci.yml) : ce fichier
+# documente les avisories connues et pourquoi elles ne sont pas jugées
+# exploitables dans le contexte de cette app, plutôt que de les faire
+# disparaître silencieusement d'un futur `cargo deny check` bloquant.
+#
+# Revoir cette liste à chaque mise à jour de `Cargo.lock` qui touche l'une de
+# ces crates, et à chaque montée de version majeure des dépendances GUI
+# (`eframe`/`egui`/`wgpu`) qui purgerait probablement plusieurs de ces
+# transitives d'un coup.
+
+[advisories]
+ignore = [
+    # RSA (rsa 0.9.10, via pdf-core::signature) : timing side-channel sur le
+    # déchiffrement RSA. Ce moteur n'utilise `rsa` que pour la
+    # *vérification* de signature (opération publique), jamais pour
+    # déchiffrer avec une clé privée — le vecteur d'attaque décrit ne
+    # s'applique pas. Pas de correctif publié à ce jour.
+    "RUSTSEC-2023-0071",
+
+    # quick-xml (deux versions coexistent, tirées par des dépendances macOS
+    # de la chaîne GUI eframe/egui — pas de code de ce projet ne parse de
+    # XML avec quick-xml). DoS par entrée hostile : hors de portée, ce
+    # projet ne fait jamais passer de contenu PDF/utilisateur non fiable par
+    # ce chemin.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # webbrowser (via egui-winit -> eframe) : injection d'argument via la
+    # variable d'environnement $BROWSER sur Unix. Jamais invoqué par ce
+    # projet (aucun lien "ouvrir dans le navigateur"), et $BROWSER n'est de
+    # toute façon jamais sous contrôle d'un PDF ouvert.
+    "RUSTSEC-2026-0257",
+
+    # paste (proc-macro, via metal -> wgpu-hal, backend GPU macOS) : non
+    # maintenue mais purement compile-time (génération de noms), aucune
+    # exécution ni surface d'attaque à l'exécution.
+    "RUSTSEC-2024-0436",
+
+    # ttf-parser (deux versions : une directe de pdf-core::font pour le
+    # parsing de polices intégrées, une transitive via ab_glyph/epaint pour
+    # le rendu de texte egui) : signalée non maintenue, pas une
+    # vulnérabilité connue. À surveiller — c'est la seule de cette liste
+    # directement dans le chemin d'analyse de contenu PDF non fiable.
+    "RUSTSEC-2026-0192",
+]
+
+# `cms` (0.3.0-pre.2, pdf-core::signature) est en pré-version : seule
+# exception assumée à la préférence pour des crates stables (voir la doc de
+# module de `pdf-core::signature`), faute d'alternative mature pour
+# CMS/PKCS#7 en Rust pur. Pas une entrée `ignore` (pas d'avisory connue),
+# juste à repasser en revue quand une version stable sort.
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CC0-1.0"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

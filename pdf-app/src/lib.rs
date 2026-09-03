@@ -182,16 +182,24 @@ impl Session {
         password: &[u8],
     ) -> Result<Self, SessionOpenError> {
         let path = path.into();
-        let bytes = std::fs::read(&path).map_err(|e| SessionOpenError::Other(e.to_string()))?;
-        let doc = Document::open_with_password(bytes, password).map_err(|e| match e {
+        // Lu une seule fois, partagé (via `Arc<[u8]>`, voir
+        // `pdf_core::Document`) entre `doc` et `edit.document()` plutôt que
+        // relu du disque et copié une seconde fois pour `EditSession` — deux
+        // `Document` indépendants sur le même fichier gardaient jusqu'ici
+        // chacun leur propre copie complète des octets en mémoire
+        // (AUDIT_FIXES_2026-09-03.md O1).
+        let bytes: std::sync::Arc<[u8]> = std::fs::read(&path)
+            .map_err(|e| SessionOpenError::Other(e.to_string()))?
+            .into();
+        let doc = Document::open_with_password(bytes.clone(), password).map_err(|e| match e {
             PdfError::IncorrectPassword => SessionOpenError::IncorrectPassword,
             other => SessionOpenError::Other(other.to_string()),
         })?;
         let page_count = doc
             .page_count()
             .map_err(|e| SessionOpenError::Other(e.to_string()))?;
-        let edit = pdf_edit::EditSession::open_with_password(&path, password)
-            .map_err(SessionOpenError::Other)?;
+        let edit =
+            pdf_edit::EditSession::from_bytes(bytes, password).map_err(SessionOpenError::Other)?;
         Ok(Self {
             doc,
             path,
@@ -303,7 +311,9 @@ impl Session {
             None => {
                 let pixmap =
                     pdf_render::render_page_rotated(&display, page.media_box, page.rotate, scale)
-                        .ok_or_else(|| "render target allocation failed".to_string())?;
+                        .ok_or_else(|| {
+                        "page too large to render (media box exceeds render limits)".to_string()
+                    })?;
                 RenderedPage {
                     width: pixmap.width(),
                     height: pixmap.height(),
@@ -435,6 +445,23 @@ impl Session {
         self.edit.can_redo()
     }
 
+    /// Refuse toute opération d'édition sur un document chiffré : la
+    /// sauvegarde incrémentale (`Document::save_incremental`) écrit les
+    /// nouveaux objets en clair sans mettre à jour `/Encrypt`/`/ID`, ce qui
+    /// corrompt silencieusement le fichier (voir
+    /// AUDIT_FIXES_2026-09-03.md #6). À retirer quand le rechiffrement des
+    /// objets ajoutés sera implémenté ; le viewer (lecture seule) reste
+    /// fonctionnel entre-temps, seule l'édition est bloquée ici.
+    fn reject_if_encrypted(&self) -> Result<(), String> {
+        if self.doc.is_encrypted() {
+            return Err(
+                "l'édition d'un PDF chiffré n'est pas encore prise en charge ; exportez d'abord une copie déchiffrée"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Ajoute une annotation `/Highlight` sur la page courante (voir
     /// `pdf_edit::EditSession::add_highlight_annotation`) et rafraîchit
     /// immédiatement le rendu pour qu'elle soit visible sans sauvegarder.
@@ -443,6 +470,7 @@ impl Session {
         rect: [f64; 4],
         color: (f32, f32, f32),
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit
             .add_highlight_annotation(self.page_index, rect, color, vec![])?;
         self.refresh_after_edit()
@@ -457,6 +485,7 @@ impl Session {
         font_size: f64,
         color: (f32, f32, f32),
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit
             .add_free_text_annotation(self.page_index, rect, text, font_size, color)?;
         self.refresh_after_edit()
@@ -469,6 +498,7 @@ impl Session {
         rect: [f64; 4],
         color: (f32, f32, f32),
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit
             .add_underline_annotation(self.page_index, rect, color)?;
         self.refresh_after_edit()
@@ -481,6 +511,7 @@ impl Session {
         rect: [f64; 4],
         color: (f32, f32, f32),
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit
             .add_strikeout_annotation(self.page_index, rect, color)?;
         self.refresh_after_edit()
@@ -498,6 +529,7 @@ impl Session {
         text_color: (f32, f32, f32),
         background: (f32, f32, f32),
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.replace_text_with_overlay(
             self.page_index,
             rect,
@@ -516,6 +548,7 @@ impl Session {
     /// usage). Marque la session pour que `save_edits_in_place` bascule sur
     /// `EditSession::save_redacted` (voir sa doc).
     pub fn redact_on_current_page(&mut self, rect: [f64; 4]) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.redact_region(self.page_index, rect)?;
         self.has_redaction = true;
         self.refresh_after_edit()
@@ -529,6 +562,7 @@ impl Session {
         annot_index: usize,
         new_rect: [f64; 4],
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit
             .set_annotation_rect(self.page_index, annot_index, new_rect)?;
         self.refresh_after_edit()
@@ -544,6 +578,7 @@ impl Session {
         color: (f32, f32, f32),
         opacity: f64,
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit
             .set_annotation_style(self.page_index, annot_index, color, opacity)?;
         self.refresh_after_edit()
@@ -552,6 +587,7 @@ impl Session {
     /// Retire l'annotation d'indice `annot_index` de la page courante (voir
     /// `pdf_edit::EditSession::remove_annotation`) et rafraîchit le rendu.
     pub fn remove_annotation_on_current_page(&mut self, annot_index: usize) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.remove_annotation(self.page_index, annot_index)?;
         self.refresh_after_edit()
     }
@@ -665,6 +701,7 @@ impl Session {
         field_name: &str,
         value: &str,
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.set_form_field_value(field_name, value)?;
         self.refresh_after_edit()
     }
@@ -707,6 +744,7 @@ impl Session {
         field_name: &str,
         checked: bool,
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.set_checkbox_field_value(field_name, checked)?;
         self.refresh_after_edit()
     }
@@ -759,6 +797,7 @@ impl Session {
         field_name: &str,
         option_index: usize,
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.set_radio_group_value(field_name, option_index)?;
         self.refresh_after_edit()
     }
@@ -800,6 +839,7 @@ impl Session {
         field_name: &str,
         option_index: usize,
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.set_choice_field_value(field_name, option_index)?;
         self.refresh_after_edit()
     }
@@ -809,6 +849,7 @@ impl Session {
     /// la page courante si le document en a au moins une, sinon une page
     /// Lettre US par défaut (612×792pt).
     pub fn insert_blank_page_at(&mut self, at_index: usize) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         let media_box = self
             .current_page_media_box()
             .unwrap_or([0.0, 0.0, 612.0, 792.0]);
@@ -824,12 +865,14 @@ impl Session {
         at_index: usize,
         jpeg_bytes: &[u8],
     ) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.insert_image_page(at_index, jpeg_bytes)?;
         self.refresh_after_edit()
     }
 
     /// Supprime la page `index` (voir `pdf_edit::EditSession::delete_page`).
     pub fn delete_page_at(&mut self, index: usize) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.delete_page(index)?;
         self.refresh_after_edit()
     }
@@ -838,6 +881,7 @@ impl Session {
     /// `pdf_edit::EditSession::move_page`) — utilisé par le glisser-déposer
     /// des miniatures.
     pub fn move_page(&mut self, from: usize, to: usize) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.move_page(from, to)?;
         self.refresh_after_edit()
     }
@@ -846,6 +890,7 @@ impl Session {
     /// page `index` (voir `pdf_edit::EditSession::rotate_page` — distinct
     /// d'une rotation de vue éphémère, qui n'existe pas dans ce viewer).
     pub fn rotate_page_at(&mut self, index: usize, delta: i32) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         self.edit.rotate_page(index, delta)?;
         self.refresh_after_edit()
     }
@@ -854,6 +899,7 @@ impl Session {
     /// document courant (voir `pdf_edit::EditSession::merge_document`) —
     /// ouvre `source_path` en lecture seule, ne modifie jamais ce fichier.
     pub fn merge_document_from_path(&mut self, source_path: &Path) -> Result<(), String> {
+        self.reject_if_encrypted()?;
         let bytes = std::fs::read(source_path).map_err(|e| e.to_string())?;
         let source = Document::open(bytes).map_err(|e| e.to_string())?;
         self.edit.merge_document(&source)?;
@@ -866,7 +912,7 @@ impl Session {
     /// au "découper"/"extraire une sélection de pages".
     pub fn extract_pages_to_file(&self, indices: &[usize], dest: &Path) -> Result<(), String> {
         let bytes = pdf_edit::extract_pages(&self.doc, indices)?;
-        std::fs::write(dest, bytes).map_err(|e| e.to_string())
+        pdf_core::write_atomic(dest, &bytes).map_err(|e| e.to_string())
     }
 
     /// Défait la dernière opération d'édition et rafraîchit le rendu.
@@ -895,12 +941,21 @@ impl Session {
     /// `Document::save_incremental`), seulement complété, mais du point de
     /// vue de l'utilisateur c'est bien la même session de fichier qui est
     /// mise à jour.
-    pub fn save_edits_in_place(&self) -> Result<(), String> {
+    pub fn save_edits_in_place(&mut self) -> Result<(), String> {
         if self.has_redaction {
             self.edit.save_redacted(&self.path)
         } else {
             self.edit.save_as(&self.path)
         }
+    }
+
+    /// Vrai s'il y a des éditions non enregistrées depuis la dernière
+    /// `save_edits_in_place` réussie (AUDIT_FIXES_2026-09-03.md #8) — sert à
+    /// `pdf-ui` pour proposer une invite de confirmation avant de fermer un
+    /// onglet ou de quitter l'application plutôt que de perdre les
+    /// modifications en attente silencieusement.
+    pub fn is_dirty(&self) -> bool {
+        self.edit.is_dirty()
     }
 
     /// Octets du document courant, éditions en attente incluses (voir
@@ -1095,6 +1150,50 @@ mod tests {
         assert_eq!(session.page_count(), 1);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #6, temps 1 : tant que `save_incremental` ne
+    /// rechiffre pas les objets ajoutés, toute tentative d'édition d'un PDF
+    /// chiffré doit échouer explicitement (`Err`) plutôt que produire une
+    /// perte silencieuse — le viewer (lecture, navigation) doit rester
+    /// utilisable en parallèle.
+    #[test]
+    fn editing_an_encrypted_document_is_rejected_but_viewing_still_works() {
+        for (fixture, password) in [
+            ("encrypted_rc4.pdf", &b""[..]),
+            ("encrypted_aes256.pdf", &b""[..]),
+            ("encrypted_user_password.pdf", &b"secret123"[..]),
+        ] {
+            let bytes = match fixture {
+                "encrypted_rc4.pdf" => {
+                    include_bytes!("../../pdf-core/tests/fixtures/encrypted_rc4.pdf").to_vec()
+                }
+                "encrypted_aes256.pdf" => {
+                    include_bytes!("../../pdf-core/tests/fixtures/encrypted_aes256.pdf").to_vec()
+                }
+                _ => include_bytes!("../../pdf-core/tests/fixtures/encrypted_user_password.pdf")
+                    .to_vec(),
+            };
+            let path = write_fixture(&bytes);
+            let mut session = Session::open_with_password(&path, password)
+                .unwrap_or_else(|e| panic!("{fixture}: should open: {e:?}"));
+
+            let err = session
+                .add_highlight_on_current_page([50.0, 50.0, 300.0, 100.0], (1.0, 1.0, 0.0))
+                .expect_err(&format!("{fixture}: editing should be rejected"));
+            assert!(
+                err.contains("chiffré"),
+                "{fixture}: unexpected message: {err}"
+            );
+
+            // Le viewer reste fonctionnel : la page se rend toujours.
+            let rendered = session
+                .render_current_page(1.0)
+                .unwrap_or_else(|e| panic!("{fixture}: render should still work: {e}"));
+            assert!(rendered.width > 0 && rendered.height > 0);
+
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
@@ -1397,6 +1496,39 @@ mod tests {
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(annots, 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #8 : `is_dirty()` doit refléter s'il y a
+    /// des éditions non enregistrées **depuis la dernière sauvegarde**, pas
+    /// juste "y a-t-il quelque chose dans la pile d'undo" — d'où le cas
+    /// `undo` après une sauvegarde, qui doit redevenir sale (l'état sur
+    /// disque ne correspond plus à l'état en mémoire, même si on vient de
+    /// défaire une édition déjà persistée).
+    #[test]
+    fn is_dirty_tracks_unsaved_edits_across_save_and_undo() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+        let mut session = Session::open(&path).unwrap();
+
+        assert!(!session.is_dirty(), "freshly opened session must be clean");
+
+        session
+            .add_highlight_on_current_page([100.0, 600.0, 300.0, 630.0], (1.0, 1.0, 0.0))
+            .unwrap();
+        assert!(session.is_dirty(), "an edit must mark the session dirty");
+
+        session.save_edits_in_place().unwrap();
+        assert!(!session.is_dirty(), "saving must clear the dirty flag");
+
+        assert!(session.undo_edit().unwrap());
+        assert!(
+            session.is_dirty(),
+            "undoing an already-saved edit must mark the session dirty again \
+             (the on-disk state no longer matches memory)"
+        );
 
         std::fs::remove_file(&path).ok();
     }

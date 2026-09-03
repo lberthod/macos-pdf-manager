@@ -16,6 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Loïc Berthod"]
+rust-version = "1.98"
 
 [workspace.dependencies]
 pdf-core = { path = "pdf-core" }

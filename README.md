@@ -30,12 +30,12 @@ Le `.dmg` et l'app qu'il contient sont **signés (Developer ID Application) et n
 - **Manipuler les pages** : réordonner par glisser-déposer, supprimer, pivoter, insérer (page vierge, image JPEG, autre PDF), fusionner un document, extraire une sélection de pages vers un nouveau fichier.
 - **Imprimer** : délégation à Aperçu (dialogue système, aperçu, sélection de pages).
 - **Onglets multi-documents** : plusieurs PDF ouverts dans une seule fenêtre.
-- **Ouvrir des PDF chiffrés** (mot de passe utilisateur vide ou réel, avec fenêtre de saisie) : RC4, AES-128 et AES-256 gérés.
+- **Ouvrir des PDF chiffrés** (mot de passe utilisateur vide ou réel, avec fenêtre de saisie) : RC4, AES-128 et AES-256 gérés. L'édition (annoter, manipuler les pages…) d'un PDF chiffré n'est en revanche pas encore prise en charge — la visionneuse reste utilisable, mais toute tentative d'édition est refusée explicitement plutôt que de risquer une perte silencieuse.
 - **Vérifier une signature numérique** (`/Sig`, PKCS#7/CMS détaché) : intégrité cryptographique du contenu signé, détection d'une modification après signature — pas de chaîne de confiance/révocation.
 
 > ⚠️ L'édition chirurgicale du texte existant (modifier un glyphe déjà présent dans le flux de contenu, plutôt que le masquer et le redessiner par superposition) reste hors périmètre : un PDF est une description de rendu (glyphes positionnés), pas un format éditable — voir [architecture.md](./architecture.md#73-édition-du-texte-existant--le-vrai-défi) pour le détail de cette limite et l'approche par phases retenue.
 
-Ce qui ne fonctionne pas encore : Quick Look, formes/notes, production de signature (la vérification, elle, est faite — voir ci-dessus), Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, accessibilité VoiceOver du contenu de page. Voir [architecture.md](./architecture.md) pour la cible et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour le détail du fonctionnement interne.
+Ce qui ne fonctionne pas encore : Quick Look, formes/notes, production de signature (la vérification, elle, est faite — voir ci-dessus), Type1 historique (police pré-CFF), images CCITT/JBIG2/JPX, accessibilité VoiceOver du contenu de page. Côté rendu (`pdf-render`) : pas de mode de fusion autre que source-over, pas de traits pointillés, pas d'ombrages/motifs (`sh`/`/Pattern`), et les modes de rendu de texte (`Tr`) ne sont pas distingués — un `Tr 3` (texte invisible, courant sur une couche OCR) est donc peint au lieu de rester invisible. Voir [architecture.md](./architecture.md) pour la cible et [docs/EXPLICATION.md](./docs/EXPLICATION.md) pour le détail du fonctionnement interne.
 
 ## Structure du projet
 

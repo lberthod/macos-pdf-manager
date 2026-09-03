@@ -121,6 +121,11 @@ faite côté application (pas la barre native macOS) :
 - Testé bout en bout, y compris au niveau des octets bruts du fichier
   sauvegardé (pas seulement en reparsant normalement) : voir
   `pdf-edit/src/lib.rs::redact_region_actually_removes_the_underlying_text`.
+- `redact_region` retire aussi toute annotation dont `/Rect` intersecte la
+  zone (`/FreeText`, widgets de formulaire remplis, liens…), le contenu
+  marqué porteur d'un `/ActualText`/`/Alt`/`/E`/`/Lang` (accessibilité, OCR
+  taggé) et l'opérateur `sh` (ombrage) — voir AUDIT_FIXES_2026-09-03.md #3
+  et #4.
 
 Reste : le nettoyage des métadonnées/XMP (`/Info`, `/Metadata`) n'est pas
 fait — documenté comme limite connue, pas encore un chantier engagé — et

@@ -16,6 +16,11 @@ pub struct ContentInstruction {
     pub operands: Vec<Object>,
 }
 
+/// Même garde que `pdf_core::parser::MAX_OBJECT_DEPTH` : les opérandes d'un
+/// flux de contenu sont aussi des tableaux/dictionnaires imbriquables, donc
+/// vulnérables au même débordement de pile qu'un objet COS forgé.
+const MAX_OBJECT_DEPTH: usize = 256;
+
 /// Parse un flux de contenu déjà décodé (post-filtres) en une suite
 /// d'instructions. Tolérant : une image inline (`BI`...`ID`...`EI`) est
 /// repérée et ses données binaires sautées plutôt que décodées (le décodage
@@ -32,6 +37,19 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<ContentInstruction>> {
                 "false" => operands.push(Object::Boolean(false)),
                 "null" => operands.push(Object::Null),
                 "BI" => {
+                    // Émettre une instruction `BI` (sans opérande : le
+                    // dictionnaire abrégé et les données binaires ne sont pas
+                    // décodés ici, voir `skip_inline_image`) plutôt que de
+                    // simplement l'avaler : sans ça, aucun consommateur de
+                    // `parse_content_stream` (notamment `pdf-edit::redact`,
+                    // AUDIT_FIXES_2026-09-03.md #16) ne peut détecter la
+                    // présence d'une image inline autrement qu'en rescannant
+                    // les octets bruts, ce qui produit des faux positifs
+                    // (`(BIENVENUE) Tj`, `/GS0BI gs`...).
+                    instructions.push(ContentInstruction {
+                        operator: "BI".to_string(),
+                        operands: Vec::new(),
+                    });
                     skip_inline_image(&mut lexer)?;
                     operands.clear();
                 }
@@ -42,21 +60,21 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<ContentInstruction>> {
                     });
                 }
             },
-            other => operands.push(parse_value_from(&mut lexer, other)?),
+            other => operands.push(parse_value_from(&mut lexer, other, 0)?),
         }
     }
 
     Ok(instructions)
 }
 
-fn parse_value_from(lexer: &mut Lexer, token: Token) -> Result<Object> {
+fn parse_value_from(lexer: &mut Lexer, token: Token, depth: usize) -> Result<Object> {
     match token {
         Token::Integer(n) => Ok(Object::Integer(n)),
         Token::Real(f) => Ok(Object::Real(f)),
         Token::LiteralString(s) | Token::HexString(s) => Ok(Object::String(s)),
         Token::Name(n) => Ok(Object::Name(n)),
-        Token::ArrayStart => parse_array(lexer),
-        Token::DictStart => parse_dict(lexer),
+        Token::ArrayStart => parse_array(lexer, depth),
+        Token::DictStart => parse_dict(lexer, depth),
         Token::Keyword(kw) if kw == "true" => Ok(Object::Boolean(true)),
         Token::Keyword(kw) if kw == "false" => Ok(Object::Boolean(false)),
         Token::Keyword(kw) if kw == "null" => Ok(Object::Null),
@@ -67,7 +85,13 @@ fn parse_value_from(lexer: &mut Lexer, token: Token) -> Result<Object> {
     }
 }
 
-fn parse_array(lexer: &mut Lexer) -> Result<Object> {
+fn parse_array(lexer: &mut Lexer, depth: usize) -> Result<Object> {
+    if depth >= MAX_OBJECT_DEPTH {
+        return Err(PdfError::InvalidObject(
+            lexer.pos(),
+            "nesting too deep".to_string(),
+        ));
+    }
     let mut items = Vec::new();
     loop {
         let Some(token) = lexer.next_token()? else {
@@ -76,12 +100,18 @@ fn parse_array(lexer: &mut Lexer) -> Result<Object> {
         if token == Token::ArrayEnd {
             break;
         }
-        items.push(parse_value_from(lexer, token)?);
+        items.push(parse_value_from(lexer, token, depth + 1)?);
     }
     Ok(Object::Array(items))
 }
 
-fn parse_dict(lexer: &mut Lexer) -> Result<Object> {
+fn parse_dict(lexer: &mut Lexer, depth: usize) -> Result<Object> {
+    if depth >= MAX_OBJECT_DEPTH {
+        return Err(PdfError::InvalidObject(
+            lexer.pos(),
+            "nesting too deep".to_string(),
+        ));
+    }
     let mut dict = Dictionary::new();
     loop {
         let Some(token) = lexer.next_token()? else {
@@ -99,7 +129,7 @@ fn parse_dict(lexer: &mut Lexer) -> Result<Object> {
         let Some(value_token) = lexer.next_token()? else {
             return Err(PdfError::UnexpectedEof(lexer.pos()));
         };
-        let value = parse_value_from(lexer, value_token)?;
+        let value = parse_value_from(lexer, value_token, depth + 1)?;
         dict.insert(key, value);
     }
     Ok(Object::Dictionary(dict))
@@ -192,6 +222,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_deeply_nested_array_operand_instead_of_overflowing_the_stack() {
+        let n = 100_000;
+        let mut data = Vec::with_capacity(n * 2 + 4);
+        data.extend(std::iter::repeat_n(b'[', n));
+        data.push(b'1');
+        data.extend(std::iter::repeat_n(b']', n));
+        data.extend_from_slice(b" d0");
+        let err = parse_content_stream(&data).unwrap_err();
+        assert!(matches!(err, PdfError::InvalidObject(_, _)));
+    }
+
+    #[test]
     fn parses_simple_instructions() {
         let data = b"q 1 0 0 1 72 720 cm 0 0 1 rg 100 200 50 50 re f Q";
         let instrs = parse_content_stream(data).unwrap();
@@ -231,7 +273,7 @@ mod tests {
         data.extend_from_slice(b" EI n");
         let instrs = parse_content_stream(&data).unwrap();
         let ops: Vec<&str> = instrs.iter().map(|i| i.operator.as_str()).collect();
-        assert_eq!(ops, vec!["n"]);
+        assert_eq!(ops, vec!["BI", "n"]);
     }
 
     #[test]
@@ -241,6 +283,6 @@ mod tests {
         data.extend_from_slice(b" EI n");
         let instrs = parse_content_stream(&data).unwrap();
         let ops: Vec<&str> = instrs.iter().map(|i| i.operator.as_str()).collect();
-        assert_eq!(ops, vec!["n"]);
+        assert_eq!(ops, vec!["BI", "n"]);
     }
 }

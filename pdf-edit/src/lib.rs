@@ -37,6 +37,7 @@
 
 use pdf_core::document::Document;
 use pdf_core::object::{Dictionary, ObjRef, Object, Stream};
+use std::collections::HashMap;
 use std::path::Path;
 
 mod redact;
@@ -130,6 +131,10 @@ pub struct EditSession {
     undo_stack: Vec<EditOp>,
     redo_stack: Vec<EditOp>,
     page_tree: Option<PageTreeState>,
+    /// Longueur d'`undo_stack` au moment de la dernière sauvegarde réussie
+    /// (`save_as`/`save_redacted`) — voir `is_dirty`. `0` à l'ouverture,
+    /// avant toute sauvegarde.
+    saved_undo_len: usize,
 }
 
 impl EditSession {
@@ -142,6 +147,20 @@ impl EditSession {
     /// Sans effet sur un document non chiffré.
     pub fn open_with_password(path: impl AsRef<Path>, password: &[u8]) -> Result<Self, String> {
         let data = std::fs::read(path.as_ref()).map_err(|e| e.to_string())?;
+        Self::from_bytes(data, password)
+    }
+
+    /// Comme `open_with_password`, à partir d'octets déjà lus plutôt que
+    /// d'un chemin — `data: impl Into<Arc<[u8]>>` accepte un `Arc<[u8]>`
+    /// déjà construit par l'appelant (AUDIT_FIXES_2026-09-03.md O1) :
+    /// `pdf_app::Session::open_with_password` lit le fichier une seule fois
+    /// et partage cette même référence entre son propre `Document` et celui
+    /// de cette session d'édition, plutôt que de relire le fichier une
+    /// seconde fois et d'en garder une deuxième copie complète en mémoire.
+    pub fn from_bytes(
+        data: impl Into<std::sync::Arc<[u8]>>,
+        password: &[u8],
+    ) -> Result<Self, String> {
         let doc = Document::open_with_password(data, password).map_err(|e| e.to_string())?;
         let next_num = doc.next_free_object_num();
         Ok(Self {
@@ -151,7 +170,20 @@ impl EditSession {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             page_tree: None,
+            saved_undo_len: 0,
         })
+    }
+
+    /// Vrai s'il y a des éditions non enregistrées depuis la dernière
+    /// `save_as`/`save_redacted` réussie (AUDIT_FIXES_2026-09-03.md #8) : la
+    /// longueur d'`undo_stack` a changé depuis — que ce soit par une
+    /// nouvelle édition (elle grandit) ou par un `undo` d'une édition déjà
+    /// sauvegardée (elle rétrécit, l'état sur disque ne correspond plus non
+    /// plus). Ne détecte que les opérations qui passent par `commit` (voir sa
+    /// doc) ; suffisant en pratique, toute opération visible à l'utilisateur
+    /// en passe.
+    pub fn is_dirty(&self) -> bool {
+        self.undo_stack.len() != self.saved_undo_len
     }
 
     /// Accès en lecture au document sous-jacent — pour inspecter l'état
@@ -830,9 +862,13 @@ impl EditSession {
     /// Remplace entièrement `/Contents` par un unique nouveau flux (plutôt
     /// que de modifier en place un flux existant potentiellement partagé
     /// par tableau) et redessine un rectangle plein par-dessus pour le
-    /// rendu. Échoue sans rien modifier si la page ne contient rien à
-    /// retirer dans `rect`, ou si elle contient une image en ligne — voir
-    /// `redact::redact_content_stream`.
+    /// rendu. Retire aussi toute annotation dont `/Rect` intersecte `rect`
+    /// (annotations `/FreeText`, widgets de formulaire remplis, liens…) —
+    /// leur flux d'apparence (`/AP`) et leur valeur (`/V`) survivraient sinon
+    /// au caviardage du flux de contenu (AUDIT_FIXES_2026-09-03.md #3).
+    /// Échoue sans rien modifier si la page ne contient rien à retirer dans
+    /// `rect` (ni contenu, ni annotation), ou si elle contient une image en
+    /// ligne — voir `redact::redact_content_stream`.
     pub fn redact_region(&mut self, page_index: usize, rect: [f64; 4]) -> Result<(), String> {
         let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
         let page_ref = page
@@ -848,30 +884,43 @@ impl EditSession {
         let target = redact::Rect::new(x0, y0, x1, y1);
 
         let content_bytes = self.doc.page_content(&page).map_err(|e| e.to_string())?;
-        let (mut new_content, redacted_something) =
+        let (mut new_content, redacted_content) =
             redact::redact_content_stream(&self.doc, &content_bytes, &page.resources, target)?;
+
+        // Annotations dont `/Rect` intersecte la cible : sur-suppression
+        // assumée, comme pour le flux de contenu — pas de tentative de
+        // "rogner" une annotation partiellement dans la zone.
+        let annot_refs = self.page_annotation_refs(page_index)?;
+        let mut kept_annot_refs = Vec::new();
+        let mut removed_annot_refs = Vec::new();
+        for r in annot_refs {
+            let obj = self.current(r.num)?;
+            let intersects = obj
+                .as_dict()
+                .and_then(|d| d.get("Rect"))
+                .and_then(|o| o.as_array())
+                .filter(|arr| arr.len() >= 4)
+                .map(|arr| {
+                    redact::Rect::new(num(&arr[0]), num(&arr[1]), num(&arr[2]), num(&arr[3]))
+                        .intersects(&target)
+                })
+                .unwrap_or(false);
+            if intersects {
+                removed_annot_refs.push(r);
+            } else {
+                kept_annot_refs.push(r);
+            }
+        }
+        let redacted_something = redacted_content || !removed_annot_refs.is_empty();
 
         if !redacted_something {
             return Err("aucun contenu trouvé dans cette zone : rien à caviarder".to_string());
         }
 
-        new_content.extend_from_slice(
-            format!(
-                "\nq 0 0 0 rg {x0:.3} {y0:.3} {:.3} {:.3} re f Q",
-                x1 - x0,
-                y1 - y0
-            )
-            .as_bytes(),
-        );
-
-        let content_num = self.alloc_num();
-        self.pending.insert(
-            content_num,
-            Object::Stream(Stream {
-                dict: Dictionary::new(),
-                raw_data: new_content,
-            }),
-        );
+        // Tout regroupé dans un seul `EditOp` (voir sa doc) pour qu'un
+        // `undo` restaure le flux de contenu, `/Annots` et les champs de
+        // formulaire touchés en un seul bloc.
+        let mut modified: Vec<(u32, Object, Object)> = Vec::new();
 
         let page_obj = self.current(page_ref.num)?;
         let mut page_dict = page_obj
@@ -879,11 +928,81 @@ impl EditSession {
             .cloned()
             .ok_or_else(|| "page object is not a dictionary".to_string())?;
         let before_page = Object::Dictionary(page_dict.clone());
-        page_dict.insert("Contents", Object::Reference(ObjRef::new(content_num, 0)));
-        let after_page = Object::Dictionary(page_dict);
-        self.commit(EditOp {
-            modified: vec![(page_ref.num, before_page, after_page)],
-        });
+
+        if redacted_content {
+            new_content.extend_from_slice(
+                format!(
+                    "\nq 0 0 0 rg {x0:.3} {y0:.3} {:.3} {:.3} re f Q",
+                    x1 - x0,
+                    y1 - y0
+                )
+                .as_bytes(),
+            );
+            let content_num = self.alloc_num();
+            self.pending.insert(
+                content_num,
+                Object::Stream(Stream {
+                    dict: Dictionary::new(),
+                    raw_data: new_content,
+                }),
+            );
+            page_dict.insert("Contents", Object::Reference(ObjRef::new(content_num, 0)));
+        }
+
+        if !removed_annot_refs.is_empty() {
+            let new_annots =
+                Object::Array(kept_annot_refs.into_iter().map(Object::Reference).collect());
+            match page_dict.get("Annots").cloned() {
+                Some(Object::Reference(annots_ref)) => {
+                    let before_annots = self.current(annots_ref.num)?;
+                    modified.push((annots_ref.num, before_annots, new_annots));
+                }
+                _ => {
+                    page_dict.insert("Annots", new_annots);
+                }
+            }
+
+            // Un widget de champ AcroForm référence son champ parent via
+            // `/Parent` : retirer aussi la référence au widget dans
+            // `/Kids` du champ, sinon un lecteur remonterait encore au
+            // widget disparu (et à sa valeur `/V`) depuis le champ.
+            let mut field_before: HashMap<u32, Object> = HashMap::new();
+            let mut field_after: HashMap<u32, Object> = HashMap::new();
+            for r in &removed_annot_refs {
+                let obj = self.current(r.num)?;
+                let Some(Object::Reference(parent_ref)) =
+                    obj.as_dict().and_then(|d| d.get("Parent")).cloned()
+                else {
+                    continue;
+                };
+                let current_field = field_after
+                    .get(&parent_ref.num)
+                    .cloned()
+                    .unwrap_or(self.current(parent_ref.num)?);
+                field_before
+                    .entry(parent_ref.num)
+                    .or_insert_with(|| current_field.clone());
+                let Some(field_dict) = current_field.as_dict() else {
+                    continue;
+                };
+                let mut updated_field_dict = field_dict.clone();
+                if let Some(Object::Array(kids)) = updated_field_dict.get("Kids").cloned() {
+                    let new_kids: Vec<Object> = kids
+                        .into_iter()
+                        .filter(|k| k.as_reference() != Some(*r))
+                        .collect();
+                    updated_field_dict.insert("Kids", Object::Array(new_kids));
+                }
+                field_after.insert(parent_ref.num, Object::Dictionary(updated_field_dict));
+            }
+            for (field_num, after) in field_after {
+                let before = field_before.remove(&field_num).unwrap();
+                modified.push((field_num, before, after));
+            }
+        }
+
+        modified.push((page_ref.num, before_page, Object::Dictionary(page_dict)));
+        self.commit(EditOp { modified });
         Ok(())
     }
 
@@ -2033,9 +2152,12 @@ impl EditSession {
         });
 
         let raw_page = source.resolve(src_ref).map_err(|e| e.to_string())?;
+        let raw_page_dict = raw_page
+            .as_dict()
+            .ok_or_else(|| "source page is not a dictionary".to_string())?;
         let copied = copy_object_recursive(
             source,
-            &raw_page,
+            &Object::Dictionary(strip_page_tree_links(raw_page_dict)),
             &mut self.pending,
             &mut self.next_num,
             copy_map,
@@ -2074,8 +2196,10 @@ impl EditSession {
     /// Sauvegarde incrémentale (Sprint 13-14, `Document::save_incremental`)
     /// vers `path` : ajoute tous les objets en attente au fichier original,
     /// sans jamais le modifier en place.
-    pub fn save_as(&self, path: impl AsRef<Path>) -> Result<(), String> {
-        std::fs::write(path, self.to_bytes()?).map_err(|e| e.to_string())
+    pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        pdf_core::write_atomic(path, &self.to_bytes()?).map_err(|e| e.to_string())?;
+        self.saved_undo_len = self.undo_stack.len();
+        Ok(())
     }
 
     /// À utiliser **à la place de** `save_as` après un `redact_region` (voir
@@ -2092,11 +2216,13 @@ impl EditSession {
     /// reconstruction, ne copie que les objets atteignables depuis les
     /// pages) : l'ancien flux, plus référencé par aucune page, n'est simplement
     /// jamais copié dans la sortie.
-    pub fn save_redacted(&self, path: impl AsRef<Path>) -> Result<(), String> {
+    pub fn save_redacted(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
         let incremental = self.to_bytes()?;
         let reopened = Document::open(incremental).map_err(|e| e.to_string())?;
         let optimized = export_optimized(&reopened)?;
-        std::fs::write(path, optimized).map_err(|e| e.to_string())
+        pdf_core::write_atomic(path, &optimized).map_err(|e| e.to_string())?;
+        self.saved_undo_len = self.undo_stack.len();
+        Ok(())
     }
 
     /// Comme `save_as`, mais renvoie les octets plutôt que de les écrire sur
@@ -2114,6 +2240,23 @@ impl EditSession {
             .save_incremental(&objects)
             .map_err(|e| e.to_string())
     }
+}
+
+/// Retire du dictionnaire de page brut résolu (`Document::resolve`, avant
+/// tout traitement) les clés qui remontent vers l'arbre de pages du document
+/// source plutôt que vers du contenu propre à cette page : `/Parent` (nœud
+/// `/Pages` parent -> `/Kids` -> **toutes** les pages du document, voir
+/// AUDIT_FIXES_2026-09-03.md #5), `/StructParents` (index dans
+/// `/StructTreeRoot`, propre au document source) et `/B` (billboard beads,
+/// liste chaînée d'autres pages). Doit être appelé **avant**
+/// `copy_object_recursive` sur le dictionnaire de page — après, la fuite a
+/// déjà eu lieu.
+fn strip_page_tree_links(dict: &Dictionary) -> Dictionary {
+    let mut out = dict.clone();
+    out.remove("Parent");
+    out.remove("StructParents");
+    out.remove("B");
+    out
 }
 
 fn num(o: &Object) -> f64 {
@@ -2188,8 +2331,21 @@ fn copy_object_recursive(
             Ok(Object::Array(out))
         }
         Object::Dictionary(dict) => {
+            // Un dictionnaire qui porte `/Subtype` (annotation/widget,
+            // XObject…) et un `/Parent` : ce `/Parent` remonte vers un nœud
+            // de l'arbre de pages ou un champ AcroForm, jamais vers un objet
+            // que la copie doit suivre. Sans ce garde-fou, copier un widget
+            // de formulaire suit `/Parent` -> champ AcroForm -> `/Kids` ->
+            // widgets d'**autres pages**, qui font remonter à leur tour vers
+            // *leurs* pages via `/P` — la même fuite transitive que celle
+            // corrigée sur le dictionnaire de page lui-même, juste un niveau
+            // plus loin (AUDIT_FIXES_2026-09-03.md #5, étape 2).
+            let skip_parent = dict.get("Subtype").is_some();
             let mut out = Dictionary::new();
             for (k, v) in dict.iter() {
+                if skip_parent && k.as_str() == "Parent" {
+                    continue;
+                }
                 out.insert(
                     k.clone(),
                     copy_object_recursive(source, v, pending, next_num, copy_map)?,
@@ -2248,8 +2404,16 @@ pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, St
         });
 
         let raw = source.resolve(src_ref).map_err(|e| e.to_string())?;
-        let copied =
-            copy_object_recursive(source, &raw, &mut pending, &mut next_num, &mut copy_map)?;
+        let raw_dict = raw
+            .as_dict()
+            .ok_or_else(|| "source page is not a dictionary".to_string())?;
+        let copied = copy_object_recursive(
+            source,
+            &Object::Dictionary(strip_page_tree_links(raw_dict)),
+            &mut pending,
+            &mut next_num,
+            &mut copy_map,
+        )?;
         let mut dict = copied
             .as_dict()
             .cloned()
@@ -2656,6 +2820,10 @@ mod tests {
             include_bytes!("../../pdf-core/tests/fixtures/embedded_truetype_font.pdf").to_vec();
         let other = pdf_core::Document::open(other_bytes).unwrap();
 
+        let base = pdf_core::Document::open(bytes.clone()).unwrap();
+        let base_object_count = base.object_count();
+        let other_object_count = other.object_count();
+
         let mut session = EditSession::open(&path).unwrap();
         session.merge_document(&other).unwrap();
         assert_eq!(session.page_count().unwrap(), 6);
@@ -2665,6 +2833,16 @@ mod tests {
 
         let reopened = pdf_core::Document::open(std::fs::read(&out_path).unwrap()).unwrap();
         assert_eq!(reopened.page_count().unwrap(), 6);
+        // AUDIT_FIXES_2026-09-03.md #5 : la fusion ne doit copier que les
+        // pages de `other` (via `/Parent`, elle embarquerait sinon tout son
+        // arbre de pages, potentiellement plusieurs fois si `other` a
+        // plusieurs pages qui partagent le même nœud `/Pages` parent).
+        assert!(
+            reopened.object_count() <= base_object_count + other_object_count,
+            "merging should not copy more objects than the total present in both source files \
+             (base: {base_object_count}, other: {other_object_count}, got: {})",
+            reopened.object_count()
+        );
         let last_page = reopened.page(5).unwrap();
         let content = reopened.page_content(&last_page).unwrap();
         let display = pdf_core::interp::Interpreter::run_page(
@@ -2704,6 +2882,35 @@ mod tests {
         let texts = page_texts(&reopened);
         assert!(texts[0].contains("Page 2"), "got {:?}", texts);
         assert!(texts[1].contains("Page 4"), "got {:?}", texts);
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #5 : `extract_pages` sur une seule page ne
+    /// doit copier **que** cette page et ce qu'elle référence, pas tout
+    /// l'arbre de pages du document source via `/Parent` (`Page` -> `/Pages`
+    /// -> `/Kids` -> toutes les autres pages). Avant le correctif,
+    /// `pdf-cli split` produisait un fichier contenant 5 `/Type /Page` pour
+    /// une seule page extraite.
+    #[test]
+    fn extract_pages_does_not_leak_the_rest_of_the_page_tree() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let doc = pdf_core::Document::open(bytes).unwrap();
+
+        let extracted = extract_pages(&doc, &[0]).unwrap();
+        let reopened = pdf_core::Document::open(extracted.clone()).unwrap();
+        assert_eq!(reopened.page_count().unwrap(), 1);
+        assert!(
+            reopened.object_count() < 10,
+            "expected a small, self-contained object graph, got {} objects",
+            reopened.object_count()
+        );
+
+        // Le test le plus fort : aucune trace, même dans les octets bruts,
+        // du texte des pages non extraites.
+        assert!(
+            !extracted.windows(b"Page 2".len()).any(|w| w == b"Page 2"),
+            "bytes from other pages must not be copied into the extracted file at all"
+        );
     }
 
     /// `export_optimized` doit produire un fichier autonome avec toutes les
@@ -2989,6 +3196,114 @@ mod tests {
         assert!(session2
             .redact_region(0, [500.0, 10.0, 590.0, 40.0])
             .is_err());
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #3 : une annotation `/FreeText` (avec son
+    /// flux d'apparence `/AP`) dont `/Rect` intersecte la zone caviardée doit
+    /// disparaître elle aussi, pas seulement le flux de contenu de la page —
+    /// sinon le texte "masqué" reste lisible dans l'annotation.
+    #[test]
+    fn redact_region_also_removes_intersecting_annotations() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let rect = [100.0, 500.0, 300.0, 530.0];
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .add_free_text_annotation(0, rect, "SECRETANNOT", 14.0, (0.0, 0.0, 0.0))
+            .unwrap();
+        session.redact_region(0, rect).unwrap();
+
+        let out_path = write_fixture(b"redact-annot-out");
+        session.save_redacted(&out_path).unwrap();
+
+        let out_bytes = std::fs::read(&out_path).unwrap();
+        assert!(
+            !out_bytes
+                .windows(b"SECRETANNOT".len())
+                .any(|w| w == b"SECRETANNOT"),
+            "the annotation's text must not survive anywhere in the saved file's raw bytes"
+        );
+        let hex_form: Vec<u8> = "SECRETANNOT"
+            .bytes()
+            .flat_map(|b| {
+                let hi = b'0' + (b >> 4);
+                let lo = b'0' + (b & 0x0f);
+                [hi, lo]
+            })
+            .collect();
+        assert!(
+            !out_bytes
+                .windows(hex_form.len())
+                .any(|w| w == hex_form.as_slice()),
+            "the annotation's text must not survive in hex-string form either"
+        );
+
+        let reopened = pdf_core::Document::open(out_bytes).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annots_count = page
+            .dict
+            .get("Annots")
+            .and_then(|o| reopened.get(o).ok())
+            .and_then(|o| o.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        assert_eq!(
+            annots_count, 0,
+            "the intersecting FreeText annotation should have been removed from /Annots"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #3, variante formulaire : un widget de champ
+    /// texte rempli (`/V`, `/AP`) dont `/Rect` intersecte la zone caviardée
+    /// doit être retiré de `/Annots` **et** de `/Kids` de son champ parent.
+    #[test]
+    fn redact_region_removes_intersecting_form_field_widget() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/acroform_textfield.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        let mut session = EditSession::open(&path).unwrap();
+        let field = session
+            .form_fields()
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("fixture should have at least one text field");
+        session
+            .set_form_field_value(&field.name, "SECRETVALUE")
+            .unwrap();
+
+        let rect = field.rect;
+        session.redact_region(0, rect).unwrap();
+
+        let out_path = write_fixture(b"redact-field-out");
+        session.save_redacted(&out_path).unwrap();
+        let out_bytes = std::fs::read(&out_path).unwrap();
+        assert!(
+            !out_bytes
+                .windows(b"SECRETVALUE".len())
+                .any(|w| w == b"SECRETVALUE"),
+            "the filled field value must not survive anywhere in the saved file's raw bytes"
+        );
+
+        let reopened = pdf_core::Document::open(out_bytes).unwrap();
+        let page = reopened.page(0).unwrap();
+        let annots_count = page
+            .dict
+            .get("Annots")
+            .and_then(|o| reopened.get(o).ok())
+            .and_then(|o| o.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        assert_eq!(
+            annots_count, 0,
+            "the intersecting field widget should have been removed from /Annots"
+        );
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();

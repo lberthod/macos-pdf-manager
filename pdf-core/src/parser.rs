@@ -4,12 +4,19 @@ use crate::error::{PdfError, Result};
 use crate::lexer::{Lexer, Token};
 use crate::object::{Dictionary, ObjRef, Object, Stream};
 
+/// Profondeur maximale d'imbrication de tableaux/dictionnaires acceptée par
+/// `parse_object_from`. Très au-dessus de tout PDF réel, très en dessous de
+/// la pile disponible : protège contre un objet `[[[…]]]` forgé qui ferait
+/// autrement `stack overflow` (récursion non récupérable par `catch_unwind`).
+const MAX_OBJECT_DEPTH: usize = 256;
+
 /// Enrobe le lexer avec un buffer de lookahead : nécessaire pour distinguer
 /// un entier isolé d'une référence indirecte `N G R` (trois tokens de suite).
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     data: &'a [u8],
     buffered: Vec<Token>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -18,6 +25,7 @@ impl<'a> Parser<'a> {
             lexer: Lexer::new(data),
             data,
             buffered: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -26,6 +34,7 @@ impl<'a> Parser<'a> {
             lexer: Lexer::with_pos(data, pos),
             data,
             buffered: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -119,6 +128,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array(&mut self) -> Result<Object> {
+        if self.depth >= MAX_OBJECT_DEPTH {
+            return Err(PdfError::InvalidObject(
+                self.lexer.pos(),
+                "nesting too deep".to_string(),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_array_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_array_inner(&mut self) -> Result<Object> {
         let mut items = Vec::new();
         loop {
             let Some(token) = self.next_token()? else {
@@ -133,6 +155,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_dict_or_stream(&mut self) -> Result<Object> {
+        if self.depth >= MAX_OBJECT_DEPTH {
+            return Err(PdfError::InvalidObject(
+                self.lexer.pos(),
+                "nesting too deep".to_string(),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_dict_or_stream_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_dict_or_stream_inner(&mut self) -> Result<Object> {
         let mut dict = Dictionary::new();
         loop {
             let Some(token) = self.next_token()? else {
@@ -265,6 +300,29 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_deeply_nested_array_instead_of_overflowing_the_stack() {
+        let n = 100_000;
+        let mut input = Vec::with_capacity(n * 2 + 2);
+        input.extend(std::iter::repeat_n(b'[', n));
+        input.push(b'1');
+        input.extend(std::iter::repeat_n(b']', n));
+        let mut parser = Parser::new(&input);
+        let err = parser.parse_object().unwrap_err();
+        assert!(matches!(err, PdfError::InvalidObject(_, _)));
+    }
+
+    #[test]
+    fn accepts_nesting_within_the_depth_budget() {
+        let n = 32;
+        let mut input = Vec::with_capacity(n * 2 + 2);
+        input.extend(std::iter::repeat_n(b'[', n));
+        input.push(b'1');
+        input.extend(std::iter::repeat_n(b']', n));
+        let mut parser = Parser::new(&input);
+        assert!(parser.parse_object().is_ok());
+    }
 
     #[test]
     fn parses_simple_dictionary() {

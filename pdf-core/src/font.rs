@@ -300,7 +300,9 @@ impl Font {
                         .map(|bytes| {
                             CidToGid::Map(
                                 bytes
-                                    .chunks_exact(2)
+                                    .as_chunks::<2>()
+                                    .0
+                                    .iter()
                                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                                     .collect(),
                             )
@@ -442,7 +444,9 @@ impl Font {
     /// PDF malformé) est silencieusement ignoré plutôt que de paniquer.
     pub fn decode_composite(&self, bytes: &[u8]) -> Vec<u32> {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]) as u32)
             .collect()
     }
@@ -759,7 +763,9 @@ fn hex_to_code(bytes: &[u8]) -> Option<usize> {
 /// une paire de substitution) en son premier caractère.
 fn hex_to_char(bytes: &[u8]) -> Option<char> {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .collect();
     char::decode_utf16(units).next()?.ok()
@@ -804,7 +810,9 @@ fn parse_to_unicode_cmap(bytes: &[u8]) -> [Option<char>; 256] {
                     match dst_token {
                         Token::HexString(base) => {
                             let base_units: Vec<u16> = base
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                                 .collect();
                             if let [unit] = base_units[..] {
@@ -892,7 +900,9 @@ fn parse_to_unicode_cmap_wide(bytes: &[u8]) -> HashMap<u32, char> {
                     match dst_token {
                         Token::HexString(base) => {
                             let base_units: Vec<u16> = base
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                                 .collect();
                             if let [unit] = base_units[..] {

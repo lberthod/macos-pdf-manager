@@ -76,6 +76,11 @@ const SEARCH_FIELD_ID: &str = "search_query_field";
 const GOTO_PAGE_FIELD_ID: &str = "goto_page_field";
 /// Échelle de rendu des miniatures (page 612pt de large -> ~92px).
 const THUMBNAIL_SCALE: f64 = 0.15;
+/// Nombre maximal de miniatures gardées en mémoire à la fois
+/// (AUDIT_FIXES_2026-09-03.md #13) — un cache LRU simple (éviction de la plus
+/// ancienne), pas borné en Mo : suffisant, `THUMBNAIL_SCALE` gardant chaque
+/// texture petite.
+const THUMBNAIL_CACHE_CAPACITY: usize = 200;
 /// Densité de rendu minimale (pixels bitmap par point PDF), indépendante de
 /// `ctx.pixels_per_point()`. Sur un écran externe non-Retina (souvent 1.0),
 /// se caler uniquement sur la densité de l'écran donne un rendu peu
@@ -467,6 +472,13 @@ struct DocumentTab {
     highlight_rects: Vec<pdf_app::MatchRect>,
     show_thumbnails: bool,
     thumbnails: HashMap<usize, egui::TextureHandle>,
+    /// Ordre d'insertion des entrées de `thumbnails` (AUDIT_FIXES_2026-09-03.md
+    /// #13) — sert à borner le cache en mémoire (`THUMBNAIL_CACHE_CAPACITY`) :
+    /// sans virtualisation, `show_thumbnail_panel` ne demandait plus qu'une
+    /// miniature par page réellement visible, mais rien n'évinçait jamais les
+    /// anciennes une fois l'utilisateur passé à autre chose (défilement sur
+    /// un document de plusieurs milliers de pages).
+    thumbnail_order: std::collections::VecDeque<usize>,
     /// Pages cochées dans le panneau de miniatures (Sprint 19, manipulation
     /// de pages) — sert uniquement à "✂ Extraire la sélection…" ; vidé après
     /// toute édition (voir `invalidate_after_edit`) puisqu'une insertion,
@@ -635,6 +647,7 @@ impl DocumentTab {
             highlight_rects: Vec::new(),
             show_thumbnails: false,
             thumbnails: HashMap::new(),
+            thumbnail_order: std::collections::VecDeque::new(),
             thumbnail_selection: HashSet::new(),
             show_outline: false,
             continuous_scroll: false,
@@ -684,14 +697,30 @@ impl DocumentTab {
     /// onglet encore vide (juste après "Fermer l'onglet" sur le dernier
     /// onglet restant, voir `ViewerApp::close_tab`).
     fn title(&self) -> String {
-        match &self.session {
+        let name = match &self.session {
             Some(session) => session
                 .path()
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Document".to_string()),
-            None => "Nouvel onglet".to_string(),
+            None => return "Nouvel onglet".to_string(),
+        };
+        // Convention macOS : un point avant le nom signale des modifications
+        // non enregistrées (AUDIT_FIXES_2026-09-03.md #8) — le même signal
+        // que le point dans le bouton rouge de fermeture d'une vraie fenêtre
+        // native, ici sur l'onglet puisque cette app n'a qu'une fenêtre.
+        if self.is_dirty() {
+            format!("• {name}")
+        } else {
+            name
         }
+    }
+
+    /// Vrai s'il y a des éditions non enregistrées dans cet onglet — voir
+    /// `pdf_app::Session::is_dirty`. `false` pour un onglet vide (pas encore
+    /// de document ouvert).
+    fn is_dirty(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.is_dirty())
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -705,6 +734,7 @@ impl DocumentTab {
         self.highlight_state = None;
         self.highlight_rects.clear();
         self.thumbnails.clear();
+        self.thumbnail_order.clear();
         self.thumbnail_selection.clear();
         self.page_textures.clear();
         self.page_textures_zoom_key = None;
@@ -812,7 +842,7 @@ impl DocumentTab {
             .set_file_name(&default_name)
             .save_file()
         {
-            if let Err(e) = std::fs::write(&dest, bytes) {
+            if let Err(e) = pdf_core::write_atomic(&dest, &bytes) {
                 self.error = Some(format!("Échec de l'export optimisé : {e}"));
             }
         }
@@ -845,7 +875,7 @@ impl DocumentTab {
             .set_file_name(&default_name)
             .save_file()
         {
-            if let Err(e) = std::fs::write(&dest, text) {
+            if let Err(e) = pdf_core::write_atomic(&dest, text.as_bytes()) {
                 self.error = Some(format!("Échec de l'export du texte : {e}"));
             }
         }
@@ -856,7 +886,7 @@ impl DocumentTab {
     /// fichier réellement ouvert, par sauvegarde incrémentale
     /// (`pdf_app::Session::save_edits_in_place`).
     fn save_in_place(&mut self) {
-        let Some(session) = &self.session else {
+        let Some(session) = &mut self.session else {
             return;
         };
         if let Err(e) = session.save_edits_in_place() {
@@ -1629,6 +1659,7 @@ impl DocumentTab {
         self.texture_state = None;
         self.texture_logical_size = None;
         self.thumbnails.clear();
+        self.thumbnail_order.clear();
         // Une insertion/suppression/déplacement de page rend les indices
         // précédemment cochés périmés (Sprint 19) — plus sûr de tout vider
         // que de tenter de les faire suivre.
@@ -1696,7 +1727,14 @@ impl DocumentTab {
             );
             match page.kind {
                 RenderKind::Thumbnail => {
-                    self.thumbnails.insert(page.page_index, texture);
+                    if self.thumbnails.insert(page.page_index, texture).is_none() {
+                        self.thumbnail_order.push_back(page.page_index);
+                        while self.thumbnail_order.len() > THUMBNAIL_CACHE_CAPACITY {
+                            if let Some(oldest) = self.thumbnail_order.pop_front() {
+                                self.thumbnails.remove(&oldest);
+                            }
+                        }
+                    }
                 }
                 RenderKind::ContinuousPage => {
                     self.page_textures.insert(page.page_index, texture);
@@ -1999,6 +2037,23 @@ impl DocumentTab {
         let mut delete_requested: Option<usize> = None;
         let mut rotate_requested: Option<usize> = None;
 
+        // Hauteur de ligne uniforme dérivée de la page 0, en points logiques
+        // (voir `show_continuous_scroll` pour la même approche et sa
+        // limitation documentée sur les documents à pages hétérogènes) :
+        // `THUMBNAIL_SCALE` étant un facteur de mise à l'échelle en points
+        // PDF -> pixels de texture, la taille logique affichée (après
+        // division par `pixel_ratio`, voir `ensure_thumbnail`) vaut
+        // directement `dimension_pdf * THUMBNAIL_SCALE`, sans avoir besoin
+        // d'attendre qu'une texture existe pour l'estimer.
+        let thumbnail_row_height = self
+            .session
+            .as_ref()
+            .and_then(|s| s.page_media_box(0).ok())
+            .map(|mb| (mb[3] - mb[1]) * THUMBNAIL_SCALE)
+            .unwrap_or(150.0) as f32
+            // Case à cocher + libellé/boutons + marges du cadre.
+            + 56.0;
+
         egui::SidePanel::left("thumbnails")
             .resizable(true)
             .default_width(170.0)
@@ -2035,66 +2090,79 @@ impl DocumentTab {
                 }
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for index in 0..page_count {
-                        let Some(logical_size) = self.ensure_thumbnail(index, ctx) else {
-                            continue;
-                        };
-                        let Some(texture) = self.thumbnails.get(&index).cloned() else {
-                            continue;
-                        };
-                        let mut selected = self.thumbnail_selection.contains(&index);
+                // AUDIT_FIXES_2026-09-03.md #13 : `show_rows` plutôt qu'un
+                // simple `for index in 0..page_count` dans une
+                // `ScrollArea::vertical().show(...)` — sans virtualisation,
+                // un document de plusieurs milliers de pages demandait un
+                // rendu pour *chaque* page dès l'ouverture du panneau, pas
+                // seulement celles réellement visibles (voir `ensure_thumbnail`,
+                // dont chaque appel manqué en cache pousse une requête au
+                // thread de rendu en arrière-plan).
+                egui::ScrollArea::vertical().show_rows(
+                    ui,
+                    thumbnail_row_height,
+                    page_count,
+                    |ui, row_range| {
+                        for index in row_range {
+                            let Some(logical_size) = self.ensure_thumbnail(index, ctx) else {
+                                continue;
+                            };
+                            let Some(texture) = self.thumbnails.get(&index).cloned() else {
+                                continue;
+                            };
+                            let mut selected = self.thumbnail_selection.contains(&index);
 
-                        let frame = egui::Frame::default().inner_margin(4.0);
-                        let (_drop_area, dragged_from) =
-                            ui.dnd_drop_zone::<usize, _>(frame, |ui| {
-                                ui.dnd_drag_source(
-                                    egui::Id::new("thumb_drag").with(index),
-                                    index,
-                                    |ui| {
-                                        ui.vertical_centered(|ui| {
-                                            if ui.checkbox(&mut selected, "").changed() {
-                                                if selected {
-                                                    self.thumbnail_selection.insert(index);
-                                                } else {
-                                                    self.thumbnail_selection.remove(&index);
+                            let frame = egui::Frame::default().inner_margin(4.0);
+                            let (_drop_area, dragged_from) =
+                                ui.dnd_drop_zone::<usize, _>(frame, |ui| {
+                                    ui.dnd_drag_source(
+                                        egui::Id::new("thumb_drag").with(index),
+                                        index,
+                                        |ui| {
+                                            ui.vertical_centered(|ui| {
+                                                if ui.checkbox(&mut selected, "").changed() {
+                                                    if selected {
+                                                        self.thumbnail_selection.insert(index);
+                                                    } else {
+                                                        self.thumbnail_selection.remove(&index);
+                                                    }
                                                 }
-                                            }
-                                            let image = egui::Image::new(&texture)
-                                                .fit_to_exact_size(logical_size);
-                                            let response = ui.add(
-                                                egui::ImageButton::new(image)
-                                                    .selected(index == current),
-                                            );
-                                            if response.clicked() {
-                                                clicked = Some(index);
-                                            }
-                                            ui.horizontal(|ui| {
-                                                ui.label(format!("{}", index + 1));
-                                                if ui
-                                                    .small_button("Suppr.")
-                                                    .on_hover_text("Supprimer cette page")
-                                                    .clicked()
-                                                {
-                                                    delete_requested = Some(index);
+                                                let image = egui::Image::new(&texture)
+                                                    .fit_to_exact_size(logical_size);
+                                                let response = ui.add(
+                                                    egui::ImageButton::new(image)
+                                                        .selected(index == current),
+                                                );
+                                                if response.clicked() {
+                                                    clicked = Some(index);
                                                 }
-                                                if ui
-                                                    .small_button("Pivoter")
-                                                    .on_hover_text("Pivoter de 90°")
-                                                    .clicked()
-                                                {
-                                                    rotate_requested = Some(index);
-                                                }
+                                                ui.horizontal(|ui| {
+                                                    ui.label(format!("{}", index + 1));
+                                                    if ui
+                                                        .small_button("Suppr.")
+                                                        .on_hover_text("Supprimer cette page")
+                                                        .clicked()
+                                                    {
+                                                        delete_requested = Some(index);
+                                                    }
+                                                    if ui
+                                                        .small_button("Pivoter")
+                                                        .on_hover_text("Pivoter de 90°")
+                                                        .clicked()
+                                                    {
+                                                        rotate_requested = Some(index);
+                                                    }
+                                                });
                                             });
-                                        });
-                                    },
-                                );
-                            });
-                        if let Some(&from) = dragged_from.as_deref() {
-                            reorder = Some((from, index));
+                                        },
+                                    );
+                                });
+                            if let Some(&from) = dragged_from.as_deref() {
+                                reorder = Some((from, index));
+                            }
                         }
-                    }
-                });
+                    },
+                );
             });
 
         if let Some((from, to)) = reorder {
@@ -3534,6 +3602,29 @@ fn screen_to_page(
 /// `Device`/`Queue` `wgpu`, cloné dans chaque onglet à sa création) et la
 /// barre de menus native (une seule pour toute l'application, ses commandes
 /// sont routées vers l'onglet actif).
+/// Fermeture en attente de confirmation de l'utilisateur
+/// (AUDIT_FIXES_2026-09-03.md #8) — `ViewerApp::show_pending_close_modal`
+/// affiche la modale "Enregistrer / Ne pas enregistrer / Annuler"
+/// correspondante à chaque frame tant qu'elle est présente.
+enum PendingClose {
+    /// Fermer un onglet précis (bouton "×", `⌘W`, ou "Fermer l'onglet" du
+    /// menu) — l'onglet à `usize` a des éditions non enregistrées.
+    Tab(usize),
+    /// Quitter l'application ou fermer la fenêtre (`⌘Q`, "Fermer la
+    /// fenêtre", bouton rouge natif) : file des onglets sales restant à
+    /// confirmer un par un, dans l'ordre, avant de laisser le processus se
+    /// terminer réellement — les indices sont ceux de `ViewerApp::tabs` **au
+    /// moment où la file a été construite**, remis à jour à chaque onglet
+    /// résolu (voir `resolve_pending_close`).
+    Quit(Vec<usize>),
+}
+
+/// Application complète — Sprint 49 : porte la liste des onglets ouverts
+/// plutôt qu'un unique document (voir `DocumentTab`), ainsi que ce qui est
+/// réellement global à l'application : le backend GPU partagé (un seul
+/// `Device`/`Queue` `wgpu`, cloné dans chaque onglet à sa création) et la
+/// barre de menus native (une seule pour toute l'application, ses commandes
+/// sont routées vers l'onglet actif).
 struct ViewerApp {
     tabs: Vec<DocumentTab>,
     /// Indice de l'onglet actuellement affiché dans `tabs` — toujours valide
@@ -3546,6 +3637,9 @@ struct ViewerApp {
     /// utilisables pour ouvrir un fichier.
     #[cfg(target_os = "macos")]
     native_menu: Option<NativeMenu>,
+    /// Voir `PendingClose` — `None` la plupart du temps, tant qu'aucune
+    /// fermeture ne bute sur des éditions non enregistrées.
+    pending_close: Option<PendingClose>,
 }
 
 impl ViewerApp {
@@ -3556,6 +3650,7 @@ impl ViewerApp {
             gpu,
             #[cfg(target_os = "macos")]
             native_menu: None,
+            pending_close: None,
         }
     }
 
@@ -3568,26 +3663,40 @@ impl ViewerApp {
         self.active = self.tabs.len() - 1;
     }
 
-    /// "Fichier > Fermer l'onglet" (`⌘W`, Sprint 49) : ferme l'onglet actif.
-    /// Si c'était le dernier, le remplace par un onglet vide plutôt que de
-    /// fermer la fenêtre — `tabs` ne doit jamais être vide (simplification
-    /// délibérée : fermer la fenêtre elle-même reste possible via `⇧⌘W`,
-    /// "Fermer la fenêtre", `performClose:`).
+    /// "Fichier > Fermer l'onglet" (`⌘W`, Sprint 49) : ferme l'onglet actif
+    /// — voir `close_tab` (identique, `self.active` n'est qu'un cas
+    /// particulier de `index`).
     fn close_active_tab(&mut self) {
-        self.tabs.remove(self.active);
-        if self.tabs.is_empty() {
-            self.tabs.push(DocumentTab::new(None, self.gpu.clone()));
-            self.active = 0;
-        } else if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
+        self.close_tab(self.active);
+    }
+
+    /// Ferme l'onglet `index` (bouton "×" de la barre d'onglets, `⌘W`,
+    /// "Fermer l'onglet" du menu) — si l'onglet a des éditions non
+    /// enregistrées, ouvre d'abord une invite de confirmation
+    /// (AUDIT_FIXES_2026-09-03.md #8) plutôt que de perdre les modifications
+    /// silencieusement ; voir `show_pending_close_modal`.
+    fn close_tab(&mut self, index: usize) {
+        if self.pending_close.is_some() {
+            // Une confirmation est déjà en cours (ex. Quitter en train de
+            // dérouler sa file d'onglets sales) : ne pas en empiler une
+            // deuxième par-dessus.
+            return;
+        }
+        if self.tabs[index].is_dirty() {
+            self.pending_close = Some(PendingClose::Tab(index));
+        } else {
+            self.close_tab_now(index);
         }
     }
 
-    /// Ferme l'onglet `index` (bouton "×" de la barre d'onglets) — même
-    /// logique que `close_active_tab`, mais ajuste `active` pour continuer
-    /// à pointer sur le même onglet visuellement quand celui fermé était
-    /// avant lui dans la liste.
-    fn close_tab(&mut self, index: usize) {
+    /// Retire réellement l'onglet `index` de `tabs`, sans passer par la
+    /// confirmation de `close_tab` — utilisé une fois qu'elle est déjà
+    /// résolue (ou inutile, onglet propre). Si c'était le dernier onglet, le
+    /// remplace par un onglet vide plutôt que de fermer la fenêtre — `tabs`
+    /// ne doit jamais être vide (simplification délibérée : fermer la
+    /// fenêtre elle-même reste possible via `⇧⌘W`, "Fermer la fenêtre",
+    /// `performClose:`).
+    fn close_tab_now(&mut self, index: usize) {
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.tabs.push(DocumentTab::new(None, self.gpu.clone()));
@@ -3596,6 +3705,134 @@ impl ViewerApp {
             self.active -= 1;
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
+        }
+    }
+
+    /// Indices (dans `tabs`) des onglets ayant des éditions non
+    /// enregistrées, dans l'ordre — utilisé pour amorcer `PendingClose::Quit`
+    /// quand l'utilisateur quitte l'application ou ferme la fenêtre.
+    fn dirty_tab_indices(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.is_dirty())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Point d'entrée commun à "Quitter" (`⌘Q`) et à la fermeture de la
+    /// fenêtre (bouton rouge natif, `⇧⌘W`) : s'il reste des onglets sales,
+    /// ouvre la file de confirmations (`PendingClose::Quit`) plutôt que de
+    /// laisser le processus se terminer immédiatement. Renvoie `true` si la
+    /// terminaison peut se poursuivre tout de suite (rien à confirmer).
+    fn request_quit(&mut self) -> bool {
+        if self.pending_close.is_some() {
+            return false;
+        }
+        let dirty = self.dirty_tab_indices();
+        if dirty.is_empty() {
+            true
+        } else {
+            self.pending_close = Some(PendingClose::Quit(dirty));
+            false
+        }
+    }
+
+    /// Une fois l'onglet `index` résolu (sauvegardé ou modifications
+    /// abandonnées) par `show_pending_close_modal` : le ferme réellement, et
+    /// si `pending_close` était `Quit`, avance la file — la termine
+    /// (`std::process::exit`) si c'était le dernier onglet sale.
+    fn resolve_pending_close(&mut self, index: usize) {
+        let next_queue = match self.pending_close.take() {
+            Some(PendingClose::Quit(mut queue)) => {
+                queue.retain(|&i| i != index);
+                // Les indices restants pointaient dans `tabs` avant le
+                // retrait ci-dessous : ceux après `index` doivent reculer
+                // d'un cran pour continuer à désigner le même onglet.
+                for q in queue.iter_mut() {
+                    if *q > index {
+                        *q -= 1;
+                    }
+                }
+                Some(queue)
+            }
+            _ => None,
+        };
+        self.close_tab_now(index);
+        match next_queue {
+            Some(queue) if queue.is_empty() => std::process::exit(0),
+            Some(queue) => self.pending_close = Some(PendingClose::Quit(queue)),
+            None => {}
+        }
+    }
+
+    /// Affiche, tant que `pending_close` est renseigné, la modale
+    /// "Enregistrer / Ne pas enregistrer / Annuler" pour l'onglet concerné —
+    /// bloque la frame suivante de la même façon qu'une vraie boîte de
+    /// dialogue système (aucune autre interaction utile tant qu'elle est
+    /// affichée, mais rien n'empêche techniquement de cliquer ailleurs,
+    /// limite acceptée d'une modale `egui` plutôt qu'une vraie `NSAlert`).
+    fn show_pending_close_modal(&mut self, ctx: &egui::Context) {
+        let index = match &self.pending_close {
+            Some(PendingClose::Tab(i)) => *i,
+            Some(PendingClose::Quit(queue)) => match queue.first() {
+                Some(i) => *i,
+                None => {
+                    // File vide : ne devrait pas arriver (`resolve_pending_close`
+                    // termine le processus dès que la file se vide), mais
+                    // par sécurité ne pas rester bloqué sur une modale sans
+                    // onglet à montrer.
+                    self.pending_close = None;
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        let name = self.tabs[index].title();
+        let mut action: Option<u8> = None; // 0 = annuler, 1 = ne pas enregistrer, 2 = enregistrer
+        egui::Window::new("unsaved_changes_modal")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.heading("Modifications non enregistrées");
+                ui.label(format!(
+                    "« {name} » contient des modifications non enregistrées. \
+                     Voulez-vous les enregistrer avant de fermer ?"
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Ne pas enregistrer").clicked() {
+                        action = Some(1);
+                    }
+                    if ui.button("Annuler").clicked() {
+                        action = Some(0);
+                    }
+                    if ui.button("Enregistrer").clicked() {
+                        action = Some(2);
+                    }
+                });
+            });
+
+        match action {
+            Some(0) => self.pending_close = None,
+            Some(1) => self.resolve_pending_close(index),
+            Some(2) => {
+                self.tabs[index].save_in_place();
+                if self.tabs[index].is_dirty() {
+                    // `save_in_place` a déjà posé son propre message dans
+                    // `tab.error` ; ne pas fermer sur un échec, mais ne pas
+                    // non plus laisser la modale ouverte par-dessus ce
+                    // message pour ne pas empiler deux façons de signaler
+                    // la même erreur.
+                    self.pending_close = None;
+                } else {
+                    self.resolve_pending_close(index);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3701,8 +3938,34 @@ impl eframe::App for ViewerApp {
                     MenuCommand::Undo => self.tabs[self.active].undo_edit(),
                     MenuCommand::Redo => self.tabs[self.active].redo_edit(),
                     MenuCommand::Print => self.tabs[self.active].print_document(),
+                    // AUDIT_FIXES_2026-09-03.md #8 : ne pas laisser
+                    // `terminate:` faire disparaître le processus sans
+                    // vérifier les éditions non enregistrées (voir la doc de
+                    // `MenuCommand::Quit`).
+                    MenuCommand::Quit => {
+                        if self.request_quit() {
+                            std::process::exit(0);
+                        }
+                    }
                 }
             }
+        }
+
+        // Bouton rouge natif / `⇧⌘W` ("Fermer la fenêtre") : `eframe`
+        // expose la demande de fermeture via `viewport().close_requested()`
+        // *avant* qu'elle ne soit honorée, ce qui laisse le temps de
+        // l'annuler (`ViewportCommand::CancelClose`) s'il reste des éditions
+        // non enregistrées, le temps de les confirmer une par une comme pour
+        // "Quitter" (AUDIT_FIXES_2026-09-03.md #8).
+        // Si `request_quit()` renvoie `true` (rien à confirmer), la fermeture
+        // demandée par l'OS est laissée suivre son cours normalement — pas
+        // besoin de `CancelClose`, ni de `std::process::exit` (la fenêtre se
+        // ferme d'elle-même).
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.pending_close.is_none()
+            && !self.request_quit()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
         // Glisser-déposer un fichier PDF sur la fenêtre (`egui` expose déjà
@@ -3720,6 +3983,8 @@ impl eframe::App for ViewerApp {
         if let Some(path) = outcome.open_in_new_tab {
             self.open_new_tab(path);
         }
+
+        self.show_pending_close_modal(ctx);
     }
 }
 
@@ -3887,5 +4152,47 @@ mod layout_tests {
                 "avec un document ouvert, à {width}px de large, la barre d'outils déborde jusqu'à x={max_right} (rect fautif : {offender:?})"
             );
         }
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #13 : le panneau de miniatures ne doit
+    /// demander le rendu que des pages réellement visibles au premier
+    /// affichage, pas de tout le document — sur un document de 60 pages,
+    /// bien moins de 15 devraient tenir dans une fenêtre de 700px de haut à
+    /// la petite échelle des miniatures (`THUMBNAIL_SCALE`).
+    #[test]
+    fn thumbnail_panel_only_requests_visible_pages_on_first_show() {
+        let ctx = egui::Context::default();
+        let fixture = std::path::Path::new("../pdf-core/tests/fixtures/large_60_pages.pdf");
+        assert!(fixture.exists(), "fixture manquante : {fixture:?}");
+
+        let mut tab = DocumentTab::new(Some(fixture.to_path_buf()), None);
+        assert!(
+            tab.session.is_some(),
+            "le fixture aurait dû s'ouvrir sans erreur"
+        );
+        assert_eq!(tab.session.as_ref().unwrap().page_count(), 60);
+        tab.show_thumbnails = true;
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            let _ = tab.update_content(ctx);
+        });
+
+        let thumbnail_requests = tab
+            .background_requested
+            .iter()
+            .filter(|(kind, ..)| *kind == RenderKind::Thumbnail)
+            .count();
+        assert!(
+            thumbnail_requests <= 15,
+            "expected only the visible rows to be requested, got {thumbnail_requests} \
+             thumbnail render requests for a 60-page document"
+        );
     }
 }

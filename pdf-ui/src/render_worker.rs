@@ -128,51 +128,136 @@ fn worker_loop(requests: Receiver<Request>, results: Sender<BackgroundRenderedPa
     let mut generation: u64 = 0;
 
     for request in requests {
-        match request {
-            Request::SetDocument {
-                bytes,
-                generation: new_generation,
-            } => {
-                doc = pdf_core::Document::open(bytes).ok();
-                generation = new_generation;
+        // AUDIT_FIXES_2026-09-03.md #12 : sans ce `catch_unwind`, un panic
+        // pendant le rendu d'une seule page (ex. déclencheur direct #2, une
+        // `/MediaBox` forgée) faisait mourir le thread entier en silence —
+        // miniatures et défilement continu figés sans message, et toute
+        // requête suivante avalée sans effet par le `let _ =
+        // self.requests.send(...)` côté `RenderWorker` (le canal reste
+        // ouvert côté émetteur même si personne ne le lit plus). Récupérer
+        // le panic ici laisse le thread continuer à servir les requêtes
+        // suivantes plutôt que de disparaître.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_request(request, &mut doc, &mut generation, &results)
+        }));
+        if let Err(panic) = outcome {
+            eprintln!(
+                "pdf-ui render worker: recovered from a panic while rendering a page: {}",
+                panic_message(&panic)
+            );
+        }
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn process_request(
+    request: Request,
+    doc: &mut Option<pdf_core::Document>,
+    generation: &mut u64,
+    results: &Sender<BackgroundRenderedPage>,
+) {
+    match request {
+        Request::SetDocument {
+            bytes,
+            generation: new_generation,
+        } => {
+            *doc = pdf_core::Document::open(bytes).ok();
+            *generation = new_generation;
+        }
+        Request::Render {
+            kind,
+            page_index,
+            scale,
+            scale_key,
+            generation: request_generation,
+        } => {
+            if request_generation != *generation {
+                return; // requête périmée : le document a déjà changé depuis.
             }
-            Request::Render {
+            let Some(doc) = doc.as_ref() else { return };
+            let Ok(page) = doc.page(page_index) else {
+                return;
+            };
+            let Ok(content) = doc.page_content(&page) else {
+                return;
+            };
+            let Ok(display) =
+                pdf_core::interp::Interpreter::run_page_with_annotations(doc, &page, &content)
+            else {
+                return;
+            };
+            let Some(pixmap) =
+                pdf_render::render_page_rotated(&display, page.media_box, page.rotate, scale)
+            else {
+                return;
+            };
+            let _ = results.send(BackgroundRenderedPage {
                 kind,
                 page_index,
-                scale,
                 scale_key,
                 generation: request_generation,
-            } => {
-                if request_generation != generation {
-                    continue; // requête périmée : le document a déjà changé depuis.
+                width: pixmap.width(),
+                height: pixmap.height(),
+                rgba: pixmap.data().to_vec(),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_message_extracts_string_and_str_payloads() {
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(str_payload.as_ref()), "boom");
+
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(string_payload.as_ref()), "boom");
+
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            panic_message(other_payload.as_ref()),
+            "non-string panic payload"
+        );
+    }
+
+    /// AUDIT_FIXES_2026-09-03.md #12 : la boucle du thread doit continuer à
+    /// traiter les requêtes suivantes après qu'une requête a paniqué, pas
+    /// s'arrêter — reproduit ici la structure exacte de `worker_loop`
+    /// (`catch_unwind` par itération) sans dépendre d'un vrai déclencheur de
+    /// panic dans le pipeline de rendu (le déclencheur connu, #2, est
+    /// justement corrigé pour ne plus paniquer — voir la doc de module de
+    /// `worker_loop`).
+    #[test]
+    fn catch_unwind_per_request_lets_the_loop_keep_processing_after_a_panic() {
+        let mut processed_after_panic = false;
+        for i in 0..3 {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if i == 1 {
+                    panic!("simulated render panic");
                 }
-                let Some(doc) = &doc else { continue };
-                let Ok(page) = doc.page(page_index) else {
-                    continue;
-                };
-                let Ok(content) = doc.page_content(&page) else {
-                    continue;
-                };
-                let Ok(display) =
-                    pdf_core::interp::Interpreter::run_page_with_annotations(doc, &page, &content)
-                else {
-                    continue;
-                };
-                let Some(pixmap) =
-                    pdf_render::render_page_rotated(&display, page.media_box, page.rotate, scale)
-                else {
-                    continue;
-                };
-                let _ = results.send(BackgroundRenderedPage {
-                    kind,
-                    page_index,
-                    scale_key,
-                    generation: request_generation,
-                    width: pixmap.width(),
-                    height: pixmap.height(),
-                    rgba: pixmap.data().to_vec(),
-                });
+            }));
+            if outcome.is_err() && i == 1 {
+                continue;
+            }
+            if i == 2 {
+                processed_after_panic = true;
             }
         }
+        assert!(
+            processed_after_panic,
+            "the loop must keep running after a panicking iteration"
+        );
     }
 }

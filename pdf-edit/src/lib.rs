@@ -39,6 +39,8 @@ use pdf_core::document::Document;
 use pdf_core::object::{Dictionary, ObjRef, Object, Stream};
 use std::path::Path;
 
+mod redact;
+
 /// Une opération d'édition réversible : capture, pour chaque objet
 /// **existant** modifié, sa valeur avant (`undo`) et après (`redo`)
 /// l'opération. Les objets nouvellement créés par l'opération ne sont pas
@@ -814,6 +816,74 @@ impl EditSession {
             .insert(annot_num, Object::Dictionary(annot_dict));
 
         self.append_to_annots(page_ref, ObjRef::new(annot_num, 0))?;
+        Ok(())
+    }
+
+    /// Caviardage sécurisé de `rect` (espace page) sur `page_index` —
+    /// distinct de `replace_text_with_overlay` (6b), qui masque
+    /// visuellement mais laisse le contenu original extractible : voir la
+    /// doc de module de `redact` pour ce que ça retire réellement (texte,
+    /// chemins, images/formulaires dont la zone occupée croise `rect`) et
+    /// les limites assumées de cette première passe (pas d'images en ligne,
+    /// pas de descente dans les `XObject /Form`, retirés en bloc).
+    ///
+    /// Remplace entièrement `/Contents` par un unique nouveau flux (plutôt
+    /// que de modifier en place un flux existant potentiellement partagé
+    /// par tableau) et redessine un rectangle plein par-dessus pour le
+    /// rendu. Échoue sans rien modifier si la page ne contient rien à
+    /// retirer dans `rect`, ou si elle contient une image en ligne — voir
+    /// `redact::redact_content_stream`.
+    pub fn redact_region(&mut self, page_index: usize, rect: [f64; 4]) -> Result<(), String> {
+        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
+        let page_ref = page
+            .object_ref
+            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+
+        let (x0, y0, x1, y1) = (
+            rect[0].min(rect[2]),
+            rect[1].min(rect[3]),
+            rect[0].max(rect[2]),
+            rect[1].max(rect[3]),
+        );
+        let target = redact::Rect::new(x0, y0, x1, y1);
+
+        let content_bytes = self.doc.page_content(&page).map_err(|e| e.to_string())?;
+        let (mut new_content, redacted_something) =
+            redact::redact_content_stream(&self.doc, &content_bytes, &page.resources, target)?;
+
+        if !redacted_something {
+            return Err("aucun contenu trouvé dans cette zone : rien à caviarder".to_string());
+        }
+
+        new_content.extend_from_slice(
+            format!(
+                "\nq 0 0 0 rg {x0:.3} {y0:.3} {:.3} {:.3} re f Q",
+                x1 - x0,
+                y1 - y0
+            )
+            .as_bytes(),
+        );
+
+        let content_num = self.alloc_num();
+        self.pending.insert(
+            content_num,
+            Object::Stream(Stream {
+                dict: Dictionary::new(),
+                raw_data: new_content,
+            }),
+        );
+
+        let page_obj = self.current(page_ref.num)?;
+        let mut page_dict = page_obj
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "page object is not a dictionary".to_string())?;
+        let before_page = Object::Dictionary(page_dict.clone());
+        page_dict.insert("Contents", Object::Reference(ObjRef::new(content_num, 0)));
+        let after_page = Object::Dictionary(page_dict);
+        self.commit(EditOp {
+            modified: vec![(page_ref.num, before_page, after_page)],
+        });
         Ok(())
     }
 
@@ -2008,6 +2078,27 @@ impl EditSession {
         std::fs::write(path, self.to_bytes()?).map_err(|e| e.to_string())
     }
 
+    /// À utiliser **à la place de** `save_as` après un `redact_region` (voir
+    /// `ROADMAP_IMPROVEMENT.md` §1.2, étape 4) : une sauvegarde incrémentale
+    /// classique ne fait qu'*ajouter* — l'ancien flux de contenu contenant le
+    /// texte caviardé reste physiquement présent dans le fichier, juste
+    /// superseded dans la xref, et donc récupérable par n'importe quel outil
+    /// lisant les révisions antérieures ou scannant les octets bruts. C'est
+    /// exactement le piège classique des outils de "caviardage" qui ne font
+    /// qu'une sauvegarde incrémentale — inacceptable pour un vrai caviardage.
+    ///
+    /// Rouvre les octets sauvegardés incrémentalement (`to_bytes`), puis les
+    /// réécrit entièrement via `export_optimized` (garbage collector par
+    /// reconstruction, ne copie que les objets atteignables depuis les
+    /// pages) : l'ancien flux, plus référencé par aucune page, n'est simplement
+    /// jamais copié dans la sortie.
+    pub fn save_redacted(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let incremental = self.to_bytes()?;
+        let reopened = Document::open(incremental).map_err(|e| e.to_string())?;
+        let optimized = export_optimized(&reopened)?;
+        std::fs::write(path, optimized).map_err(|e| e.to_string())
+    }
+
     /// Comme `save_as`, mais renvoie les octets plutôt que de les écrire sur
     /// disque — utilisé par `pdf-app::Session` (viewer) pour obtenir un
     /// aperçu à jour des modifications en attente : les rouvrir dans un
@@ -2786,6 +2877,118 @@ mod tests {
             )
         });
         assert!(has_white_cover, "expected an opaque white cover rectangle");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Le test qui distingue, à lui seul, un vrai caviardage d'un simple
+    /// cache visuel. Voir le test juste au-dessus,
+    /// `replace_text_with_overlay_covers_without_deleting_original_content`,
+    /// qui prouve l'inverse pour l'édition 6b. Après `redact_region` suivi
+    /// d'une sauvegarde puis d'une réouverture, le texte originellement
+    /// présent dans la zone caviardée ne doit plus être extractible du
+    /// tout, pas seulement masqué au rendu.
+    #[test]
+    fn redact_region_actually_removes_the_underlying_text() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = write_fixture(&bytes);
+
+        // Localise "Hello" dynamiquement plutôt que de coder en dur un
+        // rectangle, pour ne pas dépendre d'une mise en page précise du
+        // fixture.
+        let original = pdf_core::Document::open(bytes.clone()).unwrap();
+        let page0 = original.page(0).unwrap();
+        let content0 = original.page_content(&page0).unwrap();
+        let display0 =
+            pdf_core::interp::Interpreter::run_page(&original, page0.resources.clone(), &content0)
+                .unwrap();
+        let page_text = pdf_text::extract_page_text(&display0);
+        let hits = page_text.find_matches("Hello");
+        assert!(!hits.is_empty(), "fixture should contain \"Hello\"");
+        let hit = &hits[0];
+        // Marge généreuse : la boîte de caviardage n'a pas besoin d'être
+        // pixel-parfaite, seulement de couvrir la zone trouvée.
+        let rect = [hit.x0 - 2.0, hit.y0 - 4.0, hit.x1 + 2.0, hit.y1 + 4.0];
+
+        let mut session = EditSession::open(&path).unwrap();
+        session.redact_region(0, rect).unwrap();
+
+        let out_path = write_fixture(b"redact-out");
+        // `save_redacted`, pas `save_as` : voir sa doc — une sauvegarde
+        // incrémentale laisserait l'ancien flux de contenu ("Hello" inclus)
+        // physiquement présent dans le fichier, juste superseded dans la
+        // xref.
+        session.save_redacted(&out_path).unwrap();
+
+        let out_bytes = std::fs::read(&out_path).unwrap();
+        // Le test le plus fort possible pour un vrai caviardage : le texte
+        // retiré n'est même plus présent quelque part dans les octets bruts
+        // du fichier (pas seulement inatteignable en le reparsant
+        // normalement) — ce qu'une simple sauvegarde incrémentale ne
+        // garantirait pas (voir `save_redacted`). Cible la ligne complète de
+        // la page 0 précisément ("Page 1 - Hello...") plutôt que juste
+        // "Hello" tout court : ce mot légitime survit (compressé, donc pas
+        // recherchable tel quel en octets bruts) sur les pages 2 à 5, qui ne
+        // doivent pas être touchées — vérifié plus bas via un reparsing
+        // normal plutôt qu'un scan d'octets.
+        assert!(
+            !out_bytes
+                .windows(b"Page 1 - Hello".len())
+                .any(|w| w == b"Page 1 - Hello"),
+            "the literal redacted line must not survive anywhere in the saved file's raw bytes"
+        );
+
+        let reopened = pdf_core::Document::open(out_bytes).unwrap();
+        let page = reopened.page(0).unwrap();
+        let content = reopened.page_content(&page).unwrap();
+        let display =
+            pdf_core::interp::Interpreter::run_page(&reopened, page.resources.clone(), &content)
+                .unwrap();
+        let remaining_text = pdf_text::extract_text(&display);
+
+        assert!(
+            !remaining_text.contains("Hello"),
+            "\"Hello\" should have been removed from the content stream, got {remaining_text:?}"
+        );
+        // La ligne entière ("Page 1 - Hello, PDF Manager!") est un unique
+        // opérateur `Tj` dans ce fixture (voir `pdf-core/tests/fixtures/README.md`) :
+        // la retirer retire donc toute la ligne, pas seulement "Hello" — la
+        // granularité assumée de cette première passe (voir la doc de
+        // module de `redact`), pas un bug. Ce qui doit en revanche survivre :
+        // le rectangle tracé par ailleurs sur la page (loin de la zone
+        // caviardée) et le contenu des *autres* pages, non concernées.
+        let has_stroked_rect = display.items.iter().any(|item| {
+            matches!(
+                item,
+                pdf_core::display::DisplayItem::Path {
+                    paint: pdf_core::display::PaintOp::Stroke,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_stroked_rect,
+            "unrelated path content outside the redacted zone should survive"
+        );
+
+        let page1 = reopened.page(1).unwrap();
+        let content1 = reopened.page_content(&page1).unwrap();
+        let display1 =
+            pdf_core::interp::Interpreter::run_page(&reopened, page1.resources.clone(), &content1)
+                .unwrap();
+        assert!(
+            pdf_text::extract_text(&display1).contains("Page 2"),
+            "redaction on page 0 must not affect other pages"
+        );
+
+        // Une zone vide de contenu doit échouer plutôt que de prétendre
+        // avoir réussi sans rien avoir retiré.
+        let mut session2 = EditSession::open(&out_path).unwrap();
+        assert!(session2
+            .redact_region(0, [500.0, 10.0, 590.0, 40.0])
+            .is_err());
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&out_path).ok();

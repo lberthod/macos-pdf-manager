@@ -29,6 +29,7 @@ fn print_usage() {
         "       pdf-cli replace-text <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1> <font_size> <text>"
     );
     eprintln!("       pdf-cli remove-annotation <in.pdf> <out.pdf> <page_index> <annot_index>");
+    eprintln!("       pdf-cli redact <in.pdf> <out.pdf> <page_index> <x0> <y0> <x1> <y1>");
     eprintln!("       pdf-cli bench <file.pdf>");
     eprintln!("       pdf-cli verify-signatures <file.pdf>");
 }
@@ -69,6 +70,7 @@ fn main() -> ExitCode {
         Some("add-text") => run_add_text_args(&args),
         Some("replace-text") => run_replace_text_args(&args),
         Some("remove-annotation") => run_remove_annotation_args(&args),
+        Some("redact") => run_redact_args(&args),
         Some("bench") => args.get(2).map(|path| run_bench(path)),
         Some("verify-signatures") => args.get(2).map(|path| run_verify_signatures(path)),
         _ => None,
@@ -109,6 +111,32 @@ fn run_highlight_args(args: &[String]) -> Option<pdf_core::Result<()>> {
     let g: f32 = args.get(10).and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let b: f32 = args.get(11).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     Some(run_highlight(input, out, page_index, [x0, y0, x1, y1], (r, g, b)).map_err(pdf_error))
+}
+
+/// Caviardage sécurisé (`ROADMAP_IMPROVEMENT.md` §1.2, `pdf_edit::EditSession::redact_region`)
+/// — distinct de `replace-text`, qui masque visuellement sans toucher le
+/// flux de contenu d'origine. Retire réellement le texte/chemins/images
+/// dont la zone occupée croise le rectangle donné.
+fn run_redact_args(args: &[String]) -> Option<pdf_core::Result<()>> {
+    let input = args.get(2)?;
+    let out = args.get(3)?;
+    let page_index: usize = args.get(4)?.parse().ok()?;
+    let x0: f64 = args.get(5)?.parse().ok()?;
+    let y0: f64 = args.get(6)?.parse().ok()?;
+    let x1: f64 = args.get(7)?.parse().ok()?;
+    let y1: f64 = args.get(8)?.parse().ok()?;
+    Some(run_redact(input, out, page_index, [x0, y0, x1, y1]).map_err(pdf_error))
+}
+
+fn run_redact(input: &str, out: &str, page_index: usize, rect: [f64; 4]) -> Result<(), String> {
+    let mut session = pdf_edit::EditSession::open(input)?;
+    session.redact_region(page_index, rect)?;
+    // `save_redacted`, pas `save_as` : une sauvegarde incrémentale laisserait
+    // l'ancien flux de contenu (le texte caviardé) physiquement présent dans
+    // le fichier — voir la doc de `save_redacted`.
+    session.save_redacted(out)?;
+    println!("Redacted region on page {page_index} of {input}, saved to {out}");
+    Ok(())
 }
 
 /// Sprint 13-14 : ajoute une annotation `/Highlight` (`pdf-edit`) et

@@ -503,6 +503,11 @@ struct DocumentTab {
     /// Boîte de dialogue de saisie de texte actuellement ouverte (#30/#40),
     /// `None` si aucune — voir `TextInputModal`.
     text_modal: Option<TextInputModal>,
+    /// Rectangle (espace page) en attente de confirmation pour un
+    /// caviardage (`ROADMAP_IMPROVEMENT.md` §1.2) — `None` si aucune boîte
+    /// de confirmation n'est ouverte. Distinct de `text_modal` : pas de
+    /// texte à saisir, juste une confirmation avant une action destructive.
+    redact_confirm: Option<[f64; 4]>,
     /// Annotations de la page courante (Sprint 20, #32) — recalculées à
     /// chaque changement de page/édition (voir `ensure_annotations`),
     /// affichées en contour cliquable pour la suppression.
@@ -643,6 +648,7 @@ impl DocumentTab {
             selection_text: String::new(),
             add_text_mode: false,
             text_modal: None,
+            redact_confirm: None,
             annotations: Vec::new(),
             annotations_state: None,
             selected_annotation: None,
@@ -1002,6 +1008,31 @@ impl DocumentTab {
             y1 = y1.max(rect.y1);
         }
         Some([x0, y0, x1, y1])
+    }
+
+    /// Ouvre la confirmation de caviardage (`ROADMAP_IMPROVEMENT.md` §1.2)
+    /// pour la sélection de texte courante — action destructive, jamais
+    /// appliquée directement sans confirmation explicite (voir
+    /// `perform_redact`, appelé par le bouton "Confirmer" de cette boîte).
+    fn open_redact_confirm(&mut self) {
+        let Some(rect) = self.selection_bbox() else {
+            return;
+        };
+        self.redact_confirm = Some(rect);
+    }
+
+    /// Applique le caviardage confirmé par `redact_confirm` (voir
+    /// `pdf_app::Session::redact_on_current_page`) et ferme la boîte de
+    /// confirmation.
+    fn perform_redact(&mut self, rect: [f64; 4]) {
+        self.redact_confirm = None;
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        match session.redact_on_current_page(rect) {
+            Ok(()) => self.invalidate_after_edit(),
+            Err(e) => self.error = Some(format!("Impossible de caviarder : {e}")),
+        }
     }
 
     /// Ouvre la boîte de dialogue de saisie pour remplacer (superposition,
@@ -2292,6 +2323,43 @@ impl DocumentTab {
         }
     }
 
+    /// Boîte de confirmation pour `redact_confirm` (`ROADMAP_IMPROVEMENT.md`
+    /// §1.2) — action destructive et irréversible (le contenu retiré n'est
+    /// pas juste masqué mais réellement supprimé du fichier une fois
+    /// enregistré), jamais appliquée sans ce passage explicite.
+    fn show_redact_confirm(&mut self, ctx: &egui::Context) {
+        let Some(rect) = self.redact_confirm else {
+            return;
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Confirmer le caviardage")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Le contenu de cette zone (texte, formes, images) sera retiré du document — \
+                     contrairement à \"Remplacer\", qui ne fait que le masquer visuellement. \
+                     \"Annuler\" (⌘Z) reste possible avant enregistrement ; une fois enregistré, \
+                     le contenu original ne sera plus récupérable, même dans le fichier.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Confirmer").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if confirmed {
+            self.perform_redact(rect);
+        } else if cancelled {
+            self.redact_confirm = None;
+        }
+    }
+
     /// Met à jour la sélection de texte à partir du glissement de souris sur
     /// `response` (l'image de la page), et recalcule le texte/les
     /// rectangles sélectionnés en conséquence. Invalide la sélection
@@ -2694,6 +2762,20 @@ impl DocumentTab {
                             }
                             if ui.button("Remplacer…").clicked() {
                                 self.open_replace_text_modal();
+                            }
+                            // Distinct de "Remplacer…" (superposition, ne
+                            // touche jamais le flux d'origine) : celui-ci
+                            // retire réellement le contenu, voir la doc de
+                            // `open_redact_confirm`.
+                            if ui
+                                .button("Caviarder…")
+                                .on_hover_text(
+                                    "Retire définitivement le contenu de cette zone \
+                                     (contrairement à Remplacer, qui ne fait que le masquer)",
+                                )
+                                .clicked()
+                            {
+                                self.open_redact_confirm();
                             }
                         });
                     }
@@ -3101,6 +3183,7 @@ impl DocumentTab {
         });
 
         self.show_text_modal(ctx);
+        self.show_redact_confirm(ctx);
         self.show_choice_field_popup(ctx);
         self.show_annotation_style_popup(ctx);
         self.show_password_prompt(ctx);

@@ -55,7 +55,7 @@ débloque le plus d'usages réels.
 
 ---
 
-### 2. Caviardage sécurisé — absent → complet
+### 2. Caviardage sécurisé — absent → complet (métadonnées/XMP en suspens)
 
 **Pourquoi en priorité 2 :** ce n'est pas qu'une fonctionnalité manquante,
 c'est un piège actif. Le mécanisme le plus proche (`replace_text_with_overlay`)
@@ -103,7 +103,29 @@ reste extractible. Ne pas le corriger, c'est laisser un angle mort connu.
 
 **Effort : L.** Le retrait d'opérateurs texte est relativement direct ; le
 cas des images partiellement couvertes et le nettoyage de métadonnées sont
-ce qui pousse l'estimation vers L plutôt que M.
+ce qui pousse l'estimation vers L vs M.
+
+**Statut (2026-09-03) :** étapes 1, 2 (variante "tout ou rien" pour
+images/formulaires plutôt que le recadrage XL), 4 et 5 faites, étape 6
+faite côté application (pas la barre native macOS) :
+- `pdf_edit::EditSession::redact_region` (`pdf-edit/src/redact.rs`) retire
+  réellement texte/chemins/images dont la zone croise le rectangle donné.
+- `EditSession::save_redacted` (remplace `save_as` après une redaction)
+  réécrit le fichier en entier via `export_optimized` plutôt qu'une simple
+  sauvegarde incrémentale — sans ça, l'ancien flux de contenu caviardé
+  resterait physiquement présent dans le fichier, juste superseded dans la
+  xref. `pdf_app::Session` bascule automatiquement dessus (`has_redaction`)
+  dès qu'une redaction a eu lieu dans la session.
+- Exposé via `pdf-cli redact` et, dans `pdf-ui`, un bouton "Caviarder…"
+  distinct de "Remplacer…" avec confirmation explicite avant application.
+- Testé bout en bout, y compris au niveau des octets bruts du fichier
+  sauvegardé (pas seulement en reparsant normalement) : voir
+  `pdf-edit/src/lib.rs::redact_region_actually_removes_the_underlying_text`.
+
+Reste : le nettoyage des métadonnées/XMP (`/Info`, `/Metadata`) n'est pas
+fait — documenté comme limite connue, pas encore un chantier engagé — et
+les images en ligne (`BI`/`ID`/`EI`) sont volontairement rejetées avec une
+erreur explicite plutôt que prises en charge.
 
 ---
 

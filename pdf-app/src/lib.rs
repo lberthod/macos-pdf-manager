@@ -153,6 +153,15 @@ pub struct Session {
     /// modifications en attente, sans jamais toucher au fichier sur disque
     /// tant que l'utilisateur ne sauvegarde pas explicitement.
     edit: pdf_edit::EditSession,
+    /// `true` dès qu'un `redact_on_current_page` a eu lieu dans cette
+    /// session — jamais remis à `false`. Fait passer `save_edits_in_place`
+    /// sur `EditSession::save_redacted` plutôt que `save_as` (voir sa doc) :
+    /// une sauvegarde incrémentale classique laisserait l'ancien flux de
+    /// contenu caviardé physiquement présent dans le fichier. Une fois
+    /// qu'une vraie redaction a eu lieu, **tous** les enregistrements
+    /// suivants de cette session doivent purger les objets orphelins, pas
+    /// seulement le tout premier.
+    has_redaction: bool,
 }
 
 impl Session {
@@ -193,6 +202,7 @@ impl Session {
             outline_cache: RefCell::new(None),
             gpu: None,
             edit,
+            has_redaction: false,
         })
     }
 
@@ -496,6 +506,18 @@ impl Session {
             text_color,
             background,
         )?;
+        self.refresh_after_edit()
+    }
+
+    /// Caviardage sécurisé de `rect` sur la page courante (voir
+    /// `pdf_edit::EditSession::redact_region` et `ROADMAP_IMPROVEMENT.md`
+    /// §1.2) — retire réellement le contenu concerné, contrairement à
+    /// `replace_text_on_current_page` (superposition, non sécurisée pour cet
+    /// usage). Marque la session pour que `save_edits_in_place` bascule sur
+    /// `EditSession::save_redacted` (voir sa doc).
+    pub fn redact_on_current_page(&mut self, rect: [f64; 4]) -> Result<(), String> {
+        self.edit.redact_region(self.page_index, rect)?;
+        self.has_redaction = true;
         self.refresh_after_edit()
     }
 
@@ -874,7 +896,11 @@ impl Session {
     /// vue de l'utilisateur c'est bien la même session de fichier qui est
     /// mise à jour.
     pub fn save_edits_in_place(&self) -> Result<(), String> {
-        self.edit.save_as(&self.path)
+        if self.has_redaction {
+            self.edit.save_redacted(&self.path)
+        } else {
+            self.edit.save_as(&self.path)
+        }
     }
 
     /// Octets du document courant, éditions en attente incluses (voir

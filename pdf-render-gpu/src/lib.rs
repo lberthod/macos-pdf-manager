@@ -1179,6 +1179,20 @@ impl GpuContext {
                         rgba,
                         quad,
                     } => {
+                        // Audit 2026-10-26 #10 : la cible de rendu est bornée
+                        // par `max_texture_dimension_2d` en amont, mais pas
+                        // ces textures-source d'images. `decode_image`
+                        // plafonne le nombre de *pixels* (64 M), pas chaque
+                        // dimension : une image forgée 20000×3000 (sous le
+                        // cap) dépasse la limite 8192 et faisait paniquer
+                        // wgpu (`Validation Error … exceeds the limit`) sur
+                        // le thread principal d'egui, non protégé par
+                        // `catch_unwind`. On ignore alors l'image (non
+                        // peinte) plutôt que de faire tomber l'application.
+                        let max_dim = self.device.limits().max_texture_dimension_2d;
+                        if *img_w > max_dim || *img_h > max_dim || *img_w == 0 || *img_h == 0 {
+                            continue;
+                        }
                         let texture = self.device.create_texture_with_data(
                             &self.queue,
                             &wgpu::TextureDescriptor {
@@ -1311,7 +1325,9 @@ impl GpuContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdf_core::display::{Color, DisplayItem, DisplayList, FillRule, PaintOp, PathSegment};
+    use pdf_core::display::{
+        Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+    };
 
     fn pixel(page: &RenderedPage, x: u32, y: u32) -> (u8, u8, u8, u8) {
         let i = ((y * page.width + x) * 4) as usize;
@@ -1344,6 +1360,44 @@ mod tests {
                 clip: None,
             }],
         }
+    }
+
+    /// Audit 2026-10-26 #10 : une image dont une dimension dépasse
+    /// `max_texture_dimension_2d` (ici 20000 > 8192/16384) tout en restant
+    /// sous le plafond de 64 M *pixels* faisait paniquer wgpu
+    /// (`create_texture_with_data` → « Validation Error … exceeds the
+    /// limit ») sur le thread principal d'egui, non protégé par
+    /// `catch_unwind`. Le rendu doit désormais ignorer l'image et renvoyer
+    /// `Ok` sans paniquer.
+    #[test]
+    fn oversized_source_image_is_skipped_instead_of_panicking() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        // 20000×2 = 40 000 pixels (bien sous le cap de 64 M), mais 20000
+        // dépasse `max_texture_dimension_2d` sur tout GPU courant.
+        let decoded = DecodedImage {
+            width: 20_000,
+            height: 2,
+            rgba: vec![0xFF; 20_000 * 2 * 4],
+        };
+        let display = DisplayList {
+            items: vec![DisplayItem::Image {
+                resource: "Im0".to_string(),
+                transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
+                pixels: Some(decoded),
+                clip: None,
+            }],
+        };
+
+        // Ne doit pas paniquer ; l'image surdimensionnée est simplement non
+        // peinte.
+        let page = renderer
+            .render_page(&display, [0.0, 0.0, 100.0, 100.0])
+            .expect("le rendu devrait réussir en ignorant l'image");
+        assert_eq!((page.width, page.height), (100, 100));
     }
 
     /// `GpuRenderer` doit rester utilisable pour plusieurs pages

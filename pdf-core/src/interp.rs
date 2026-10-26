@@ -21,14 +21,49 @@ use std::rc::Rc;
 
 use crate::content::{parse_content_stream, ContentInstruction};
 use crate::display::{
-    ClipPath, ClipStack, Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+    ClipPath, ClipStack, Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp,
+    PathSegment,
 };
 use crate::document::Document;
 use crate::error::Result;
 use crate::font::Font;
-use crate::object::{Dictionary, ObjRef, Object};
+use crate::object::{Dictionary, ObjRef, Object, Stream};
 
 const MAX_XOBJECT_DEPTH: usize = 12;
+
+/// Budget cumulé d'invocations de Form XObjects pour une page. Audit
+/// 2026-10-26 #13 : `MAX_XOBJECT_DEPTH` borne la *profondeur* (pas de
+/// débordement de pile) mais pas le *travail* — un Form qui s'invoque *b*
+/// fois par niveau exécute b¹² flux (b = 3 : 265 720 items ; b = 10 :
+/// hang/OOM garanti). Une page réelle n'approche pas ce nombre même en
+/// réutilisant massivement un symbole (cartographie).
+const MAX_FORM_INVOCATIONS_PER_PAGE: usize = 100_000;
+
+/// Budget cumulé d'octets de contenu décodé interprétés à travers les Form
+/// XObjects d'une page : la moitié du plus gros flux de contenu unique
+/// autorisé (`filters::MAX_DECODED_LEN`, 256 Mo), pour que l'imbrication de
+/// Forms n'amplifie pas au-delà de ce qu'un seul flux pourrait déjà faire.
+/// Chaque invocation compte la taille de son flux, même si c'est le même
+/// Form réinvoqué : c'est le travail d'interprétation qui est borné.
+const MAX_FORM_BYTES_PER_PAGE: usize = 128 * 1024 * 1024;
+
+/// Profondeur maximale de la chaîne de clips (`W`/`W*` sans `Q` pour les
+/// dépiler). Audit 2026-10-26 #27 : chaque clip recopie la chaîne de ses
+/// parents, donc N clips imbriqués coûtaient O(N²) en mémoire et en rendu
+/// (chaque item rejoue toute la chaîne). Au-delà, un nouveau clip est
+/// ignoré (le contenu est moins rogné, jamais masqué à tort). Le moteur GPU
+/// code en outre chaque niveau dans un stencil 8 bits : la limite reste
+/// loin de 255. Les PDF réels imbriquent rarement plus de quelques dizaines
+/// de clips.
+const MAX_CLIP_DEPTH: usize = 64;
+
+/// Total d'octets RGBA d'images *distinctes* qu'une page s'autorise à
+/// décoder. Audit 2026-10-26 #28 : chaque image distincte peut atteindre
+/// 64 M pixels (256 Mo RGBA, plafond de `image.rs`), et quelques images
+/// compressées de quelques Ko chacune suffisaient à réclamer plusieurs Go.
+/// Une page scannée réelle (A4 couleur à 600 dpi) fait ~140 Mo RGBA. Les
+/// images au-delà du budget ne sont pas peintes (`pixels: None`).
+const MAX_PAGE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct GraphicsState {
@@ -105,6 +140,18 @@ pub struct Interpreter<'a> {
     /// `resources_stack` imbriquées puisqu'il n'y a alors pas de référence
     /// d'objet stable à utiliser comme clé.
     font_cache: BTreeMap<ObjRef, Rc<Font>>,
+    /// Images déjà décodées, clé par référence d'objet (un flux d'image est
+    /// toujours un objet indirect) — même principe que `font_cache`. Un
+    /// échec de décodage est aussi mémorisé (`None`) : redécoder 1000 fois
+    /// une image JBIG2 non supportée n'apporterait rien. Voir
+    /// `MAX_PAGE_IMAGE_BYTES` (audit 2026-10-26 #28).
+    image_cache: BTreeMap<ObjRef, Option<Rc<DecodedImage>>>,
+    /// Octets RGBA restants avant d'atteindre `MAX_PAGE_IMAGE_BYTES`.
+    image_bytes_left: u64,
+    /// Invocations de Form XObjects restantes (`MAX_FORM_INVOCATIONS_PER_PAGE`).
+    form_invocations_left: usize,
+    /// Octets de contenu de Forms restants (`MAX_FORM_BYTES_PER_PAGE`).
+    form_bytes_left: usize,
 }
 
 impl<'a> Interpreter<'a> {
@@ -123,6 +170,10 @@ impl<'a> Interpreter<'a> {
             resources_stack: vec![resources],
             depth: 0,
             font_cache: BTreeMap::new(),
+            image_cache: BTreeMap::new(),
+            image_bytes_left: MAX_PAGE_IMAGE_BYTES,
+            form_invocations_left: MAX_FORM_INVOCATIONS_PER_PAGE,
+            form_bytes_left: MAX_FORM_BYTES_PER_PAGE,
         }
     }
 
@@ -581,12 +632,20 @@ impl<'a> Interpreter<'a> {
             // est donc peint avec le clip *avant* mise à jour.
             let clip_before = self.gs.clip.clone();
             if let Some(rule) = clip_rule {
-                let mut stack: Vec<ClipPath> = self.gs.clip.as_deref().cloned().unwrap_or_default();
-                stack.push(ClipPath {
-                    segments: segments.clone(),
-                    fill_rule: rule,
-                });
-                self.gs.clip = Some(Rc::new(stack));
+                let depth = self.gs.clip.as_deref().map_or(0, Vec::len);
+                // Au-delà de `MAX_CLIP_DEPTH`, le nouveau clip est ignoré
+                // (voir la constante). Le clonage de la chaîne parente ne
+                // copie que des pointeurs (`ClipPath::segments` est un
+                // `Rc<[_]>`), donc il reste O(profondeur).
+                if depth < MAX_CLIP_DEPTH {
+                    let mut stack: Vec<ClipPath> =
+                        self.gs.clip.as_deref().cloned().unwrap_or_default();
+                    stack.push(ClipPath {
+                        segments: Rc::from(segments.as_slice()),
+                        fill_rule: rule,
+                    });
+                    self.gs.clip = Some(Rc::new(stack));
+                }
             }
             self.display.items.push(DisplayItem::Path {
                 segments,
@@ -749,7 +808,7 @@ impl<'a> Interpreter<'a> {
                 // Une image non supportée (CCITT, JBIG2, espace colorimétrique
                 // indexé...) ne doit pas faire échouer tout le reste de la
                 // page : on dégrade en `pixels: None` (voir image.rs).
-                let pixels = crate::image::decode_image(self.doc, stream).ok();
+                let pixels = self.decode_image_cached(name, stream);
                 self.display.items.push(DisplayItem::Image {
                     resource: name.clone(),
                     transform: self.gs.ctm,
@@ -761,7 +820,19 @@ impl<'a> Interpreter<'a> {
                 if self.depth >= MAX_XOBJECT_DEPTH {
                     return Ok(()); // garde-fou contre les formes auto-référentes.
                 }
+                // Budget cumulé par page (voir `MAX_FORM_INVOCATIONS_PER_PAGE`
+                // et `MAX_FORM_BYTES_PER_PAGE`) : une fois épuisé, les Forms
+                // suivants ne sont plus interprétés.
+                if self.form_invocations_left == 0 || self.form_bytes_left == 0 {
+                    return Ok(());
+                }
+                self.form_invocations_left -= 1;
                 let decoded = crate::filters::decode_stream(stream)?;
+                if decoded.len() > self.form_bytes_left {
+                    self.form_bytes_left = 0;
+                    return Ok(());
+                }
+                self.form_bytes_left -= decoded.len();
                 let form_resources = match stream.dict.get("Resources") {
                     Some(obj) => self
                         .doc
@@ -792,6 +863,47 @@ impl<'a> Interpreter<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Référence d'objet de l'entrée `name` de la catégorie `category` des
+    /// ressources courantes, si c'est une référence indirecte.
+    fn resource_ref(&self, category: &str, name: &str) -> Option<ObjRef> {
+        let resources = self.resources_stack.last()?;
+        let cat_obj = resources.get(category)?;
+        let cat_dict = self.doc.get(cat_obj).ok()?;
+        cat_dict.as_dict()?.get(name)?.as_reference()
+    }
+
+    /// Décode l'image XObject `name` (ou la reprend de `image_cache`), dans
+    /// la limite de `MAX_PAGE_IMAGE_BYTES` pour la page (audit 2026-10-26
+    /// #28). `None` si le décodage échoue ou si le budget est épuisé.
+    fn decode_image_cached(&mut self, name: &str, stream: &Stream) -> Option<Rc<DecodedImage>> {
+        let key = self.resource_ref("XObject", name);
+        if let Some(cached) = key.and_then(|r| self.image_cache.get(&r)) {
+            return cached.clone();
+        }
+        // Estimation d'après `/Width`/`/Height`, *avant* de décoder : on ne
+        // veut pas allouer le bitmap pour le jeter ensuite. Une estimation
+        // impossible (dimensions absentes ou démesurées) est laissée aux
+        // contrôles de `decode_image`, qui rejettent ces cas proprement.
+        let over_budget =
+            image_rgba_estimate(&stream.dict).is_some_and(|bytes| bytes > self.image_bytes_left);
+        let pixels = if over_budget {
+            None
+        } else {
+            crate::image::decode_image(self.doc, stream)
+                .ok()
+                .map(Rc::new)
+        };
+        if let Some(image) = &pixels {
+            self.image_bytes_left = self
+                .image_bytes_left
+                .saturating_sub(image.rgba.len() as u64);
+        }
+        if let Some(r) = key {
+            self.image_cache.insert(r, pixels.clone());
+        }
+        pixels
     }
 
     fn lookup_resource(&self, category: &str, name: &str) -> Result<Option<Object>> {
@@ -842,6 +954,15 @@ impl<'a> Interpreter<'a> {
         let dict = dict.as_dict()?;
         Font::load(self.doc, dict).ok().map(Rc::new)
     }
+}
+
+/// Taille RGBA (4 octets par pixel) qu'aurait l'image une fois décodée,
+/// d'après son dictionnaire. `None` si `/Width`/`/Height` manquent ou si le
+/// produit déborde.
+fn image_rgba_estimate(dict: &Dictionary) -> Option<u64> {
+    let width = dict.get("Width")?.as_int()?.max(0) as u64;
+    let height = dict.get("Height")?.as_int()?.max(0) as u64;
+    width.checked_mul(height)?.checked_mul(4)
 }
 
 fn num(ops: &[Object], index: usize) -> f64 {
@@ -1479,5 +1600,135 @@ mod tests {
         let content = doc.page_content(&page).unwrap();
         let display = Interpreter::run_page_with_annotations(&doc, &page, &content).unwrap();
         assert!(display.items.is_empty());
+    }
+
+    /// Document dont les objets `1..=n` ont pour corps `objects` (objet 1 =
+    /// catalogue), avec une table xref exacte.
+    fn doc_from_objects(objects: &[String]) -> Document {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+            offsets.len() + 1
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+        Document::open(bytes).unwrap()
+    }
+
+    fn stream_object(dict_entries: &str, data: &str) -> String {
+        format!(
+            "<< {dict_entries} /Length {} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+    }
+
+    /// Ressources `<< /XObject << /<name> 3 0 R >> >>`.
+    fn xobject_resources(name: &str) -> Dictionary {
+        let mut xobjects = Dictionary::new();
+        xobjects.insert(name, Object::Reference(ObjRef::new(3, 0)));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+        resources
+    }
+
+    fn catalog_and_pages() -> Vec<String> {
+        vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
+        ]
+    }
+
+    /// Audit 2026-10-26 #13 : un Form qui s'invoque 10 fois par niveau
+    /// exécutait 10¹² flux malgré `MAX_XOBJECT_DEPTH` (hang garanti). Le
+    /// budget cumulé par page doit borner le travail total : l'interprétation
+    /// se termine, et le nombre d'items reste sous le budget d'invocations.
+    #[test]
+    fn self_invoking_form_fan_out_is_bounded_per_page() {
+        let content = format!("0 0 1 1 re f {}", "/Fx Do ".repeat(10));
+        let mut objects = catalog_and_pages();
+        objects.push(stream_object(
+            "/Type /XObject /Subtype /Form /BBox [0 0 1 1] \
+             /Resources << /XObject << /Fx 3 0 R >> >>",
+            &content,
+        ));
+        let doc = doc_from_objects(&objects);
+
+        let display = Interpreter::run_page(&doc, xobject_resources("Fx"), b"/Fx Do").unwrap();
+        assert!(!display.items.is_empty());
+        assert!(
+            display.items.len() <= MAX_FORM_INVOCATIONS_PER_PAGE,
+            "{} items",
+            display.items.len()
+        );
+    }
+
+    /// Audit 2026-10-26 #27 : 1000 clips imbriqués (sans `Q`) produisaient
+    /// une chaîne de 1000 clips recopiée à chaque `W` (O(n²)). La chaîne est
+    /// désormais plafonnée à `MAX_CLIP_DEPTH`.
+    #[test]
+    fn nested_clip_chain_is_capped() {
+        let doc = doc_from_objects(&catalog_and_pages());
+        let content = format!("{}0 0 1 1 re f", "0 0 1 1 re W n ".repeat(1000));
+        let display = Interpreter::run_page(&doc, Dictionary::new(), content.as_bytes()).unwrap();
+        let Some(DisplayItem::Path { clip, .. }) = display.items.last() else {
+            panic!("dernier item attendu : le remplissage");
+        };
+        assert_eq!(clip.as_ref().map(|c| c.len()), Some(MAX_CLIP_DEPTH));
+    }
+
+    fn image_document() -> Document {
+        let mut objects = catalog_and_pages();
+        // Image 2×2 DeviceRGB rouge, en hexadécimal pour rester textuelle.
+        objects.push(stream_object(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 \
+             /ColorSpace /DeviceRGB /Filter /ASCIIHexDecode",
+            "FF0000FF0000FF0000FF0000>",
+        ));
+        doc_from_objects(&objects)
+    }
+
+    /// Audit 2026-10-26 #28 : chaque `Do` d'une même image redécodait et
+    /// gardait sa propre copie RGBA (50 `Do` d'une image 1500×1500 = 450 Mo).
+    /// Toutes les occurrences doivent partager un seul bitmap.
+    #[test]
+    fn repeated_image_do_shares_one_decoded_bitmap() {
+        let doc = image_document();
+        let content = "/Im0 Do ".repeat(50);
+        let display =
+            Interpreter::run_page(&doc, xobject_resources("Im0"), content.as_bytes()).unwrap();
+        let bitmaps: Vec<&Rc<DecodedImage>> = display
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Image { pixels, .. } => pixels.as_ref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bitmaps.len(), 50);
+        assert!(bitmaps.iter().all(|b| Rc::ptr_eq(b, bitmaps[0])));
+        assert_eq!(bitmaps[0].rgba.len(), 2 * 2 * 4);
+    }
+
+    /// Le budget RGBA par page est vérifié *avant* de décoder : une image
+    /// qui le dépasserait n'est pas peinte (`pixels: None`).
+    #[test]
+    fn image_over_the_page_budget_is_not_decoded() {
+        let doc = image_document();
+        let mut interp = Interpreter::new(&doc, xobject_resources("Im0"));
+        interp.image_bytes_left = 15; // l'image fait 2×2×4 = 16 octets
+        interp.run(b"/Im0 Do").unwrap();
+        let Some(DisplayItem::Image { pixels, .. }) = interp.display.items.first() else {
+            panic!("un item image attendu");
+        };
+        assert!(pixels.is_none());
     }
 }

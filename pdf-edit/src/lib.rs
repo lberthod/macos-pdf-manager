@@ -2300,12 +2300,41 @@ fn escape_pdf_literal(text: &str) -> String {
 /// résoudre/copier récursivement l'objet référencé, donc une référence
 /// arrière retrouve un numéro déjà attribué plutôt que de boucler à
 /// l'infini).
+///
+/// Itératif sur les références (audit 2026-10-26 #26) : suivre chaque
+/// `N 0 R` par un appel récursif faisait déborder la pile sur une chaîne
+/// `1 0 R → 2 0 R → …` de quelques dizaines de milliers de maillons (fusion
+/// ou extraction d'un document hostile). Une référence rencontrée reçoit
+/// son nouveau numéro tout de suite (même rôle de `copy_map` qu'avant) mais
+/// est mise en file au lieu d'être suivie ; la récursion ne descend donc
+/// plus qu'à l'intérieur d'un seul objet (tableaux et dictionnaires
+/// imbriqués), dont la profondeur est déjà bornée par le parseur. Aucune
+/// limite arbitraire n'est imposée à la longueur d'une chaîne légitime.
 fn copy_object_recursive(
     source: &Document,
     obj: &Object,
     pending: &mut std::collections::BTreeMap<u32, Object>,
     next_num: &mut u32,
     copy_map: &mut std::collections::HashMap<u32, u32>,
+) -> Result<Object, String> {
+    let mut queue: Vec<(ObjRef, u32)> = Vec::new();
+    let out = copy_object_shallow(obj, next_num, copy_map, &mut queue)?;
+    while let Some((old_ref, new_num)) = queue.pop() {
+        let resolved = source.resolve(old_ref).map_err(|e| e.to_string())?;
+        let copied = copy_object_shallow(&resolved, next_num, copy_map, &mut queue)?;
+        pending.insert(new_num, copied);
+    }
+    Ok(out)
+}
+
+/// Copie `obj` sans suivre ses références : chacune est renumérotée (ou
+/// retrouvée dans `copy_map`) et, si elle est nouvelle, ajoutée à `queue`
+/// pour que `copy_object_recursive` la copie à son tour.
+fn copy_object_shallow(
+    obj: &Object,
+    next_num: &mut u32,
+    copy_map: &mut std::collections::HashMap<u32, u32>,
+    queue: &mut Vec<(ObjRef, u32)>,
 ) -> Result<Object, String> {
     match obj {
         Object::Reference(r) => {
@@ -2315,18 +2344,13 @@ fn copy_object_recursive(
             let new_num = *next_num;
             *next_num += 1;
             copy_map.insert(r.num, new_num);
-
-            let resolved = source.resolve(*r).map_err(|e| e.to_string())?;
-            let copied = copy_object_recursive(source, &resolved, pending, next_num, copy_map)?;
-            pending.insert(new_num, copied);
+            queue.push((*r, new_num));
             Ok(Object::Reference(ObjRef::new(new_num, 0)))
         }
         Object::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(copy_object_recursive(
-                    source, item, pending, next_num, copy_map,
-                )?);
+                out.push(copy_object_shallow(item, next_num, copy_map, queue)?);
             }
             Ok(Object::Array(out))
         }
@@ -2348,7 +2372,7 @@ fn copy_object_recursive(
                 }
                 out.insert(
                     k.clone(),
-                    copy_object_recursive(source, v, pending, next_num, copy_map)?,
+                    copy_object_shallow(v, next_num, copy_map, queue)?,
                 );
             }
             Ok(Object::Dictionary(out))
@@ -2358,7 +2382,7 @@ fn copy_object_recursive(
             for (k, v) in stream.dict.iter() {
                 out_dict.insert(
                     k.clone(),
-                    copy_object_recursive(source, v, pending, next_num, copy_map)?,
+                    copy_object_shallow(v, next_num, copy_map, queue)?,
                 );
             }
             // Les octets bruts ne sont jamais redécodés/recompressés : le
@@ -3765,5 +3789,59 @@ mod tests {
         assert!(err.contains("FreeText") || err.contains("unsupported"));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Audit 2026-10-26 #26 : `copy_object_recursive` suivait chaque
+    /// référence par un appel récursif. Une chaîne `3 0 R → 4 0 R → …` de
+    /// 50 000 maillons (fusion ou extraction d'un document hostile)
+    /// débordait la pile et faisait tomber le processus. La copie est
+    /// désormais itérative : elle se termine et recopie toute la chaîne.
+    #[test]
+    fn copy_object_recursive_handles_a_very_long_reference_chain() {
+        const CHAIN: u32 = 50_000;
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        let mut push = |bytes: &mut Vec<u8>, body: String| {
+            offsets.push(bytes.len());
+            let num = offsets.len();
+            bytes.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(&mut bytes, "<< /Type /Catalog /Pages 2 0 R >>".to_string());
+        push(
+            &mut bytes,
+            "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
+        );
+        // Objets 3..=CHAIN+2 : chacun pointe sur le suivant, le dernier est vide.
+        for num in 3..CHAIN + 2 {
+            push(&mut bytes, format!("[{} 0 R]", num + 1));
+        }
+        push(&mut bytes, "[]".to_string());
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+            offsets.len() + 1
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+        let source = Document::open(bytes).unwrap();
+
+        let mut pending = std::collections::BTreeMap::new();
+        let mut next_num = 1u32;
+        let mut copy_map = std::collections::HashMap::new();
+        let copied = copy_object_recursive(
+            &source,
+            &Object::Reference(ObjRef::new(3, 0)),
+            &mut pending,
+            &mut next_num,
+            &mut copy_map,
+        )
+        .unwrap();
+
+        assert_eq!(copied, Object::Reference(ObjRef::new(1, 0)));
+        assert_eq!(pending.len(), CHAIN as usize);
+        assert_eq!(next_num, CHAIN + 1);
     }
 }

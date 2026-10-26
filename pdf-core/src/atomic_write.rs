@@ -58,10 +58,20 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Répertoire propre à chaque appel. Le compteur est indispensable : les
+    /// tests tournent en parallèle dans le même processus (même pid), et
+    /// l'horloge réelle de macOS n'a qu'une résolution d'une microseconde.
+    /// Deux tests démarrant dans la même microseconde partageaient sinon le
+    /// même répertoire et le même `out.pdf`, l'un réécrivant ou supprimant
+    /// le fichier de l'autre. D'où un échec intermittent de
+    /// `preserves_existing_file_permissions_after_overwrite` (permissions
+    /// 0o644 lues au lieu de 0o640).
     fn temp_dir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
         dir.push(format!(
-            "pdf-core-write-atomic-test-{}-{}",
+            "pdf-core-write-atomic-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

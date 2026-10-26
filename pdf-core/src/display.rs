@@ -100,9 +100,16 @@ pub enum PathSegment {
 /// au moment de `W`/`W*`) accompagné de sa règle de remplissage. Une
 /// `DisplayItem` peut porter une chaîne de plusieurs `ClipPath` (clips
 /// imbriqués) : la zone effective est leur **intersection**.
+///
+/// `segments` est partagé (`Rc<[_]>`) plutôt que possédé : chaque nouveau
+/// clip recopie la chaîne de ses parents, et un `Vec` imposait de recopier
+/// aussi tous leurs segments, soit un coût O(profondeur × taille des
+/// clips) par opérateur `W`. Audit 2026-10-26 #27 : un flux de quelques Ko
+/// coûtait ainsi 12 s (CPU) à 42 s (GPU) de rendu. Avec `Rc`, cloner un
+/// `ClipPath` ne copie qu'un pointeur.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipPath {
-    pub segments: Vec<PathSegment>,
+    pub segments: Rc<[PathSegment]>,
     pub fill_rule: FillRule,
 }
 
@@ -162,10 +169,15 @@ pub enum DisplayItem {
     /// format n'est pas supporté (`CCITTFaxDecode`, `JBIG2Decode`,
     /// `JPXDecode`, espaces colorimétriques indexés/Separation, profondeurs
     /// autres que 8 bits/composante — voir `image.rs`).
+    ///
+    /// `Rc` : la même image dessinée par plusieurs `Do` (ou plusieurs
+    /// invocations d'un Form XObject) partage un seul bitmap décodé au lieu
+    /// d'en garder une copie RGBA complète par occurrence (audit 2026-10-26
+    /// #28 : 50 `Do` d'une image 1500×1500 retenaient 450 Mo).
     Image {
         resource: String,
         transform: Matrix,
-        pixels: Option<DecodedImage>,
+        pixels: Option<Rc<DecodedImage>>,
         clip: Option<ClipStack>,
     },
 }

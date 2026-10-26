@@ -577,7 +577,7 @@ mod tests {
             items: vec![DisplayItem::Image {
                 resource: "Im0".into(),
                 transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
-                pixels: Some(image),
+                pixels: Some(Rc::new(image)),
                 clip: None,
             }],
         };
@@ -605,7 +605,7 @@ mod tests {
             PathSegment::ClosePath,
         ];
         let clip = Some(Rc::new(vec![ClipPath {
-            segments: clip_rect,
+            segments: clip_rect.into(),
             fill_rule: FillRule::NonZero,
         }]));
 
@@ -683,7 +683,7 @@ mod tests {
             items: vec![DisplayItem::Image {
                 resource: "Im0".into(),
                 transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
-                pixels: Some(image),
+                pixels: Some(Rc::new(image)),
                 clip: None,
             }],
         };

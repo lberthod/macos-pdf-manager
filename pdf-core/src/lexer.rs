@@ -37,6 +37,19 @@ fn is_regular(b: u8) -> bool {
     !is_whitespace(b) && !is_delimiter(b)
 }
 
+/// Normalise une valeur réelle lue dans le flux : un nombre non fini
+/// (`inf`/`NaN`, issu d'un littéral démesuré) est ramené à `0.0`. Audit
+/// 2026-10-26 #14 : garantit que la couche numérique du parseur n'émet
+/// jamais de valeur non finie, qui ferait paniquer le rasteriseur GPU et
+/// contaminerait les matrices de transformation.
+fn sanitize_real(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 pub struct Lexer<'a> {
     data: &'a [u8],
     pos: usize,
@@ -186,11 +199,17 @@ impl<'a> Lexer<'a> {
             };
             let normalized = normalized.trim_end_matches('.');
             let value: f64 = normalized.parse().unwrap_or(0.0);
-            Ok(Token::Real(value))
+            Ok(Token::Real(sanitize_real(value)))
         } else {
             match text.parse::<i64>() {
                 Ok(v) => Ok(Token::Integer(v)),
-                Err(_) => Ok(Token::Real(text.parse().unwrap_or(0.0))),
+                // Un entier hors `i64` (ex. 400 chiffres) retombe ici en
+                // `f64` : `parse` donne alors `inf`. Audit 2026-10-26 #14 :
+                // sans assainissement, cet `inf` se propage dans `cm`/`w`/
+                // `Tf`, `Matrix::then` (inf×0) produit des `NaN`, et le
+                // back-end GPU (`lyon`) fait un `debug_assert!(is_finite)`
+                // qui panique en build debug. On normalise à la source.
+                Err(_) => Ok(Token::Real(sanitize_real(text.parse().unwrap_or(0.0)))),
             }
         }
     }
@@ -345,6 +364,31 @@ mod tests {
                 Token::Real(4.0),
             ]
         );
+    }
+
+    /// Audit 2026-10-26 #14 : un littéral numérique démesuré (entier hors
+    /// `i64`, ou réel qui déborde `f64`) retombait sur un `parse::<f64>()`
+    /// produisant `inf`, propagé ensuite dans les matrices `cm`/`w`/`Tf` —
+    /// `inf × 0` donne `NaN`, et le rasteriseur GPU (`lyon`) panique sur une
+    /// coordonnée non finie en build debug. Le lexer doit désormais ne
+    /// jamais émettre de `Token::Real` non fini.
+    #[test]
+    fn oversized_literals_never_produce_non_finite_reals() {
+        // Notation scientifique volontairement absente : « 1e400 » n'est pas
+        // de la syntaxe de nombre PDF (le lexer la découperait en plusieurs
+        // tokens). Le vecteur réel est le littéral entièrement numérique
+        // trop grand pour `i64` (puis `f64`).
+        let huge_int = "1".repeat(400); // bien au-delà de i64
+        let huge_real = format!("{}.0", "9".repeat(400)); // bien au-delà de f64
+        for input in [huge_int.as_str(), huge_real.as_str()] {
+            match tokens(input).as_slice() {
+                [Token::Real(v)] => assert!(
+                    v.is_finite(),
+                    "« {input} » a produit un réel non fini : {v}"
+                ),
+                other => panic!("« {input} » attendu en un seul Token::Real, obtenu {other:?}"),
+            }
+        }
     }
 
     #[test]

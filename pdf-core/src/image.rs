@@ -49,6 +49,19 @@ impl ColorSpaceKind {
 /// (`interp.rs`) traite ça comme une absence de pixels plutôt qu'un échec
 /// fatal de l'interprétation du reste de la page.
 pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
+    decode_image_at(doc, stream, 0)
+}
+
+/// Profondeur maximale de récursion `/SMask` (image → son masque → le masque
+/// de ce masque…). Audit 2026-10-26 #2 : un XObject image dont le `/SMask`
+/// pointe sur lui-même (ou un cycle A→B→A) faisait sinon récurser
+/// `decode_image` à l'infini jusqu'au débordement de pile (`abort`), dès
+/// l'affichage de toute page portant l'image. Un `/SMask` légitime n'est
+/// jamais imbriqué en pratique (un masque de fondu est une image en niveaux
+/// de gris sans masque) ; une petite marge suffit donc largement.
+const MAX_SMASK_DEPTH: u32 = 4;
+
+fn decode_image_at(doc: &Document, stream: &Stream, depth: u32) -> Result<DecodedImage> {
     let width = stream.dict.get_int("Width")?.max(0) as u32;
     let height = stream.dict.get_int("Height")?.max(0) as u32;
     if width == 0 || height == 0 {
@@ -121,10 +134,12 @@ pub fn decode_image(doc: &Document, stream: &Stream) -> Result<DecodedImage> {
         rgba.extend_from_slice(&[r, g, b, 255]);
     }
 
-    if let Some(smask_obj) = stream.dict.get("SMask") {
-        if let Ok(Object::Stream(smask_stream)) = doc.get(smask_obj) {
-            if let Ok(smask) = decode_image(doc, &smask_stream) {
-                apply_soft_mask(&mut rgba, width, height, &smask);
+    if depth < MAX_SMASK_DEPTH {
+        if let Some(smask_obj) = stream.dict.get("SMask") {
+            if let Ok(Object::Stream(smask_stream)) = doc.get(smask_obj) {
+                if let Ok(smask) = decode_image_at(doc, &smask_stream, depth + 1) {
+                    apply_soft_mask(&mut rgba, width, height, &smask);
+                }
             }
         }
     }
@@ -281,6 +296,46 @@ mod tests {
 
         let err = decode_image(&doc, &stream).unwrap_err();
         assert!(matches!(err, PdfError::DecodeError(_)));
+    }
+
+    /// Audit 2026-10-26 #2 : un XObject image dont le `/SMask` pointe sur
+    /// lui-même faisait récurser `decode_image` à l'infini (débordement de
+    /// pile, `abort`) dès l'affichage de la page. Le plafond de profondeur
+    /// garantit la terminaison : le décodage renvoie `Ok` au lieu de
+    /// crasher. Avant le correctif, ce test faisait tomber tout le binaire
+    /// de test par `stack overflow`.
+    #[test]
+    fn decode_image_with_self_referential_smask_terminates() {
+        // Objet 3 : image 1×1 DeviceRGB dont `/SMask` est `3 0 R` (soi-même).
+        let obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+        let obj2 = "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n";
+        let obj3_head = "3 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceRGB /SMask 3 0 R /Length 3 >>\nstream\n";
+        let obj3_tail = "\nendstream\nendobj\n";
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = bytes.len();
+        bytes.extend_from_slice(obj1.as_bytes());
+        let off2 = bytes.len();
+        bytes.extend_from_slice(obj2.as_bytes());
+        let off3 = bytes.len();
+        bytes.extend_from_slice(obj3_head.as_bytes());
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // 3 octets de données RGB
+        bytes.extend_from_slice(obj3_tail.as_bytes());
+        let xref_offset = bytes.len();
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+
+        let doc = Document::open(bytes).unwrap();
+        let img_ref = Object::Reference(crate::object::ObjRef::new(3, 0));
+        let Object::Stream(stream) = doc.get(&img_ref).unwrap() else {
+            panic!("objet 3 devrait être un flux image");
+        };
+        // Ne doit pas déborder la pile — le simple fait de renvoyer suffit.
+        let decoded = decode_image(&doc, &stream).expect("décodage devrait réussir");
+        assert_eq!((decoded.width, decoded.height), (1, 1));
     }
 
     #[test]

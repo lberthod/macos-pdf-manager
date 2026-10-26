@@ -126,6 +126,17 @@ impl Decryptor {
             } else {
                 (length_bits / 8) as usize
             };
+            // Audit 2026-10-26 #1 : un `/Length` forgé ≤ 7 bits (ou absent
+            // avec `/R 2`… non, R2 force 5) donne `key_len == 0`, d'où une
+            // clé RC4 vide qui fait paniquer `rc4_apply` (`key[0]` sur un
+            // slice vide) dès l'ouverture, avant toute saisie de mot de
+            // passe. Une clé de chiffrement standard valide fait 40 à 128
+            // bits (5 à 16 octets, ISO 32000-1 §7.6.3.3) : tout ce qui sort
+            // de cette plage est un fichier malformé, pas un mot de passe
+            // incorrect.
+            if !(5..=16).contains(&key_len) {
+                return Err(Unsupported);
+            }
             let encrypt_metadata = encrypt
                 .get("EncryptMetadata")
                 .map(|o| matches!(o, Object::Boolean(true)))
@@ -363,13 +374,21 @@ fn crypt_filter_method(encrypt: &Dictionary, key: &str) -> Option<CryptMethod> {
 /// correcte ; on ne le supporte ici que pour la compatibilité en lecture de
 /// vieux PDF, jamais pour protéger quoi que ce soit.
 fn rc4_apply(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // Audit 2026-10-26 #1 : garde défensive. `Decryptor::new` rejette déjà
+    // une clé hors de 5..=16 octets, mais RC4 est aussi appelé en interne
+    // (recalcul de `/U`) — une clé vide ne doit jamais indexer `key[0]` sur
+    // un slice vide. Avec une clé vide, RC4 est l'identité : on renvoie les
+    // données inchangées plutôt que de paniquer.
+    if key.is_empty() {
+        return data.to_vec();
+    }
     let mut s: [u8; 256] = [0; 256];
     for (i, entry) in s.iter_mut().enumerate() {
         *entry = i as u8;
     }
     let mut j: u8 = 0;
     for i in 0..256 {
-        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len().max(1)]);
+        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
         s.swap(i, j as usize);
     }
     let mut out = Vec::with_capacity(data.len());
@@ -548,6 +567,59 @@ mod tests {
             Err(DecryptError::WrongPassword) => {}
             other => panic!("expected WrongPassword, got {}", other.is_ok()),
         }
+    }
+
+    /// Audit 2026-10-26 #1 : un `/Encrypt` forgé avec `/Length` ≤ 7 bits
+    /// (ici 0) donne `key_len == 0`, donc une clé RC4 vide. Avant le
+    /// correctif, `Decryptor::new` descendait jusqu'à `rc4_apply(&[], …)`
+    /// qui indexait `key[0]` sur un slice vide → panic « index out of
+    /// bounds » dès l'ouverture, avant toute saisie de mot de passe. On
+    /// exige désormais une erreur propre (`Unsupported`), pas un panic.
+    #[test]
+    fn new_rejects_a_zero_length_key_instead_of_panicking() {
+        let id0 = b"0123456789ABCDEF";
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("Filter", Object::Name("Standard".to_string()));
+        encrypt.insert("V", Object::Integer(2));
+        encrypt.insert("R", Object::Integer(3));
+        encrypt.insert("O", Object::String(vec![0u8; 32]));
+        encrypt.insert("U", Object::String(vec![0u8; 32]));
+        encrypt.insert("P", Object::Integer(-1));
+        encrypt.insert("Length", Object::Integer(0));
+
+        match Decryptor::new(&encrypt, id0, None, b"") {
+            Err(DecryptError::Unsupported) => {}
+            other => panic!("expected Unsupported, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Même famille : une longueur de clé démesurée (`/Length` > 128 bits)
+    /// est aussi hors de la plage valide 40-128 bits (ISO 32000-1
+    /// §7.6.3.3) et doit être rejetée proprement.
+    #[test]
+    fn new_rejects_an_oversized_key_length() {
+        let id0 = b"0123456789ABCDEF";
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("Filter", Object::Name("Standard".to_string()));
+        encrypt.insert("V", Object::Integer(2));
+        encrypt.insert("R", Object::Integer(3));
+        encrypt.insert("O", Object::String(vec![0u8; 32]));
+        encrypt.insert("U", Object::String(vec![0u8; 32]));
+        encrypt.insert("P", Object::Integer(-1));
+        encrypt.insert("Length", Object::Integer(4096));
+
+        assert!(matches!(
+            Decryptor::new(&encrypt, id0, None, b""),
+            Err(DecryptError::Unsupported)
+        ));
+    }
+
+    /// Garde défensive sur la primitive elle-même : `rc4_apply` avec une
+    /// clé vide ne doit jamais paniquer (elle se comporte comme
+    /// l'identité).
+    #[test]
+    fn rc4_apply_with_empty_key_does_not_panic() {
+        assert_eq!(rc4_apply(&[], b"hello"), b"hello".to_vec());
     }
 
     /// AUDIT_FIXES_2026-09-03.md #19 : round-trip AES-128 (`/V 4`, `CFM

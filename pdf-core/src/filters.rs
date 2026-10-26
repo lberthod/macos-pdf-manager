@@ -49,6 +49,16 @@ pub fn decode_stream(stream: &Stream) -> Result<Vec<u8>> {
         if let Some(parms) = decode_parms_at(&stream.dict, index) {
             data = apply_predictor(&data, &parms)?;
         }
+        // Audit 2026-10-26 #19 : le plafond n'existait que dans
+        // `flate_decode`. Flate, LZW et DCT bornent leur sortie pendant le
+        // décodage (seul moyen d'éviter l'allocation elle-même) ; ce
+        // contrôle après chaque étage couvre les autres (ASCIIHex, ASCII85,
+        // prédicteur), dont la sortie reste linéaire en l'entrée.
+        if data.len() as u64 > MAX_DECODED_LEN {
+            return Err(PdfError::DecodeError(format!(
+                "{name}: decoded stream too large"
+            )));
+        }
     }
     Ok(data)
 }
@@ -84,6 +94,21 @@ fn flate_decode(data: &[u8]) -> Result<Vec<u8>> {
 /// dépend du JPEG source (1 = niveaux de gris, 3 = RGB, 4 = CMYK) — c'est
 /// `image.rs` qui les interprète en s'appuyant sur `/ColorSpace`.
 fn dct_decode(data: &[u8]) -> Result<Vec<u8>> {
+    // Audit 2026-10-26 #19 : `zune-jpeg` alloue son tampon de sortie d'après
+    // les dimensions déclarées par l'en-tête JPEG lui-même, qui peuvent
+    // différer de `/Width`/`/Height` (déjà bornés par `image.rs`). Un JPEG
+    // de quelques octets annonçant 16000×16000 ferait sinon allouer ~1 Go
+    // avant tout contrôle. On lit l'en-tête et on refuse d'emblée une sortie
+    // qui dépasserait `MAX_DECODED_LEN`.
+    let (width, height, components) = jpeg_dimensions(data)?;
+    let output_len = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|px| px.checked_mul(components.max(1) as u64));
+    if output_len.is_none_or(|len| len > MAX_DECODED_LEN) {
+        return Err(PdfError::DecodeError(format!(
+            "DCTDecode: {width}x{height} image exceeds the decoded size limit"
+        )));
+    }
     let mut decoder =
         zune_jpeg::JpegDecoder::new(zune_jpeg::zune_core::bytestream::ZCursor::new(data));
     decoder
@@ -191,9 +216,29 @@ fn decode_group85(group: &[u8; 5], out_len: usize) -> Vec<u8> {
 fn lzw_decode(data: &[u8]) -> Result<Vec<u8>> {
     const CLEAR: u16 = 256;
     const EOD: u16 = 257;
+    // Audit 2026-10-26 #19 : codes sur 12 bits au plus (ISO 32000-1
+    // §7.4.4.2), donc 4096 entrées au plus. La table n'était jamais
+    // plafonnée : chaque entrée clonant la précédente plus un octet, un flux
+    // forgé faisait croître la table en O(n²) avec l'entrée (plusieurs Go à
+    // partir de quelques Ko) bien avant tout contrôle de la sortie. Une fois
+    // pleine, la table n'accepte plus de nouvelle entrée jusqu'au prochain
+    // CLEAR, ce qui borne aussi chaque entrée à ~4 Ko.
+    const MAX_TABLE_LEN: usize = 4096;
 
+    /// 256 littéraux, puis deux emplacements réservés pour CLEAR (256) et
+    /// EOD (257) : la première entrée créée porte ainsi le code **258**
+    /// (ISO 32000-1 §7.4.4.2), et `table.len()` vaut le prochain code à
+    /// attribuer, ce sur quoi reposent les seuils d'« early change » et le
+    /// cas KwKwK. Sans ces deux emplacements, la première entrée atterrissait
+    /// à l'index 256 et tout flux LZW conforme était rejeté dès son premier
+    /// code composé (« invalid code 258 »), y compris l'exemple de la spec.
+    /// Les emplacements restent vides : CLEAR et EOD sont traités avant toute
+    /// lecture de la table.
     fn fresh_table() -> Vec<Vec<u8>> {
-        (0..256u16).map(|i| vec![i as u8]).collect()
+        let mut table: Vec<Vec<u8>> = (0..256u16).map(|i| vec![i as u8]).collect();
+        table.push(Vec::new()); // 256 : CLEAR
+        table.push(Vec::new()); // 257 : EOD
+        table
     }
 
     let mut out = Vec::new();
@@ -237,8 +282,16 @@ fn lzw_decode(data: &[u8]) -> Result<Vec<u8>> {
         };
 
         out.extend_from_slice(&entry);
+        // Même plafond que Flate : un flux légitime ne produit jamais plus
+        // que `MAX_DECODED_LEN`, et on s'arrête dès qu'il est franchi plutôt
+        // qu'après avoir tout accumulé.
+        if out.len() as u64 > MAX_DECODED_LEN {
+            return Err(PdfError::DecodeError(
+                "LZWDecode: decoded stream too large".to_string(),
+            ));
+        }
 
-        if let Some(p) = prev_code {
+        if let (Some(p), true) = (prev_code, table.len() < MAX_TABLE_LEN) {
             let mut new_entry = table[p as usize].clone();
             new_entry.push(entry[0]);
             table.push(new_entry);
@@ -514,6 +567,120 @@ mod tests {
         let bytes = bits_to_bytes(&bits);
         let decoded = lzw_decode(&bytes).unwrap();
         assert_eq!(decoded, vec![65]);
+    }
+
+    /// Empaquette une suite de codes LZW (bits de poids fort en premier) en
+    /// reproduisant exactement les largeurs de code que `lzw_decode` utilisera
+    /// pour les relire : 9 bits au départ, puis 10/11/12 bits quand la table
+    /// atteint 511/1023/2047 entrées (« early change »), table plafonnée à
+    /// 4096 entrées.
+    fn lzw_pack(codes: &[u16]) -> Vec<u8> {
+        let mut bits = String::new();
+        let mut width = 9usize;
+        let mut table_len = 258usize;
+        let mut have_prev = false;
+        for &code in codes {
+            bits.push_str(&format!("{code:0width$b}"));
+            match code {
+                256 => {
+                    width = 9;
+                    table_len = 258;
+                    have_prev = false;
+                    continue;
+                }
+                257 => break,
+                _ => {}
+            }
+            if have_prev && table_len < 4096 {
+                table_len += 1;
+                match table_len {
+                    511 => width = 10,
+                    1023 => width = 11,
+                    2047 => width = 12,
+                    _ => {}
+                }
+            }
+            have_prev = true;
+        }
+        bits_to_bytes(&bits)
+    }
+
+    /// Exemple de la spec (ISO 32000-1 §7.4.4.2) : « -----A---B » s'encode en
+    /// `256 45 258 258 65 259 66 257` sur 9 bits. Avant la correction de la
+    /// table (deux emplacements réservés pour CLEAR/EOD), le décodeur
+    /// rangeait la première entrée créée à l'index 256 et rejetait ce flux
+    /// conforme dès le code 258 (« invalid code 258 ») : aucun vrai flux LZW
+    /// ne se décodait. L'ancien test ne couvrait qu'un littéral isolé.
+    #[test]
+    fn lzw_decodes_the_iso_32000_example() {
+        let bytes = lzw_pack(&[256, 45, 258, 258, 65, 259, 66, 257]);
+        assert_eq!(lzw_decode(&bytes).unwrap(), b"-----A---B");
+    }
+
+    /// Audit 2026-10-26 #19 : une « bombe LZW ». Une chaîne KwKwK (codes 258
+    /// à 4095, chacun l'entrée précédente plus un octet) remplit la table
+    /// avec des entrées de 2 à 3839 octets, puis le code 4095 répété émet
+    /// 3839 octets par code de 12 bits (ratio ~2500:1). Sans plafond, la
+    /// table continuait de grossir indéfiniment et la sortie n'était pas
+    /// bornée. Le décodage doit désormais échouer proprement une fois
+    /// `MAX_DECODED_LEN` franchi.
+    #[test]
+    fn lzw_decode_rejects_a_decompression_bomb() {
+        let mut codes: Vec<u16> = vec![256, 65];
+        codes.extend(258..=4095u16);
+        // ~68 000 répétitions × 3839 octets > 256 Mo, pour ~100 Ko d'entrée.
+        let repeats = (MAX_DECODED_LEN / 3839 + 10) as usize;
+        codes.extend(std::iter::repeat_n(4095u16, repeats));
+        codes.push(257);
+        let bytes = lzw_pack(&codes);
+        assert!(
+            bytes.len() < 200_000,
+            "fixture should be tiny, got {}",
+            bytes.len()
+        );
+
+        match lzw_decode(&bytes) {
+            Err(PdfError::DecodeError(msg)) => assert!(msg.contains("too large"), "{msg}"),
+            other => panic!(
+                "expected a too-large error, got {:?}",
+                other.map(|v| v.len())
+            ),
+        }
+    }
+
+    /// Audit 2026-10-26 #19 : `zune-jpeg` alloue d'après les dimensions de
+    /// l'en-tête JPEG, qui peuvent mentir. Le JPEG de fixture (64×48) est
+    /// patché pour annoncer 16000×16000 (768 Mo en RGB, sous la limite
+    /// propre de `zune-jpeg` de 16384×16384) : il doit être refusé avant
+    /// toute allocation, avec notre propre erreur.
+    #[test]
+    fn dct_decode_rejects_a_header_announcing_an_oversized_image() {
+        let mut jpeg = include_bytes!("../tests/fixtures/sample_image.jpg").to_vec();
+        let sof = jpeg
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC0])
+            .expect("fixture should be a baseline JPEG");
+        let big = 16_000u16.to_be_bytes();
+        jpeg[sof + 5..sof + 7].copy_from_slice(&big); // hauteur
+        jpeg[sof + 7..sof + 9].copy_from_slice(&big); // largeur
+
+        match dct_decode(&jpeg) {
+            Err(PdfError::DecodeError(msg)) => {
+                assert!(msg.contains("exceeds the decoded size limit"), "{msg}")
+            }
+            other => panic!(
+                "expected a size-limit error, got {:?}",
+                other.map(|v| v.len())
+            ),
+        }
+    }
+
+    /// La garde DCT ne doit pas refuser un JPEG ordinaire.
+    #[test]
+    fn dct_decode_still_decodes_an_ordinary_jpeg() {
+        let jpeg = include_bytes!("../tests/fixtures/sample_image.jpg");
+        let decoded = dct_decode(jpeg).unwrap();
+        assert_eq!(decoded.len(), 64 * 48 * 3);
     }
 
     fn bits_to_bytes(bits: &str) -> Vec<u8> {

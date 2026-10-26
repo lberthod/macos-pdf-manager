@@ -561,18 +561,45 @@ fn load_embedded_font_files(
 /// CIDs consécutifs à partir de `c`) et `cFirst cLast w` (largeur uniforme
 /// sur une plage). Entrées malformées (élément inattendu) : le reste du
 /// tableau est simplement ignoré plutôt que de paniquer.
+/// CID maximal (ISO 32000-1 Annexe C, limites d'implémentation : un CID
+/// vaut au plus 65 535). Audit 2026-10-26 #12 : sert de borne naturelle aux
+/// deux formes de `/W`, qui faisaient sinon déborder `first + offset`
+/// (`/W [4294967295 [1 2]]`, panic en debug) ou boucler sur une plage
+/// démesurée (`/W [0 4294967295 5]`, ~4 G d'insertions).
+const MAX_CID: i64 = 0xFFFF;
+
+/// Nombre total maximal d'insertions de largeurs CID, toutes entrées de
+/// `/W` confondues : empêche l'amplification par répétition de plages
+/// valides. Un espace CID complet fait 65 536 entrées.
+const MAX_CID_WIDTH_INSERTS: usize = 1 << 20;
+
 fn parse_cid_widths(items: &[Object], out: &mut HashMap<u32, f64>) {
+    let mut budget = MAX_CID_WIDTH_INSERTS;
     let mut i = 0;
     while i < items.len() {
         let Some(first) = items.get(i).and_then(number) else {
             return;
         };
         i += 1;
+        // `as i64` sature (et vaut 0 pour `NaN`) : aucune valeur de `first`
+        // ne peut faire paniquer ni s'enrouler.
+        let first = first as i64;
         match items.get(i) {
             Some(Object::Array(run)) => {
                 for (offset, w) in run.iter().enumerate() {
+                    let cid = first.saturating_add(offset as i64);
+                    if cid > MAX_CID {
+                        break; // les CIDs suivants sont tous plus grands.
+                    }
+                    if cid < 0 {
+                        continue;
+                    }
                     if let Some(width) = number(w) {
-                        out.insert(first as u32 + offset as u32, width);
+                        if budget == 0 {
+                            return;
+                        }
+                        budget -= 1;
+                        out.insert(cid as u32, width);
                     }
                 }
                 i += 1;
@@ -586,8 +613,14 @@ fn parse_cid_widths(items: &[Object], out: &mut HashMap<u32, f64>) {
                     return;
                 };
                 i += 1;
-                let mut cid = first as i64;
-                while cid <= last as i64 {
+                let lo = first.max(0);
+                let hi = (last as i64).min(MAX_CID);
+                let mut cid = lo;
+                while cid <= hi {
+                    if budget == 0 {
+                        return;
+                    }
+                    budget -= 1;
                     out.insert(cid as u32, width);
                     cid += 1;
                 }
@@ -867,6 +900,30 @@ fn hex_to_code_u32(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0u32, |acc, b| (acc << 8) | *b as u32)
 }
 
+/// Étendue maximale (`hi - lo`) d'une plage `beginbfrange` acceptée. Audit
+/// 2026-10-26 #11 : la boucle `0..=(hi - lo)` n'était pas bornée — une plage
+/// inversée (`<FFFF> <0000>`) faisait déborder la soustraction (panic en
+/// debug, ~4,29 milliards d'itérations en release) et une plage
+/// `<0000> <FFFFFFFF>` tentait 4 G d'insertions. La spec impose qu'une
+/// plage ne varie que sur son dernier octet (étendue ≤ 255) ; on tolère
+/// jusqu'à un espace de codes 2 octets complet (`<0000> <FFFF>`, l'astuce
+/// « identité » courante), et on ignore toute plage plus large.
+const MAX_CMAP_RANGE_SPAN: u32 = 0xFFFF;
+
+/// Nombre total maximal d'insertions dans une CMap `ToUnicode` composite,
+/// toutes plages confondues : empêche l'amplification par répétition (des
+/// milliers de plages `<0000> <FFFF>` valides chacune). Un espace de codes 2
+/// octets complet fait 65 536 entrées ; cette marge couvre largement toute
+/// CMap réelle.
+const MAX_CMAP_INSERTS: usize = 1 << 20;
+
+/// `Some(hi - lo)` si la plage `lo..=hi` est bien ordonnée et d'étendue
+/// raisonnable (voir `MAX_CMAP_RANGE_SPAN`), `None` sinon.
+fn cmap_range_span(lo: u32, hi: u32) -> Option<u32> {
+    hi.checked_sub(lo)
+        .filter(|&span| span <= MAX_CMAP_RANGE_SPAN)
+}
+
 /// Comme `parse_to_unicode_cmap`, pour une police composite : source ->
 /// destination non bornée à 256 (`HashMap` plutôt que tableau 256 entrées).
 /// Mêmes blocs gérés (`beginbfchar`/`beginbfrange`, même limitation sur les
@@ -874,6 +931,7 @@ fn hex_to_code_u32(bytes: &[u8]) -> u32 {
 fn parse_to_unicode_cmap_wide(bytes: &[u8]) -> HashMap<u32, char> {
     let mut map = HashMap::new();
     let mut lexer = Lexer::new(bytes);
+    let mut budget = MAX_CMAP_INSERTS;
 
     while let Ok(Some(token)) = lexer.next_token() {
         match token {
@@ -905,10 +963,22 @@ fn parse_to_unicode_cmap_wide(bytes: &[u8]) -> HashMap<u32, char> {
                                 .iter()
                                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                                 .collect();
+                            // Plage inversée ou démesurée : ignorée (voir
+                            // `MAX_CMAP_RANGE_SPAN`). Le jeton destination a
+                            // déjà été consommé, le lexer reste synchronisé.
+                            let Some(span) = cmap_range_span(lo_code, hi_code) else {
+                                continue;
+                            };
                             if let [unit] = base_units[..] {
-                                for offset in 0..=(hi_code - lo_code) {
+                                for offset in 0..=span {
+                                    if budget == 0 {
+                                        return map;
+                                    }
+                                    budget -= 1;
                                     let code_point = (unit as u32).wrapping_add(offset);
                                     if let Some(ch) = char::from_u32(code_point) {
+                                        // `lo_code + offset <= hi_code` : pas
+                                        // de débordement possible.
                                         map.insert(lo_code + offset, ch);
                                     }
                                 }
@@ -918,8 +988,12 @@ fn parse_to_unicode_cmap_wide(bytes: &[u8]) -> HashMap<u32, char> {
                                 // Destination multi-unités : toute la plage
                                 // reçoit la même valeur (voir limitation en
                                 // tête de fichier).
-                                for code in lo_code..=hi_code {
-                                    map.insert(code, ch);
+                                for offset in 0..=span {
+                                    if budget == 0 {
+                                        return map;
+                                    }
+                                    budget -= 1;
+                                    map.insert(lo_code + offset, ch);
                                 }
                             }
                         }
@@ -2178,5 +2252,89 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "你好，世界");
+    }
+
+    /// Audit 2026-10-26 #11 : une plage `bfrange` inversée faisait déborder
+    /// `hi - lo` (panic en debug, ~4,29 G d'itérations en release) et une
+    /// plage `<00000000> <FFFFFFFF>` tentait 4 G d'insertions. Les deux
+    /// doivent être ignorées immédiatement, sans affecter une plage valide
+    /// qui les suit (le lexer doit rester synchronisé).
+    #[test]
+    fn bfrange_ignores_inverted_and_oversized_ranges() {
+        let cmap = b"beginbfrange\n\
+            <FFFF> <0000> <0041>\n\
+            <00000000> <FFFFFFFF> <0041>\n\
+            <0041> <0043> <0061>\n\
+            endbfrange";
+        let map = parse_to_unicode_cmap_wide(cmap);
+        assert_eq!(map.len(), 3, "seule la plage valide doit être retenue");
+        assert_eq!(map.get(&0x41), Some(&'a'));
+        assert_eq!(map.get(&0x42), Some(&'b'));
+        assert_eq!(map.get(&0x43), Some(&'c'));
+    }
+
+    /// Une plage « identité » sur tout l'espace 2 octets (`<0000> <FFFF>`,
+    /// astuce courante) reste acceptée : c'est la borne haute tolérée.
+    #[test]
+    fn bfrange_accepts_a_full_two_byte_identity_range() {
+        let map = parse_to_unicode_cmap_wide(b"beginbfrange <0000> <FFFF> <0000> endbfrange");
+        assert_eq!(map.get(&0x0041), Some(&'A'));
+        assert_eq!(map.get(&0x4F60), Some(&'你'));
+    }
+
+    /// Audit 2026-10-26 #12 : `/W [4294967295 [1 2]]` faisait déborder
+    /// `first as u32 + offset` (panic en debug) et `/W [0 4294967295 5]`
+    /// insérait ~4 G largeurs (hang/OOM). Les CIDs sont bornés à 65 535.
+    #[test]
+    fn cid_widths_are_bounded_to_the_cid_space() {
+        let mut out = HashMap::new();
+        parse_cid_widths(
+            &[
+                Object::Integer(4_294_967_295),
+                Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+            ],
+            &mut out,
+        );
+        assert!(out.is_empty(), "CIDs hors de l'espace CID : rien à retenir");
+
+        let mut out = HashMap::new();
+        parse_cid_widths(
+            &[
+                Object::Integer(0),
+                Object::Integer(4_294_967_295),
+                Object::Integer(5),
+            ],
+            &mut out,
+        );
+        assert_eq!(out.len(), 0x1_0000, "plage tronquée à CID 0..=65535");
+        assert_eq!(out.get(&0xFFFF), Some(&5.0));
+    }
+
+    /// Les deux formes légitimes de `/W` restent décodées à l'identique.
+    #[test]
+    fn cid_widths_still_parse_both_legitimate_forms() {
+        let mut out = HashMap::new();
+        parse_cid_widths(
+            &[
+                Object::Integer(1),
+                Object::Array(vec![Object::Integer(500), Object::Integer(600)]),
+                Object::Integer(10),
+                Object::Integer(12),
+                Object::Integer(700),
+            ],
+            &mut out,
+        );
+        let mut entries: Vec<(u32, f64)> = out.into_iter().collect();
+        entries.sort_by_key(|(cid, _)| *cid);
+        assert_eq!(
+            entries,
+            vec![
+                (1, 500.0),
+                (2, 600.0),
+                (10, 700.0),
+                (11, 700.0),
+                (12, 700.0)
+            ]
+        );
     }
 }

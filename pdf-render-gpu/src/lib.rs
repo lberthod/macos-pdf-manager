@@ -63,7 +63,8 @@ use lyon::tessellation::{
     VertexBuffers,
 };
 use pdf_core::display::{
-    ClipStack, Color, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+    ClipStack, Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp,
+    PathSegment,
 };
 use std::rc::Rc;
 
@@ -490,9 +491,10 @@ fn build_image_quad(transform: &Matrix, mapper: &PageToNdc) -> ([TexVertex; 4], 
 enum Draw {
     Solid(VertexBuffers<Vertex, u32>),
     Image {
-        width: u32,
-        height: u32,
-        rgba: Vec<u8>,
+        /// Partagé avec la `DisplayList` (audit 2026-10-26 #28) : plusieurs
+        /// `Do` de la même image ne recopient plus son RGBA, et
+        /// `rasterize` ne téléverse qu'une texture par image distincte.
+        image: Rc<DecodedImage>,
         quad: ([TexVertex; 4], [u16; 6]),
     },
 }
@@ -682,9 +684,7 @@ fn group_items(display: &DisplayList, mapper: &PageToNdc, device_scale: f64) -> 
                     continue;
                 }
                 group.draws.push(Draw::Image {
-                    width: image.width,
-                    height: image.height,
-                    rgba: image.rgba.clone(),
+                    image: Rc::clone(image),
                     quad: build_image_quad(transform, mapper),
                 });
             }
@@ -1082,6 +1082,14 @@ impl GpuContext {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+        // Une texture (et son bind group) par image *distincte* plutôt
+        // qu'une par `Do` (audit 2026-10-26 #28). Clé : l'adresse de l'`Rc`,
+        // stable et unique tant que `groups` (qui détient les `Rc`) vit.
+        let mut image_textures: std::collections::HashMap<
+            *const DecodedImage,
+            (wgpu::Texture, wgpu::BindGroup),
+        > = std::collections::HashMap::new();
+
         for (group_index, group) in groups.iter().enumerate() {
             let clip_depth = group.clip_layers.len() as u32;
             let is_clipped = clip_depth > 0;
@@ -1173,48 +1181,64 @@ impl GpuContext {
                         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..geometry.indices.len() as u32, 0, 0..1);
                     }
-                    Draw::Image {
-                        width: img_w,
-                        height: img_h,
-                        rgba,
-                        quad,
-                    } => {
-                        let texture = self.device.create_texture_with_data(
-                            &self.queue,
-                            &wgpu::TextureDescriptor {
-                                label: Some("pdf-render-gpu-image-src"),
-                                size: wgpu::Extent3d {
-                                    width: *img_w,
-                                    height: *img_h,
-                                    depth_or_array_layers: 1,
-                                },
-                                mip_level_count: 1,
-                                sample_count: 1,
-                                dimension: wgpu::TextureDimension::D2,
-                                format: wgpu::TextureFormat::Rgba8Unorm,
-                                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                                    | wgpu::TextureUsages::COPY_DST,
-                                view_formats: &[],
-                            },
-                            wgpu::util::TextureDataOrder::LayerMajor,
-                            rgba,
-                        );
-                        let texture_view =
-                            texture.create_view(&wgpu::TextureViewDescriptor::default());
-                        let bind_group =
-                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("pdf-render-gpu-image-bind-group"),
-                                layout: &image_bind_group_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    Draw::Image { image, quad } => {
+                        let (img_w, img_h) = (&image.width, &image.height);
+                        // Audit 2026-10-26 #10 : la cible de rendu est bornée
+                        // par `max_texture_dimension_2d` en amont, mais pas
+                        // ces textures-source d'images. `decode_image`
+                        // plafonne le nombre de *pixels* (64 M), pas chaque
+                        // dimension : une image forgée 20000×3000 (sous le
+                        // cap) dépasse la limite 8192 et faisait paniquer
+                        // wgpu (`Validation Error … exceeds the limit`) sur
+                        // le thread principal d'egui, non protégé par
+                        // `catch_unwind`. On ignore alors l'image (non
+                        // peinte) plutôt que de faire tomber l'application.
+                        let max_dim = self.device.limits().max_texture_dimension_2d;
+                        if *img_w > max_dim || *img_h > max_dim || *img_w == 0 || *img_h == 0 {
+                            continue;
+                        }
+                        let (_, bind_group) =
+                            image_textures.entry(Rc::as_ptr(image)).or_insert_with(|| {
+                                let texture = self.device.create_texture_with_data(
+                                    &self.queue,
+                                    &wgpu::TextureDescriptor {
+                                        label: Some("pdf-render-gpu-image-src"),
+                                        size: wgpu::Extent3d {
+                                            width: *img_w,
+                                            height: *img_h,
+                                            depth_or_array_layers: 1,
+                                        },
+                                        mip_level_count: 1,
+                                        sample_count: 1,
+                                        dimension: wgpu::TextureDimension::D2,
+                                        format: wgpu::TextureFormat::Rgba8Unorm,
+                                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                            | wgpu::TextureUsages::COPY_DST,
+                                        view_formats: &[],
                                     },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::Sampler(&sampler),
-                                    },
-                                ],
+                                    wgpu::util::TextureDataOrder::LayerMajor,
+                                    &image.rgba,
+                                );
+                                let texture_view =
+                                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                                let bind_group =
+                                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                        label: Some("pdf-render-gpu-image-bind-group"),
+                                        layout: &image_bind_group_layout,
+                                        entries: &[
+                                            wgpu::BindGroupEntry {
+                                                binding: 0,
+                                                resource: wgpu::BindingResource::TextureView(
+                                                    &texture_view,
+                                                ),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 1,
+                                                resource: wgpu::BindingResource::Sampler(&sampler),
+                                            },
+                                        ],
+                                    });
+                                (texture, bind_group)
                             });
                         let (vertices, indices) = quad;
                         let vertex_buffer =
@@ -1237,7 +1261,7 @@ impl GpuContext {
                             &image_pipeline
                         };
                         pass.set_pipeline(pipeline);
-                        pass.set_bind_group(0, &bind_group, &[]);
+                        pass.set_bind_group(0, &*bind_group, &[]);
                         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
@@ -1311,7 +1335,9 @@ impl GpuContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdf_core::display::{Color, DisplayItem, DisplayList, FillRule, PaintOp, PathSegment};
+    use pdf_core::display::{
+        Color, DecodedImage, DisplayItem, DisplayList, FillRule, Matrix, PaintOp, PathSegment,
+    };
 
     fn pixel(page: &RenderedPage, x: u32, y: u32) -> (u8, u8, u8, u8) {
         let i = ((y * page.width + x) * 4) as usize;
@@ -1344,6 +1370,44 @@ mod tests {
                 clip: None,
             }],
         }
+    }
+
+    /// Audit 2026-10-26 #10 : une image dont une dimension dépasse
+    /// `max_texture_dimension_2d` (ici 20000 > 8192/16384) tout en restant
+    /// sous le plafond de 64 M *pixels* faisait paniquer wgpu
+    /// (`create_texture_with_data` → « Validation Error … exceeds the
+    /// limit ») sur le thread principal d'egui, non protégé par
+    /// `catch_unwind`. Le rendu doit désormais ignorer l'image et renvoyer
+    /// `Ok` sans paniquer.
+    #[test]
+    fn oversized_source_image_is_skipped_instead_of_panicking() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+
+        // 20000×2 = 40 000 pixels (bien sous le cap de 64 M), mais 20000
+        // dépasse `max_texture_dimension_2d` sur tout GPU courant.
+        let decoded = DecodedImage {
+            width: 20_000,
+            height: 2,
+            rgba: vec![0xFF; 20_000 * 2 * 4],
+        };
+        let display = DisplayList {
+            items: vec![DisplayItem::Image {
+                resource: "Im0".to_string(),
+                transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
+                pixels: Some(Rc::new(decoded)),
+                clip: None,
+            }],
+        };
+
+        // Ne doit pas paniquer ; l'image surdimensionnée est simplement non
+        // peinte.
+        let page = renderer
+            .render_page(&display, [0.0, 0.0, 100.0, 100.0])
+            .expect("le rendu devrait réussir en ignorant l'image");
+        assert_eq!((page.width, page.height), (100, 100));
     }
 
     /// `GpuRenderer` doit rester utilisable pour plusieurs pages
@@ -1678,7 +1742,7 @@ mod tests {
             items: vec![DisplayItem::Image {
                 resource: "Im0".into(),
                 transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
-                pixels: Some(image),
+                pixels: Some(Rc::new(image)),
                 clip: None,
             }],
         };
@@ -1716,7 +1780,7 @@ mod tests {
             items: vec![DisplayItem::Image {
                 resource: "Im0".into(),
                 transform: Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0),
-                pixels: Some(image),
+                pixels: Some(Rc::new(image)),
                 clip: None,
             }],
         };
@@ -1750,7 +1814,7 @@ mod tests {
             PathSegment::ClosePath,
         ];
         let clip = Some(Rc::new(vec![ClipPath {
-            segments: clip_rect,
+            segments: clip_rect.into(),
             fill_rule: FillRule::NonZero,
         }]));
 
@@ -1807,7 +1871,8 @@ mod tests {
                 PathSegment::LineTo((40.0, 100.0)),
                 PathSegment::LineTo((0.0, 100.0)),
                 PathSegment::ClosePath,
-            ],
+            ]
+            .into(),
             fill_rule: FillRule::NonZero,
         }]));
         let clip_b = Some(Rc::new(vec![ClipPath {
@@ -1817,7 +1882,8 @@ mod tests {
                 PathSegment::LineTo((100.0, 100.0)),
                 PathSegment::LineTo((60.0, 100.0)),
                 PathSegment::ClosePath,
-            ],
+            ]
+            .into(),
             fill_rule: FillRule::NonZero,
         }]));
 
@@ -1852,6 +1918,41 @@ mod tests {
         assert_eq!((in_a.0, in_a.1, in_a.2), (0, 0, 0));
         let in_b = pixel(&page, 80, 50);
         assert_eq!((in_b.0, in_b.1, in_b.2), (0, 0, 0));
+        let between = pixel(&page, 50, 50);
+        assert_eq!((between.0, between.1, between.2), (255, 255, 255));
+    }
+
+    /// Audit 2026-10-26 #28 : une même image (`Rc` partagé) dessinée deux
+    /// fois ne téléverse plus qu'une texture, réutilisée pour le second
+    /// tirage. Les deux occurrences doivent toujours être peintes.
+    #[test]
+    fn shared_image_drawn_twice_is_painted_at_both_positions() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("no wgpu adapter available in this environment, skipping");
+            return;
+        };
+        let red = Rc::new(DecodedImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+        });
+        let at = |x: f64| DisplayItem::Image {
+            resource: "Im0".to_string(),
+            transform: Matrix::new(20.0, 0.0, 0.0, 20.0, x, 40.0),
+            pixels: Some(Rc::clone(&red)),
+            clip: None,
+        };
+        let display = DisplayList {
+            items: vec![at(10.0), at(70.0)],
+        };
+        let page = renderer
+            .render_page(&display, [0.0, 0.0, 100.0, 100.0])
+            .unwrap();
+
+        let left = pixel(&page, 20, 50);
+        assert_eq!((left.0, left.1, left.2), (255, 0, 0));
+        let right = pixel(&page, 80, 50);
+        assert_eq!((right.0, right.1, right.2), (255, 0, 0));
         let between = pixel(&page, 50, 50);
         assert_eq!((between.0, between.1, between.2), (255, 255, 255));
     }

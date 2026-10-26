@@ -18,7 +18,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # La référence de l'action EST le canal de toolchain : `@master` n'en
+      # est pas un, d'où l'échec « 'toolchain' is a required input » avant
+      # tout build. Épinglé sur le même canal que `rust-toolchain.toml`
+      # (AUDIT_2026-10-26.md #33) pour que la CI teste la toolchain locale.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2

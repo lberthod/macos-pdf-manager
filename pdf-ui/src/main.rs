@@ -789,7 +789,9 @@ impl DocumentTab {
     /// actuellement ouvert **sur disque** vers un nouvel emplacement choisi
     /// via `NSSavePanel` (`rfd`) — une copie brute du fichier d'origine, pas
     /// des modifications en attente dans la session d'édition (utiliser
-    /// "Enregistrer", `⌘S`, pour celles-ci — voir `save_in_place`).
+    /// "Enregistrer", `⌘S`, pour celles-ci — voir `save_in_place`). Voir
+    /// `pdf_app::Session::export_copy_to` : écriture atomique, et refus de
+    /// copier le fichier sur lui-même (audit 2026-10-26 #15).
     fn export_copy_as(&mut self) {
         let Some(session) = &self.session else {
             self.error = Some("Aucun document ouvert à exporter.".to_string());
@@ -805,7 +807,7 @@ impl DocumentTab {
             .set_file_name(&default_name)
             .save_file()
         {
-            if let Err(e) = std::fs::copy(&source, &dest) {
+            if let Err(e) = session.export_copy_to(&dest) {
                 self.error = Some(format!("Échec de l'export : {e}"));
             }
         }
@@ -842,7 +844,10 @@ impl DocumentTab {
             .set_file_name(&default_name)
             .save_file()
         {
-            if let Err(e) = pdf_core::write_atomic(&dest, &bytes) {
+            let written = session
+                .check_export_destination(&dest)
+                .and_then(|()| pdf_core::write_atomic(&dest, &bytes).map_err(|e| e.to_string()));
+            if let Err(e) = written {
                 self.error = Some(format!("Échec de l'export optimisé : {e}"));
             }
         }

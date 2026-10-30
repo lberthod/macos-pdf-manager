@@ -131,6 +131,11 @@ pub struct EditSession {
     undo_stack: Vec<EditOp>,
     redo_stack: Vec<EditOp>,
     page_tree: Option<PageTreeState>,
+    /// Dernier nœud `/Pages` aplati créé par `ensure_flat_page_tree`, gardé
+    /// même quand `page_tree` est désactivé par un `undo` : un `redo` qui
+    /// refait pointer `/Root` vers lui doit le réactiver (voir
+    /// `sync_page_tree`).
+    flat_pages_node: Option<ObjRef>,
     /// Longueur d'`undo_stack` au moment de la dernière sauvegarde réussie
     /// (`save_as`/`save_redacted`) — voir `is_dirty`. `0` à l'ouverture,
     /// avant toute sauvegarde.
@@ -170,6 +175,7 @@ impl EditSession {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             page_tree: None,
+            flat_pages_node: None,
             saved_undo_len: 0,
         })
     }
@@ -225,7 +231,7 @@ impl EditSession {
             self.pending.insert(*num, before.clone());
         }
         self.redo_stack.push(op);
-        self.refresh_page_tree_order();
+        self.sync_page_tree();
         true
     }
 
@@ -237,34 +243,160 @@ impl EditSession {
             self.pending.insert(*num, after.clone());
         }
         self.undo_stack.push(op);
-        self.refresh_page_tree_order();
+        self.sync_page_tree();
         true
     }
 
-    /// Recale `page_tree.order` (cache pratique de l'ordre des pages, tenu
-    /// à jour par les opérations de manipulation de page) sur `/Kids` tel
-    /// qu'il vient d'être restauré dans `pending` par `undo`/`redo` — sans
-    /// ça, `page_tree.order` resterait périmé après un `undo`/`redo` qui
-    /// touche l'ordre des pages, puisque `undo`/`redo` ne connaissent que
-    /// des paires (numéro d'objet, valeur), pas la sémantique "ordre de
-    /// pages" propre à `page_tree`.
-    fn refresh_page_tree_order(&mut self) {
-        let Some(state) = &self.page_tree else {
+    /// Réaligne `page_tree` sur l'état que `undo`/`redo` vient de restaurer
+    /// dans `pending` : `undo`/`redo` ne connaissent que des paires (numéro
+    /// d'objet, valeur), pas la sémantique « arbre de pages aplati ».
+    ///
+    /// Audit 2026-10-26 #6 : seul l'ordre (`order`) était recalé. Après
+    /// l'annulation de la *première* opération de page, `/Root /Pages`
+    /// repointe vers l'arbre d'origine, mais `page_tree` restait actif et les
+    /// opérations suivantes modifiaient un nœud `/Pages` devenu orphelin.
+    /// `delete_page(0)`, `undo()`, `delete_page(1)` annonçait ainsi 4 pages
+    /// pour un fichier sauvegardé qui en gardait 5. L'aplatissement est
+    /// désormais actif si et seulement si `/Root` pointe vers le nœud aplati.
+    fn sync_page_tree(&mut self) {
+        let Some(node) = self.flat_pages_node else {
             return;
         };
-        let pages_node_num = state.pages_node_ref.num;
-        let Ok(obj) = self.current(pages_node_num) else {
+        if self.root_pages_ref() != Some(node) {
+            self.page_tree = None;
             return;
+        }
+        let order = self
+            .current(node.num)
+            .ok()
+            .and_then(|obj| {
+                obj.as_dict()
+                    .and_then(|d| d.get("Kids"))
+                    .and_then(|o| o.as_array())
+                    .map(|kids| kids.iter().filter_map(|o| o.as_reference()).collect())
+            })
+            .unwrap_or_default();
+        self.page_tree = Some(PageTreeState {
+            pages_node_ref: node,
+            order,
+        });
+    }
+
+    /// `/Pages` du catalogue courant (`/Root` lu dans `pending` d'abord).
+    fn root_pages_ref(&self) -> Option<ObjRef> {
+        let root_ref = self.doc.trailer().get("Root")?.as_reference()?;
+        self.current(root_ref.num)
+            .ok()?
+            .as_dict()?
+            .get("Pages")?
+            .as_reference()
+    }
+
+    /// Référence de la page `index` dans l'ordre **courant**. Audit
+    /// 2026-10-26 #4 : les opérations d'annotation et de caviardage
+    /// résolvaient l'index sur l'arbre de pages *d'origine*
+    /// (`self.doc.page(index)`), alors que `pdf-app` renumérote les pages
+    /// après chaque insertion, suppression ou déplacement. Après
+    /// `delete_page(0)`, surligner la page affichée en position 0 accrochait
+    /// l'annotation à la page supprimée. Une fois l'arbre aplati, c'est
+    /// `page_tree.order` qui fait foi ; avant, l'arbre d'origine n'a pas
+    /// changé d'ordre.
+    fn page_ref_at(&self, index: usize) -> Result<ObjRef, String> {
+        if let Some(state) = &self.page_tree {
+            return state.order.get(index).copied().ok_or_else(|| {
+                format!(
+                    "page index {index} out of bounds (0..{})",
+                    state.order.len()
+                )
+            });
+        }
+        let page = self.doc.page(index).map_err(|e| e.to_string())?;
+        page.object_ref
+            .ok_or_else(|| "page has no indirect object reference".to_string())
+    }
+
+    /// Résout `obj` dans l'état courant : une référence est suivie via
+    /// `current` (objets en attente d'abord), toute autre valeur est clonée.
+    fn resolve_current(&self, obj: &Object) -> Result<Object, String> {
+        match obj {
+            Object::Reference(r) => self.current(r.num),
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Ressources courantes de la page `index`, dont le dictionnaire courant
+    /// est `page_dict` : ses propres `/Resources` résolues dans l'état
+    /// courant si elle en a ; sinon celles héritées de l'arbre d'origine, qui
+    /// ne change pas tant qu'il n'est pas aplati (une fois aplati, chaque
+    /// page porte les siennes).
+    fn page_resources(&self, index: usize, page_dict: &Dictionary) -> Result<Dictionary, String> {
+        match page_dict.get("Resources") {
+            Some(res) => Ok(self
+                .resolve_current(res)?
+                .as_dict()
+                .cloned()
+                .unwrap_or_else(Dictionary::new)),
+            None if self.page_tree.is_some() => Ok(Dictionary::new()),
+            None => Ok(self.doc.page(index).map_err(|e| e.to_string())?.resources),
+        }
+    }
+
+    /// `/Contents` de `page_dict` décodé dans l'état courant (flux en
+    /// attente d'abord), plusieurs flux étant joints par un saut de ligne
+    /// comme dans `Document::page_content` (ISO 32000-1 §7.8.2).
+    fn current_page_content(&self, page_dict: &Dictionary) -> Result<Vec<u8>, String> {
+        let Some(contents) = page_dict.get("Contents") else {
+            return Ok(Vec::new());
         };
-        let Some(kids) = obj
-            .as_dict()
-            .and_then(|d| d.get("Kids"))
-            .and_then(|o| o.as_array())
-        else {
-            return;
+        let streams = match self.resolve_current(contents)? {
+            Object::Array(items) => items
+                .iter()
+                .map(|o| self.resolve_current(o))
+                .collect::<Result<Vec<_>, _>>()?,
+            other => vec![other],
         };
-        let order: Vec<ObjRef> = kids.iter().filter_map(|o| o.as_reference()).collect();
-        self.page_tree.as_mut().unwrap().order = order;
+        let mut out = Vec::new();
+        for obj in streams {
+            let Object::Stream(stream) = obj else {
+                continue;
+            };
+            out.extend_from_slice(
+                &pdf_core::filters::decode_stream(&stream).map_err(|e| e.to_string())?,
+            );
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    /// Copie de `resources` dont `/XObject` ne garde que les noms de `used`,
+    /// ou `None` si aucun XObject n'est à retirer (les ressources restent
+    /// alors inchangées, y compris leur éventuel héritage).
+    fn resources_without_unused_xobjects(
+        &self,
+        resources: &Dictionary,
+        used: &std::collections::HashSet<String>,
+    ) -> Result<Option<Dictionary>, String> {
+        let Some(xobjects) = resources.get("XObject") else {
+            return Ok(None);
+        };
+        let Some(xobjects) = self.resolve_current(xobjects)?.as_dict().cloned() else {
+            return Ok(None);
+        };
+        let mut kept = Dictionary::new();
+        let mut removed_any = false;
+        for (name, value) in xobjects.iter() {
+            if used.contains(name.as_str()) {
+                kept.insert(name.clone(), value.clone());
+            } else {
+                removed_any = true;
+            }
+        }
+        if !removed_any {
+            return Ok(None);
+        }
+        let mut filtered = resources.clone();
+        filtered.insert("XObject", Object::Dictionary(kept));
+        Ok(Some(filtered))
     }
 
     fn commit(&mut self, op: EditOp) {
@@ -297,10 +429,7 @@ impl EditSession {
         color: (f32, f32, f32),
         quad_points: Vec<f64>,
     ) -> Result<(), String> {
-        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
-        let page_ref = page
-            .object_ref
-            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_ref = self.page_ref_at(page_index)?;
 
         let (x0, y0, x1, y1) = (
             rect[0].min(rect[2]),
@@ -429,10 +558,7 @@ impl EditSession {
         color: (f32, f32, f32),
         line_y_fraction: f64,
     ) -> Result<(), String> {
-        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
-        let page_ref = page
-            .object_ref
-            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_ref = self.page_ref_at(page_index)?;
 
         let (x0, y0, x1, y1) = (
             rect[0].min(rect[2]),
@@ -779,10 +905,7 @@ impl EditSession {
         text_color: (f32, f32, f32),
         background: Option<(f32, f32, f32)>,
     ) -> Result<(), String> {
-        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
-        let page_ref = page
-            .object_ref
-            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_ref = self.page_ref_at(page_index)?;
 
         let (x0, y0, x1, y1) = (
             rect[0].min(rect[2]),
@@ -870,10 +993,7 @@ impl EditSession {
     /// `rect` (ni contenu, ni annotation), ou si elle contient une image en
     /// ligne — voir `redact::redact_content_stream`.
     pub fn redact_region(&mut self, page_index: usize, rect: [f64; 4]) -> Result<(), String> {
-        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
-        let page_ref = page
-            .object_ref
-            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_ref = self.page_ref_at(page_index)?;
 
         let (x0, y0, x1, y1) = (
             rect[0].min(rect[2]),
@@ -883,9 +1003,21 @@ impl EditSession {
         );
         let target = redact::Rect::new(x0, y0, x1, y1);
 
-        let content_bytes = self.doc.page_content(&page).map_err(|e| e.to_string())?;
+        // Audit 2026-10-26 #3 : le contenu et les ressources étaient lus dans
+        // le document *d'origine* (`self.doc.page_content`), jamais dans
+        // l'état courant. Caviarder la zone A puis la zone B de la même page
+        // produisait un flux « original − B » : la zone A réapparaissait dans
+        // le fichier sauvegardé. Tout est désormais lu dans l'état courant.
+        let page_obj = self.current(page_ref.num)?;
+        let mut page_dict = page_obj
+            .as_dict()
+            .cloned()
+            .ok_or_else(|| "page object is not a dictionary".to_string())?;
+        let before_page = Object::Dictionary(page_dict.clone());
+        let resources = self.page_resources(page_index, &page_dict)?;
+        let content_bytes = self.current_page_content(&page_dict)?;
         let (mut new_content, redacted_content) =
-            redact::redact_content_stream(&self.doc, &content_bytes, &page.resources, target)?;
+            redact::redact_content_stream(&self.doc, &content_bytes, &resources, target)?;
 
         // Annotations dont `/Rect` intersecte la cible : sur-suppression
         // assumée, comme pour le flux de contenu — pas de tentative de
@@ -922,14 +1054,24 @@ impl EditSession {
         // formulaire touchés en un seul bloc.
         let mut modified: Vec<(u32, Object, Object)> = Vec::new();
 
-        let page_obj = self.current(page_ref.num)?;
-        let mut page_dict = page_obj
-            .as_dict()
-            .cloned()
-            .ok_or_else(|| "page object is not a dictionary".to_string())?;
-        let before_page = Object::Dictionary(page_dict.clone());
+        // Audit 2026-10-26 #5 : la vignette de page (`/Thumb`) est une image
+        // pré-rendue de la page entière, zone caviardée comprise.
+        page_dict.remove("Thumb");
 
         if redacted_content {
+            // Audit 2026-10-26 #5 : retirer un `Do` ne retirait que
+            // l'opérateur ; le Form ou l'Image restait dans `/Resources
+            // /XObject`, et la sauvegarde caviardée (qui copie tout ce que la
+            // page référence) le recopiait. Le texte d'un Form XObject restait
+            // ainsi extractible. Seuls les XObjects encore dessinés par un `Do`
+            // conservé sont gardés. Le nouveau dictionnaire est écrit sur la
+            // page elle-même : des ressources partagées avec d'autres pages ou
+            // héritées d'un nœud parent ne sont jamais modifiées.
+            let used = redact::xobject_names_used(&new_content)?;
+            if let Some(filtered) = self.resources_without_unused_xobjects(&resources, &used)? {
+                page_dict.insert("Resources", Object::Dictionary(filtered));
+            }
+
             new_content.extend_from_slice(
                 format!(
                     "\nq 0 0 0 rg {x0:.3} {y0:.3} {:.3} {:.3} re f Q",
@@ -1010,10 +1152,7 @@ impl EditSession {
     /// `page_index` — résout `/Annots` qu'il soit inline ou indirect, comme
     /// `append_to_annots`.
     fn page_annotation_refs(&self, page_index: usize) -> Result<Vec<ObjRef>, String> {
-        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
-        let page_ref = page
-            .object_ref
-            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_ref = self.page_ref_at(page_index)?;
         let page_obj = self.current(page_ref.num)?;
         let page_dict = page_obj
             .as_dict()
@@ -1039,10 +1178,7 @@ impl EditSession {
         page_index: usize,
         annot_index: usize,
     ) -> Result<(), String> {
-        let page = self.doc.page(page_index).map_err(|e| e.to_string())?;
-        let page_ref = page
-            .object_ref
-            .ok_or_else(|| "page has no indirect object reference".to_string())?;
+        let page_ref = self.page_ref_at(page_index)?;
         let refs = self.page_annotation_refs(page_index)?;
         if annot_index >= refs.len() {
             return Err(format!(
@@ -1828,7 +1964,14 @@ impl EditSession {
                 Object::Array(page.media_box.iter().map(|&n| Object::Real(n)).collect()),
             );
             dict.insert("Rotate", Object::Integer(page.rotate as i64));
-            dict.insert("Resources", Object::Dictionary(page.resources.clone()));
+            // Ressources propres à la page dans l'état *courant* conservées
+            // telles quelles : un caviardage a pu les réécrire (XObjects
+            // retirés, audit 2026-10-26 #5), et `page.resources` vient de
+            // l'arbre d'origine. Seules des ressources héritées d'un nœud
+            // parent sont recopiées sur la page, puisque ce parent disparaît.
+            if dict.get("Resources").is_none() {
+                dict.insert("Resources", Object::Dictionary(page.resources.clone()));
+            }
             let after = Object::Dictionary(dict);
             modified.push((page_ref.num, before, after));
             order.push(page_ref);
@@ -1866,6 +2009,7 @@ impl EditSession {
             pages_node_ref,
             order,
         });
+        self.flat_pages_node = Some(pages_node_ref);
         Ok(modified)
     }
 
@@ -2101,13 +2245,26 @@ impl EditSession {
         let pages_node_ref = self.page_tree.as_ref().unwrap().pages_node_ref;
         let source_pages = source.pages().map_err(|e| e.to_string())?;
 
-        let mut copy_map = std::collections::HashMap::new();
-        let mut new_refs = Vec::with_capacity(source_indices.len());
+        // Pages sources non insérées : `null` (audit 2026-10-26 #8). Le
+        // formulaire source n'est pas fusionné, d'où l'élagage du `/Parent`
+        // des widgets (voir `CopyRules`).
+        let mut inserted = std::collections::HashSet::new();
         for &src_index in source_indices {
             let src_page = source_pages
                 .get(src_index)
                 .ok_or_else(|| format!("source page index {src_index} out of bounds"))?;
-            let new_ref = self.copy_page(source, src_page, pages_node_ref, &mut copy_map)?;
+            if let Some(r) = src_page.object_ref {
+                inserted.insert(r.num);
+            }
+        }
+        let rules = CopyRules::keeping_pages(&source_pages, &inserted, true);
+
+        let mut copy_map = std::collections::HashMap::new();
+        let mut new_refs = Vec::with_capacity(source_indices.len());
+        for &src_index in source_indices {
+            let src_page = &source_pages[src_index];
+            let new_ref =
+                self.copy_page(source, src_page, pages_node_ref, &mut copy_map, &rules)?;
             new_refs.push(new_ref);
         }
 
@@ -2140,6 +2297,7 @@ impl EditSession {
         src_page: &pdf_core::page::Page,
         pages_node_ref: ObjRef,
         copy_map: &mut std::collections::HashMap<u32, u32>,
+        rules: &CopyRules,
     ) -> Result<ObjRef, String> {
         let src_ref = src_page.object_ref.ok_or_else(|| {
             "source page has no indirect object reference (inline in /Kids, not supported)"
@@ -2161,6 +2319,7 @@ impl EditSession {
             &mut self.pending,
             &mut self.next_num,
             copy_map,
+            rules,
         )?;
         let mut dict = copied
             .as_dict()
@@ -2186,6 +2345,7 @@ impl EditSession {
             &mut self.pending,
             &mut self.next_num,
             copy_map,
+            rules,
         )?;
         dict.insert("Resources", copied_resources);
 
@@ -2212,14 +2372,14 @@ impl EditSession {
     /// qu'une sauvegarde incrémentale — inacceptable pour un vrai caviardage.
     ///
     /// Rouvre les octets sauvegardés incrémentalement (`to_bytes`), puis les
-    /// réécrit entièrement via `export_optimized` (garbage collector par
+    /// réécrit entièrement via `export_redacted` (garbage collector par
     /// reconstruction, ne copie que les objets atteignables depuis les
     /// pages) : l'ancien flux, plus référencé par aucune page, n'est simplement
     /// jamais copié dans la sortie.
     pub fn save_redacted(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
         let incremental = self.to_bytes()?;
         let reopened = Document::open(incremental).map_err(|e| e.to_string())?;
-        let optimized = export_optimized(&reopened)?;
+        let optimized = export_redacted(&reopened)?;
         pdf_core::write_atomic(path, &optimized).map_err(|e| e.to_string())?;
         self.saved_undo_len = self.undo_stack.len();
         Ok(())
@@ -2230,7 +2390,34 @@ impl EditSession {
     /// aperçu à jour des modifications en attente : les rouvrir dans un
     /// `Document` en lecture pour le rendu, sans passer par un fichier
     /// temporaire ni toucher au fichier réellement ouvert par l'utilisateur.
+    ///
+    /// Refuse d'écrire des modifications dans un document chiffré. Audit
+    /// 2026-10-26 #9 : la garde existait seulement dans `pdf-app`, et
+    /// `pdf-cli highlight encrypted.pdf out.pdf …` écrivait sans erreur des
+    /// objets en clair dans un fichier dont `/Encrypt` s'applique à tous les
+    /// objets, donc un document corrompu. La garde est placée à l'écriture,
+    /// seul point où la corruption se produit, et non à l'ouverture :
+    /// `pdf-app` crée une `EditSession` pour tout document, chiffré compris,
+    /// et doit pouvoir l'afficher et l'imprimer.
+    ///
+    /// Sans modification en attente, les octets d'origine sont renvoyés tels
+    /// quels. `save_incremental` ajoutait sinon une section de mise à jour
+    /// vide dont le trailer ne reprend pas `/Encrypt` : sur un PDF chiffré,
+    /// ce dernier trailer faisait du fichier un document non chiffré aux
+    /// contenus illisibles. Imprimer un PDF chiffré sans l'avoir modifié
+    /// (`pdf-app::Session::current_bytes`) envoyait ainsi à Aperçu un fichier
+    /// cassé.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.pending.is_empty() {
+            return Ok(self.doc.raw_bytes().to_vec());
+        }
+        if self.doc.is_encrypted() {
+            return Err(
+                "l'édition d'un PDF chiffré n'est pas encore prise en charge ; exportez d'abord une \
+                 copie déchiffrée"
+                    .to_string(),
+            );
+        }
         let objects: Vec<(ObjRef, Object)> = self
             .pending
             .iter()
@@ -2316,15 +2503,74 @@ fn copy_object_recursive(
     pending: &mut std::collections::BTreeMap<u32, Object>,
     next_num: &mut u32,
     copy_map: &mut std::collections::HashMap<u32, u32>,
+    rules: &CopyRules,
 ) -> Result<Object, String> {
     let mut queue: Vec<(ObjRef, u32)> = Vec::new();
-    let out = copy_object_shallow(obj, next_num, copy_map, &mut queue)?;
+    let out = copy_object_shallow(obj, next_num, copy_map, &mut queue, rules)?;
     while let Some((old_ref, new_num)) = queue.pop() {
-        let resolved = source.resolve(old_ref).map_err(|e| e.to_string())?;
-        let copied = copy_object_shallow(&resolved, next_num, copy_map, &mut queue)?;
+        let resolved = match rules.overrides.get(&old_ref.num) {
+            Some(replacement) => replacement.clone(),
+            None => source.resolve(old_ref).map_err(|e| e.to_string())?,
+        };
+        // Un nœud `/Pages` source n'est jamais recopié, quelle que soit la
+        // façon dont on l'atteint : son `/Kids` mènerait à toutes les pages.
+        // La copie construit toujours son propre arbre de pages.
+        let copied = if is_page_tree_node(&resolved, "Pages") {
+            Object::Null
+        } else {
+            copy_object_shallow(&resolved, next_num, copy_map, &mut queue, rules)?
+        };
         pending.insert(new_num, copied);
     }
     Ok(out)
+}
+
+/// Règles d'une copie d'objets depuis un document source (voir
+/// `copy_object_recursive`).
+#[derive(Default)]
+struct CopyRules {
+    /// Objets sources remplacés par une autre valeur avant d'être copiés.
+    /// Sert à faire pointer vers `null` toute page source qui ne fait pas
+    /// partie de la copie (audit 2026-10-26 #8), et à substituer des champs
+    /// de formulaire filtrés lors d'une sauvegarde caviardée (#7).
+    overrides: HashMap<u32, Object>,
+    /// Élaguer `/Parent` des dictionnaires d'annotation ou de XObject (ceux
+    /// qui portent `/Subtype`). Indispensable quand seule une partie des
+    /// pages est copiée : le `/Parent` d'un widget remonte au champ AcroForm,
+    /// dont `/Kids` mène aux widgets d'autres pages
+    /// (AUDIT_FIXES_2026-09-03.md #5). Nuisible quand toutes les pages sont
+    /// copiées : le formulaire conservé y perdrait le lien de ses widgets
+    /// vers leurs champs.
+    skip_annotation_parent: bool,
+}
+
+impl CopyRules {
+    /// Règles d'une copie qui ne garde que les pages `kept` de `source` :
+    /// toute autre page source devient `null`.
+    fn keeping_pages(
+        source_pages: &[pdf_core::page::Page],
+        kept: &std::collections::HashSet<u32>,
+        skip_annotation_parent: bool,
+    ) -> Self {
+        let overrides = source_pages
+            .iter()
+            .filter_map(|page| page.object_ref)
+            .filter(|r| !kept.contains(&r.num))
+            .map(|r| (r.num, Object::Null))
+            .collect();
+        Self {
+            overrides,
+            skip_annotation_parent,
+        }
+    }
+}
+
+/// Vrai si `obj` est un dictionnaire dont `/Type` vaut `type_name`.
+fn is_page_tree_node(obj: &Object, type_name: &str) -> bool {
+    obj.as_dict()
+        .and_then(|d| d.get("Type"))
+        .and_then(|t| t.as_name())
+        == Some(type_name)
 }
 
 /// Copie `obj` sans suivre ses références : chacune est renumérotée (ou
@@ -2335,6 +2581,7 @@ fn copy_object_shallow(
     next_num: &mut u32,
     copy_map: &mut std::collections::HashMap<u32, u32>,
     queue: &mut Vec<(ObjRef, u32)>,
+    rules: &CopyRules,
 ) -> Result<Object, String> {
     match obj {
         Object::Reference(r) => {
@@ -2350,21 +2597,23 @@ fn copy_object_shallow(
         Object::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(copy_object_shallow(item, next_num, copy_map, queue)?);
+                out.push(copy_object_shallow(item, next_num, copy_map, queue, rules)?);
             }
             Ok(Object::Array(out))
         }
         Object::Dictionary(dict) => {
-            // Un dictionnaire qui porte `/Subtype` (annotation/widget,
-            // XObject…) et un `/Parent` : ce `/Parent` remonte vers un nœud
-            // de l'arbre de pages ou un champ AcroForm, jamais vers un objet
-            // que la copie doit suivre. Sans ce garde-fou, copier un widget
-            // de formulaire suit `/Parent` -> champ AcroForm -> `/Kids` ->
-            // widgets d'**autres pages**, qui font remonter à leur tour vers
-            // *leurs* pages via `/P` — la même fuite transitive que celle
-            // corrigée sur le dictionnaire de page lui-même, juste un niveau
-            // plus loin (AUDIT_FIXES_2026-09-03.md #5, étape 2).
-            let skip_parent = dict.get("Subtype").is_some();
+            // Le `/Parent` d'une page ou d'un nœud `/Pages` remonte vers
+            // l'arbre de pages source, donc vers **toutes** ses pages : il
+            // n'est jamais suivi. Audit 2026-10-26 #8 : seul le `/Parent` des
+            // dictionnaires à `/Subtype` était élagué. Une annotation `/Link`
+            // dont `/Dest` vise une page menait à cette page, puis par son
+            // `/Parent` à tout l'arbre : extraire une seule page embarquait
+            // le contenu des autres. Celui d'une annotation ou d'un XObject
+            // dépend du type de copie (voir `CopyRules`).
+            let skip_parent = matches!(
+                dict.get("Type").and_then(|t| t.as_name()),
+                Some("Page") | Some("Pages")
+            ) || (rules.skip_annotation_parent && dict.get("Subtype").is_some());
             let mut out = Dictionary::new();
             for (k, v) in dict.iter() {
                 if skip_parent && k.as_str() == "Parent" {
@@ -2372,7 +2621,7 @@ fn copy_object_shallow(
                 }
                 out.insert(
                     k.clone(),
-                    copy_object_shallow(v, next_num, copy_map, queue)?,
+                    copy_object_shallow(v, next_num, copy_map, queue, rules)?,
                 );
             }
             Ok(Object::Dictionary(out))
@@ -2382,7 +2631,7 @@ fn copy_object_shallow(
             for (k, v) in stream.dict.iter() {
                 out_dict.insert(
                     k.clone(),
-                    copy_object_shallow(v, next_num, copy_map, queue)?,
+                    copy_object_shallow(v, next_num, copy_map, queue, rules)?,
                 );
             }
             // Les octets bruts ne sont jamais redécodés/recompressés : le
@@ -2397,13 +2646,96 @@ fn copy_object_shallow(
     }
 }
 
+/// Ce qu'une reconstruction de document (`rebuild_document`) reprend du
+/// catalogue et du trailer source. Audit 2026-10-26 #7 : les trois usages
+/// passaient par le même catalogue minimal (`/Type` + `/Pages`) et un trailer
+/// réduit à `/Size` + `/Root`. Exporter ou sauvegarder après un caviardage
+/// perdait ainsi le formulaire (devenu inerte), les signets, les destinations
+/// nommées, l'étiquetage des pages, l'action d'ouverture, l'arbre de
+/// structure (accessibilité), les métadonnées, `/Info` et `/ID`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// Sous-ensemble de pages (`extract_pages`) : catalogue minimal, comme
+    /// avant. Signets, formulaire, étiquettes de pages, arbre de structure et
+    /// destinations nommées décrivent le document *entier* : ils pointeraient
+    /// vers des pages absentes, ou en révéleraient le contenu (titres de
+    /// signets, valeurs de champs).
+    Subset,
+    /// Document entier (`export_optimized`) : tout le catalogue est repris,
+    /// sauf `/Pages` qui est reconstruit, ainsi que `/Info` et `/ID`.
+    WholeDocument,
+    /// Document entier après caviardage (`save_redacted`, `export_redacted`) :
+    /// comme `WholeDocument`, sans ce qui peut conserver le texte caviardé
+    /// hors du flux de contenu. Sont retirés les métadonnées XMP et `/Info`
+    /// (titre, sujet, mots-clés), l'arbre de structure (`/ActualText`, `/Alt`
+    /// des éléments balisés), les données privées d'application
+    /// (`/PieceInfo`, où Illustrator garde une copie éditable de la page) et
+    /// le formulaire XFA (copie XML des valeurs). `/AcroForm` ne garde que
+    /// les champs encore reliés à un widget présent sur une page : un widget
+    /// retiré par le caviardage emportait sa vue, mais la valeur `/V` de son
+    /// champ restait listée dans `/Fields`.
+    Redacted,
+}
+
+/// Clés du catalogue source jamais reprises par `rebuild_document`, selon le
+/// mode (`/Pages` est toujours reconstruit, `/AcroForm` est filtré à part).
+fn catalog_keys_dropped(mode: Rebuild) -> &'static [&'static str] {
+    match mode {
+        Rebuild::Subset => &[],
+        Rebuild::WholeDocument => &["Type", "Pages"],
+        Rebuild::Redacted => &[
+            "Type",
+            "Pages",
+            "AcroForm",
+            "Metadata",
+            "StructTreeRoot",
+            "MarkInfo",
+            "PieceInfo",
+        ],
+    }
+}
+
 /// Découpage de document (Sprint 15-16, "split") : construit un PDF
 /// autonome (`pdf_core::writer::write_standalone`) ne contenant que les
 /// pages `indices` de `source` et tout ce qu'elles référencent
 /// transitivement — puisque rien d'autre n'est copié, ce fichier ne
 /// contient par construction aucun objet inatteignable : un sous-produit
-/// naturel de garbage collection, pas une passe séparée.
+/// naturel de garbage collection, pas une passe séparée. Voir
+/// `Rebuild::Subset` pour ce que le catalogue reprend.
 pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, String> {
+    rebuild_document(source, indices, Rebuild::Subset)
+}
+
+/// "Export / optimisation" (Sprint 15-16) : réécrit `source` en entier
+/// plutôt que de la modifier en place — une sauvegarde incrémentale ne peut
+/// qu'ajouter, donc ne peut jamais "faire le ménage" ; reconstruire le
+/// fichier à partir des seuls objets atteignables en fait un vrai garbage
+/// collector, au prix d'une réécriture complète plutôt qu'un simple ajout.
+/// Le catalogue est repris en entier (`Rebuild::WholeDocument`).
+/// **Non fait :** linéarisation (réordonnancement des objets pour
+/// l'affichage progressif/streaming) — hors périmètre de cette passe, un
+/// chantier à part entière.
+pub fn export_optimized(source: &Document) -> Result<Vec<u8>, String> {
+    let count = source.page_count().map_err(|e| e.to_string())?;
+    let indices: Vec<usize> = (0..count).collect();
+    rebuild_document(source, &indices, Rebuild::WholeDocument)
+}
+
+/// Comme `export_optimized`, pour un document qui a été caviardé : voir
+/// `Rebuild::Redacted` pour ce qui n'est pas repris. À utiliser pour tout
+/// export complet d'un document caviardé, sans quoi le texte retiré du flux
+/// de contenu pourrait ressortir par le catalogue.
+pub fn export_redacted(source: &Document) -> Result<Vec<u8>, String> {
+    let count = source.page_count().map_err(|e| e.to_string())?;
+    let indices: Vec<usize> = (0..count).collect();
+    rebuild_document(source, &indices, Rebuild::Redacted)
+}
+
+fn rebuild_document(
+    source: &Document,
+    indices: &[usize],
+    mode: Rebuild,
+) -> Result<Vec<u8>, String> {
     let mut pending: std::collections::BTreeMap<u32, Object> = std::collections::BTreeMap::new();
     let mut next_num: u32 = 1;
     let mut copy_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
@@ -2413,11 +2745,53 @@ pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, St
     let pages_node_ref = ObjRef::new(pages_node_num, 0);
 
     let source_pages = source.pages().map_err(|e| e.to_string())?;
-    let mut kids = Vec::with_capacity(indices.len());
+    let mut kept_pages = std::collections::HashSet::new();
     for &idx in indices {
-        let src_page = source_pages
+        let page = source_pages
             .get(idx)
             .ok_or_else(|| format!("page index {idx} out of bounds"))?;
+        if let Some(r) = page.object_ref {
+            kept_pages.insert(r.num);
+        }
+    }
+    let mut rules = CopyRules::keeping_pages(&source_pages, &kept_pages, mode == Rebuild::Subset);
+
+    let source_root = source
+        .trailer()
+        .get("Root")
+        .map(|root| source.get(root))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .and_then(|root| root.as_dict().cloned())
+        .unwrap_or_else(Dictionary::new);
+
+    // Formulaire filtré calculé *avant* la copie des pages : les widgets
+    // conservés y retrouvent leur champ par `/Parent`, et un champ dont la
+    // liste `/Kids` change doit déjà être substitué à ce moment-là.
+    let redacted_acroform = match (mode, source_root.get("AcroForm")) {
+        (Rebuild::Redacted, Some(acroform)) => {
+            let acroform = source
+                .get(acroform)
+                .map_err(|e| e.to_string())?
+                .as_dict()
+                .cloned();
+            match acroform {
+                Some(acroform) => {
+                    let widgets = annotation_refs_on_pages(source, &source_pages)?;
+                    let (filtered, field_overrides) =
+                        acroform_for_redaction(source, &acroform, &widgets);
+                    rules.overrides.extend(field_overrides);
+                    Some(filtered)
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
+    let mut kids = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let src_page = &source_pages[idx];
         let src_ref = src_page
             .object_ref
             .ok_or_else(|| "source page has no indirect object reference".to_string())?;
@@ -2431,12 +2805,30 @@ pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, St
         let raw_dict = raw
             .as_dict()
             .ok_or_else(|| "source page is not a dictionary".to_string())?;
+        let page_dict = match mode {
+            Rebuild::Subset => strip_page_tree_links(raw_dict),
+            Rebuild::WholeDocument => {
+                let mut dict = raw_dict.clone();
+                dict.remove("Parent");
+                dict
+            }
+            Rebuild::Redacted => {
+                let mut dict = raw_dict.clone();
+                // `/StructParents` indexe l'arbre de structure, non repris ;
+                // `/PieceInfo` et `/Metadata` de page : voir `Rebuild::Redacted`.
+                for key in ["Parent", "StructParents", "PieceInfo", "Metadata"] {
+                    dict.remove(key);
+                }
+                dict
+            }
+        };
         let copied = copy_object_recursive(
             source,
-            &Object::Dictionary(strip_page_tree_links(raw_dict)),
+            &Object::Dictionary(page_dict),
             &mut pending,
             &mut next_num,
             &mut copy_map,
+            &rules,
         )?;
         let mut dict = copied
             .as_dict()
@@ -2461,6 +2853,7 @@ pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, St
             &mut pending,
             &mut next_num,
             &mut copy_map,
+            &rules,
         )?;
         dict.insert("Resources", copied_resources);
 
@@ -2475,10 +2868,61 @@ pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, St
     pages_dict.insert("Count", Object::Integer(kids_len as i64));
     pending.insert(pages_node_num, Object::Dictionary(pages_dict));
 
-    let root_num = next_num;
+    // Catalogue : copié *après* les pages, pour que signets, destinations et
+    // action d'ouverture retrouvent dans `copy_map` les pages déjà copiées.
     let mut root_dict = Dictionary::new();
     root_dict.insert("Type", Object::Name("Catalog".to_string()));
     root_dict.insert("Pages", Object::Reference(pages_node_ref));
+    if mode != Rebuild::Subset {
+        let dropped = catalog_keys_dropped(mode);
+        for (key, value) in source_root.iter() {
+            if dropped.contains(&key.as_str()) {
+                continue;
+            }
+            let copied = copy_object_recursive(
+                source,
+                value,
+                &mut pending,
+                &mut next_num,
+                &mut copy_map,
+                &rules,
+            )?;
+            root_dict.insert(key.clone(), copied);
+        }
+        if let Some(acroform) = redacted_acroform {
+            let copied = copy_object_recursive(
+                source,
+                &Object::Dictionary(acroform),
+                &mut pending,
+                &mut next_num,
+                &mut copy_map,
+                &rules,
+            )?;
+            root_dict.insert("AcroForm", copied);
+        }
+    }
+
+    let mut extra_trailer = Dictionary::new();
+    if mode != Rebuild::Subset {
+        if let Some(id) = source.trailer().get("ID") {
+            extra_trailer.insert("ID", id.clone());
+        }
+    }
+    if mode == Rebuild::WholeDocument {
+        if let Some(info) = source.trailer().get("Info") {
+            let copied = copy_object_recursive(
+                source,
+                info,
+                &mut pending,
+                &mut next_num,
+                &mut copy_map,
+                &rules,
+            )?;
+            extra_trailer.insert("Info", copied);
+        }
+    }
+
+    let root_num = next_num;
     pending.insert(root_num, Object::Dictionary(root_dict));
 
     let objects: Vec<(ObjRef, Object)> = pending
@@ -2488,22 +2932,133 @@ pub fn extract_pages(source: &Document, indices: &[usize]) -> Result<Vec<u8>, St
     Ok(pdf_core::writer::write_standalone(
         &objects,
         ObjRef::new(root_num, 0),
+        &extra_trailer,
     ))
 }
 
-/// "Export / optimisation" (Sprint 15-16) : réécrit `source` en entier via
-/// `extract_pages` (toutes les pages, dans l'ordre) plutôt que de la
-/// modifier en place — une sauvegarde incrémentale ne peut qu'ajouter, donc
-/// ne peut jamais "faire le ménage" ; reconstruire le fichier à partir des
-/// seuls objets atteignables depuis les pages en fait un vrai garbage
-/// collector, au prix d'une réécriture complète plutôt qu'un simple ajout.
-/// **Non fait :** linéarisation (réordonnancement des objets pour
-/// l'affichage progressif/streaming) — hors périmètre de cette passe, un
-/// chantier à part entière.
-pub fn export_optimized(source: &Document) -> Result<Vec<u8>, String> {
-    let count = source.page_count().map_err(|e| e.to_string())?;
-    let indices: Vec<usize> = (0..count).collect();
-    extract_pages(source, &indices)
+/// Numéros d'objet de toutes les annotations listées dans `/Annots` des
+/// pages `pages` de `source`.
+fn annotation_refs_on_pages(
+    source: &Document,
+    pages: &[pdf_core::page::Page],
+) -> Result<std::collections::HashSet<u32>, String> {
+    let mut refs = std::collections::HashSet::new();
+    for page in pages {
+        let Some(annots) = page.dict.get("Annots") else {
+            continue;
+        };
+        let annots = source.get(annots).map_err(|e| e.to_string())?;
+        if let Some(items) = annots.as_array() {
+            refs.extend(items.iter().filter_map(|o| o.as_reference()).map(|r| r.num));
+        }
+    }
+    Ok(refs)
+}
+
+/// Profondeur maximale d'un arbre de champs AcroForm parcouru par
+/// `acroform_for_redaction` : un arbre réel en a quelques niveaux ; au-delà
+/// (arbre forgé), les champs ne sont pas repris.
+const MAX_FIELD_TREE_DEPTH: usize = 32;
+
+/// `/AcroForm` d'un document caviardé (voir `Rebuild::Redacted`) : `/Fields`
+/// et `/CO` ne gardent que les champs encore reliés à un widget présent sur
+/// une page (`widgets`), et `/XFA` est retiré. Renvoie aussi les champs
+/// intermédiaires à substituer pendant la copie, dont la liste `/Kids` perd
+/// des enfants.
+///
+/// Un champ sans aucun widget (champ masqué ou calculé, sans `/Kids` et qui
+/// n'est pas lui-même un widget) n'a rien à voir avec une zone caviardée :
+/// il est conservé.
+fn acroform_for_redaction(
+    source: &Document,
+    acroform: &Dictionary,
+    widgets: &std::collections::HashSet<u32>,
+) -> (Dictionary, HashMap<u32, Object>) {
+    let mut decisions: HashMap<u32, bool> = HashMap::new();
+    let mut overrides: HashMap<u32, Object> = HashMap::new();
+
+    let mut filtered = acroform.clone();
+    filtered.remove("XFA");
+    for key in ["Fields", "CO"] {
+        let Some(list) = acroform.get(key) else {
+            continue;
+        };
+        let list = source
+            .get(list)
+            .ok()
+            .and_then(|o| o.as_array().map(<[Object]>::to_vec));
+        let kept: Vec<Object> = list
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                item.as_reference().is_some_and(|r| {
+                    keep_field(source, r, widgets, &mut decisions, &mut overrides, 0)
+                })
+            })
+            .collect();
+        filtered.insert(key, Object::Array(kept));
+    }
+    (filtered, overrides)
+}
+
+/// Le champ `field` doit-il survivre au caviardage ? Voir
+/// `acroform_for_redaction`. Mémoïsé dans `decisions`, qui sert aussi de
+/// garde contre les cycles (décision provisoire `false` pendant le parcours).
+fn keep_field(
+    source: &Document,
+    field: ObjRef,
+    widgets: &std::collections::HashSet<u32>,
+    decisions: &mut HashMap<u32, bool>,
+    overrides: &mut HashMap<u32, Object>,
+    depth: usize,
+) -> bool {
+    if let Some(&decided) = decisions.get(&field.num) {
+        return decided;
+    }
+    decisions.insert(field.num, false);
+    if depth > MAX_FIELD_TREE_DEPTH {
+        return false;
+    }
+    let Some(dict) = source
+        .resolve(field)
+        .ok()
+        .and_then(|o| o.as_dict().cloned())
+    else {
+        return false;
+    };
+
+    let keep = if dict.get("Subtype").and_then(|s| s.as_name()) == Some("Widget") {
+        // Widget (enfant d'un champ, ou champ et widget fusionnés).
+        widgets.contains(&field.num)
+    } else {
+        match dict.get("Kids") {
+            None => true,
+            Some(kids) => {
+                let kids = source
+                    .get(kids)
+                    .ok()
+                    .and_then(|o| o.as_array().map(<[Object]>::to_vec))
+                    .unwrap_or_default();
+                let kept: Vec<Object> = kids
+                    .iter()
+                    .filter(|kid| {
+                        kid.as_reference().is_some_and(|r| {
+                            keep_field(source, r, widgets, decisions, overrides, depth + 1)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if kept.len() != kids.len() {
+                    let mut updated = dict.clone();
+                    updated.insert("Kids", Object::Array(kept.clone()));
+                    overrides.insert(field.num, Object::Dictionary(updated));
+                }
+                !kept.is_empty()
+            }
+        }
+    };
+    decisions.insert(field.num, keep);
+    keep
 }
 
 #[cfg(test)]
@@ -2822,9 +3377,14 @@ mod tests {
         let mut session = EditSession::open(&path).unwrap();
 
         session.delete_page(1).unwrap();
-        assert_eq!(session.page_tree.as_ref().unwrap().order.len(), 4);
+        assert_eq!(session.page_count().unwrap(), 4);
         assert!(session.undo());
-        assert_eq!(session.page_tree.as_ref().unwrap().order.len(), 5);
+        assert_eq!(session.page_count().unwrap(), 5);
+        // Annuler la première opération de page annule aussi l'aplatissement
+        // de l'arbre : `/Root` repointe vers l'arbre d'origine, et `page_tree`
+        // ne doit plus désigner le nœud aplati devenu orphelin (audit
+        // 2026-10-26 #6). Ce test vérifiait jusqu'ici l'inverse.
+        assert!(session.page_tree.is_none());
         assert!(!session.can_undo());
 
         std::fs::remove_file(&path).ok();
@@ -3837,11 +4397,429 @@ mod tests {
             &mut pending,
             &mut next_num,
             &mut copy_map,
+            &CopyRules::default(),
         )
         .unwrap();
 
         assert_eq!(copied, Object::Reference(ObjRef::new(1, 0)));
         assert_eq!(pending.len(), CHAIN as usize);
         assert_eq!(next_num, CHAIN + 1);
+    }
+
+    // ---- Audit 2026-10-26, priorité 3 (caviardage et intégrité du fichier) ----
+
+    /// PDF dont les objets `1..=n` ont pour corps `objects` (objet 1 =
+    /// catalogue) ; `trailer_extra` est ajouté tel quel au trailer.
+    fn pdf_from_objects(objects: &[String], trailer_extra: &str) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R {trailer_extra} >>\nstartxref\n{xref_offset}\n%%EOF",
+            offsets.len() + 1
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+        bytes
+    }
+
+    fn stream(dict_entries: &str, data: &str) -> String {
+        format!(
+            "<< {dict_entries} /Length {} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+    }
+
+    const HELVETICA: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
+    /// Vrai si `needle` apparaît dans `bytes`, en clair ou en hexadécimal
+    /// (majuscules ou minuscules) : `write_object` écrit toute chaîne en
+    /// hexadécimal, si bien qu'une simple recherche d'octets manquerait une
+    /// valeur réécrite par le moteur.
+    fn leaks(bytes: &[u8], needle: &str) -> bool {
+        let hex_upper: String = needle.bytes().map(|b| format!("{b:02X}")).collect();
+        let hex_lower = hex_upper.to_lowercase();
+        [
+            needle.as_bytes(),
+            hex_upper.as_bytes(),
+            hex_lower.as_bytes(),
+        ]
+        .iter()
+        .any(|n| bytes.windows(n.len()).any(|w| w == *n))
+    }
+
+    /// Chemin de sortie temporaire unique, même entre tests parallèles du
+    /// même processus (l'horloge de macOS n'a qu'une résolution d'une
+    /// microseconde, d'où le compteur).
+    fn temp_output(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("pdf-edit-test-{}-{n}-{name}", std::process::id()))
+    }
+
+    /// Audit 2026-10-26 #3 : caviarder deux zones de la même page dans la
+    /// même session. Le second caviardage repartait du flux *d'origine* et la
+    /// première zone réapparaissait dans le fichier sauvegardé.
+    #[test]
+    fn second_redaction_on_a_page_keeps_the_first_one() {
+        let bytes = pdf_from_objects(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_string(),
+                stream(
+                    "",
+                    "BT /F1 24 Tf 72 700 Td (SECRETALPHA) Tj ET \
+                     BT /F1 24 Tf 72 500 Td (SECRETBRAVO) Tj ET \
+                     BT /F1 24 Tf 72 300 Td (visible) Tj ET",
+                ),
+                HELVETICA.to_string(),
+            ],
+            "",
+        );
+        let mut session = EditSession::from_bytes(bytes, b"").unwrap();
+        session
+            .redact_region(0, [60.0, 690.0, 400.0, 730.0])
+            .unwrap();
+        session
+            .redact_region(0, [60.0, 490.0, 400.0, 530.0])
+            .unwrap();
+
+        let out = temp_output("double-redaction.pdf");
+        session.save_redacted(&out).unwrap();
+        let saved = std::fs::read(&out).unwrap();
+        let text = page_texts(&pdf_core::Document::open(saved.clone()).unwrap()).join("\n");
+        assert!(
+            !text.contains("SECRETALPHA"),
+            "première zone réapparue : {text}"
+        );
+        assert!(!text.contains("SECRETBRAVO"), "{text}");
+        assert!(
+            text.contains("visible"),
+            "le reste de la page doit survivre : {text}"
+        );
+        assert!(!leaks(&saved, "SECRETALPHA") && !leaks(&saved, "SECRETBRAVO"));
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// Audit 2026-10-26 #5 : le texte d'un Form XObject caviardé restait dans
+    /// le fichier (le `Do` était retiré, pas l'entrée `/XObject`), de même
+    /// que la vignette de page `/Thumb`.
+    #[test]
+    fn redacted_form_xobject_and_page_thumbnail_leave_the_file() {
+        let bytes = pdf_from_objects(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Fx 6 0 R >> >> \
+                 /Contents 4 0 R /Thumb 7 0 R >>"
+                    .to_string(),
+                stream(
+                    "",
+                    "q 1 0 0 1 72 600 cm /Fx Do Q BT /F1 12 Tf 72 300 Td (visible) Tj ET",
+                ),
+                HELVETICA.to_string(),
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 200 50] \
+                     /Resources << /Font << /F1 5 0 R >> >>",
+                    "BT /F1 12 Tf 0 10 Td (SECRETXOBJ) Tj ET",
+                ),
+                stream(
+                    "/Type /XObject /Subtype /Image /Width 11 /Height 1 \
+                     /ColorSpace /DeviceGray /BitsPerComponent 8",
+                    "THUMBSECRET",
+                ),
+            ],
+            "",
+        );
+        let mut session = EditSession::from_bytes(bytes, b"").unwrap();
+        session
+            .redact_region(0, [60.0, 590.0, 300.0, 660.0])
+            .unwrap();
+
+        let out = temp_output("xobject-redaction.pdf");
+        session.save_redacted(&out).unwrap();
+        let saved = std::fs::read(&out).unwrap();
+        assert!(
+            !leaks(&saved, "SECRETXOBJ"),
+            "le Form XObject caviardé est resté"
+        );
+        assert!(
+            !leaks(&saved, "THUMBSECRET"),
+            "la vignette de page est restée"
+        );
+        let text = page_texts(&pdf_core::Document::open(saved).unwrap()).join("\n");
+        assert!(text.contains("visible"), "{text}");
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// Audit 2026-10-26 #4 : après `delete_page(0)`, l'index 0 désigne
+    /// l'ancienne page 1. Le surlignage s'accrochait à la page supprimée.
+    #[test]
+    fn annotation_after_a_page_deletion_lands_on_the_page_now_at_that_index() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let mut session = EditSession::from_bytes(bytes, b"").unwrap();
+        session.delete_page(0).unwrap();
+        session
+            .add_highlight_annotation(0, [10.0, 10.0, 50.0, 50.0], (1.0, 1.0, 0.0), Vec::new())
+            .unwrap();
+
+        let doc = pdf_core::Document::open(session.to_bytes().unwrap()).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 4);
+        let page = doc.page(0).unwrap();
+        let annots = page
+            .dict
+            .get("Annots")
+            .map(|a| doc.get(a).unwrap())
+            .and_then(|a| a.as_array().map(<[Object]>::len));
+        assert_eq!(
+            annots,
+            Some(1),
+            "l'annotation doit être sur la nouvelle page 0"
+        );
+        assert!(
+            page_texts(&doc)[0].contains("Page 2"),
+            "{:?}",
+            page_texts(&doc)
+        );
+    }
+
+    /// Audit 2026-10-26 #6 : `delete_page(0)`, `undo()`, `delete_page(1)`.
+    /// La session annonçait 4 pages, le fichier sauvegardé en gardait 5.
+    #[test]
+    fn page_operation_after_undoing_the_first_one_reaches_the_saved_file() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let mut session = EditSession::from_bytes(bytes, b"").unwrap();
+        session.delete_page(0).unwrap();
+        assert!(session.undo());
+        session.delete_page(1).unwrap();
+
+        assert_eq!(session.page_count().unwrap(), 4);
+        let doc = pdf_core::Document::open(session.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            doc.page_count().unwrap(),
+            4,
+            "la suppression doit être sauvegardée"
+        );
+        let texts = page_texts(&doc);
+        assert!(
+            texts[0].contains("Page 1") && texts[1].contains("Page 3"),
+            "{texts:?}"
+        );
+    }
+
+    /// Un `redo` de la première opération de page doit réactiver l'arbre
+    /// aplati qu'un `undo` avait désactivé.
+    #[test]
+    fn redo_of_the_first_page_operation_reactivates_the_flat_tree() {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let mut session = EditSession::from_bytes(bytes, b"").unwrap();
+        session.delete_page(0).unwrap();
+        assert!(session.undo());
+        assert!(session.redo());
+        assert_eq!(session.page_count().unwrap(), 4);
+        session.delete_page(0).unwrap();
+        assert_eq!(session.page_count().unwrap(), 3);
+        let doc = pdf_core::Document::open(session.to_bytes().unwrap()).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 3);
+    }
+
+    /// Catalogue de deux pages : la page 0 porte un lien `/Link` dont la
+    /// destination est la page 1, qui contient `OTHERPAGE`.
+    fn two_pages_with_a_link() -> Vec<u8> {
+        pdf_from_objects(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R >>".to_string(),
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R /Annots [8 0 R] >>"
+                    .to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>"
+                    .to_string(),
+                stream("", "BT /F1 12 Tf 72 700 Td (first) Tj ET"),
+                stream("", "BT /F1 12 Tf 72 700 Td (OTHERPAGE) Tj ET"),
+                HELVETICA.to_string(),
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>"
+                    .to_string(),
+                "<< /Type /Outlines /Count 0 >>".to_string(),
+            ],
+            "",
+        )
+    }
+
+    /// Audit 2026-10-26 #8 : extraire la page 0 seule suivait le `/Dest` du
+    /// lien jusqu'à la page 1, puis son `/Parent` jusqu'à tout l'arbre.
+    #[test]
+    fn extracting_one_page_does_not_follow_a_link_to_another_page() {
+        let source = pdf_core::Document::open(two_pages_with_a_link()).unwrap();
+        let extracted = extract_pages(&source, &[0]).unwrap();
+        assert!(
+            !leaks(&extracted, "OTHERPAGE"),
+            "la page liée a été embarquée"
+        );
+        let doc = pdf_core::Document::open(extracted).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 1);
+        assert!(page_texts(&doc)[0].contains("first"));
+    }
+
+    /// Catalogue de `doc` rouvert.
+    fn catalog(doc: &pdf_core::Document) -> Dictionary {
+        doc.get(doc.trailer().get("Root").unwrap())
+            .unwrap()
+            .as_dict()
+            .cloned()
+            .unwrap()
+    }
+
+    /// Audit 2026-10-26 #7 : l'export complet gardait un catalogue réduit à
+    /// `/Type` + `/Pages`. Formulaire, signets et `/Info` doivent survivre.
+    #[test]
+    fn whole_document_export_keeps_form_outlines_and_info() {
+        let form = include_bytes!("../../pdf-core/tests/fixtures/acroform_textfield.pdf").to_vec();
+        let exported = export_optimized(&pdf_core::Document::open(form).unwrap()).unwrap();
+        let doc = pdf_core::Document::open(exported).unwrap();
+        let acroform = catalog(&doc)
+            .get("AcroForm")
+            .map(|a| doc.get(a).unwrap())
+            .expect("/AcroForm doit être conservé");
+        let fields = acroform.as_dict().unwrap().get("Fields").unwrap();
+        assert_eq!(
+            doc.get(fields).unwrap().as_array().map(<[Object]>::len),
+            Some(1)
+        );
+
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /PageLabels << /Nums [0 << /S /r >>] >> >>"
+                .to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_string(),
+            stream("", ""),
+            "<< /Type /Outlines /Count 0 >>".to_string(),
+        ];
+        objects.push("<< /Title (Mon titre) >>".to_string());
+        let bytes = pdf_from_objects(&objects, "/Info 6 0 R");
+        let exported = export_optimized(&pdf_core::Document::open(bytes).unwrap()).unwrap();
+        let doc = pdf_core::Document::open(exported).unwrap();
+        let root = catalog(&doc);
+        assert!(root.get("Outlines").is_some(), "signets perdus");
+        assert!(
+            root.get("PageLabels").is_some(),
+            "étiquettes de pages perdues"
+        );
+        let info = doc
+            .get(doc.trailer().get("Info").expect("/Info perdu"))
+            .unwrap();
+        assert!(info.as_dict().unwrap().get("Title").is_some());
+    }
+
+    /// Audit 2026-10-26 #7, sauvegarde caviardée : le formulaire est conservé,
+    /// mais sans le champ dont le widget a été caviardé (sa valeur `/V`
+    /// ressortait sinon par `/Fields`), et sans métadonnées XMP, `/Info` ni
+    /// arbre de structure, qui peuvent contenir le texte caviardé.
+    #[test]
+    fn redacted_save_keeps_other_fields_but_drops_redacted_ones_and_metadata() {
+        let bytes = pdf_from_objects(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R 6 0 R] >> \
+                 /Metadata 7 0 R /StructTreeRoot 8 0 R >>"
+                    .to_string(),
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R /Annots [5 0 R 6 0 R] >>"
+                    .to_string(),
+                stream("", "BT /F1 12 Tf 72 300 Td (visible) Tj ET"),
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (fa) /V (SECRETFIELD) \
+                 /Rect [72 700 272 720] /P 3 0 R >>"
+                    .to_string(),
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (fb) /V (KEEPFIELD) \
+                 /Rect [72 500 272 520] /P 3 0 R >>"
+                    .to_string(),
+                stream("/Type /Metadata /Subtype /XML", "<x>SECRETXMP</x>"),
+                "<< /Type /StructTreeRoot /K << /S /P /ActualText (SECRETSTRUCT) >> >>".to_string(),
+                HELVETICA.to_string(),
+                "<< /Title (SECRETINFO) >>".to_string(),
+            ],
+            "/Info 10 0 R",
+        );
+        let mut session = EditSession::from_bytes(bytes, b"").unwrap();
+        session
+            .redact_region(0, [60.0, 690.0, 300.0, 730.0])
+            .unwrap();
+
+        let out = temp_output("form-redaction.pdf");
+        session.save_redacted(&out).unwrap();
+        let saved = std::fs::read(&out).unwrap();
+        for secret in ["SECRETFIELD", "SECRETXMP", "SECRETSTRUCT", "SECRETINFO"] {
+            assert!(
+                !leaks(&saved, secret),
+                "{secret} ressort de la sauvegarde caviardée"
+            );
+        }
+
+        let doc = pdf_core::Document::open(saved).unwrap();
+        let acroform = doc
+            .get(catalog(&doc).get("AcroForm").expect("/AcroForm perdu"))
+            .unwrap();
+        let fields = doc
+            .get(acroform.as_dict().unwrap().get("Fields").unwrap())
+            .unwrap();
+        let names: Vec<Vec<u8>> = fields
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| match doc.get(f).unwrap().as_dict().unwrap().get("T") {
+                Some(Object::String(s)) => s.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![b"fb".to_vec()],
+            "seul le champ non caviardé reste"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// Audit 2026-10-26 #9 : des modifications ne doivent jamais être écrites
+    /// en clair dans un PDF chiffré. Sans modification, les octets d'origine
+    /// sont renvoyés tels quels : `save_incremental` y ajoutait sinon un
+    /// trailer sans `/Encrypt`, et imprimer un PDF chiffré non modifié
+    /// produisait un fichier illisible.
+    #[test]
+    fn encrypted_documents_are_returned_untouched_and_never_edited_in_clear() {
+        let bytes = include_bytes!("../../pdf-core/tests/fixtures/encrypted_rc4.pdf").to_vec();
+        let mut session = EditSession::from_bytes(bytes.clone(), b"").unwrap();
+
+        let unchanged = session.to_bytes().unwrap();
+        assert!(
+            unchanged == bytes,
+            "document non modifié : {} octets renvoyés au lieu des {} d'origine",
+            unchanged.len(),
+            bytes.len()
+        );
+        assert!(pdf_core::Document::open(unchanged).unwrap().is_encrypted());
+
+        session
+            .add_highlight_annotation(0, [10.0, 10.0, 50.0, 50.0], (1.0, 1.0, 0.0), Vec::new())
+            .unwrap();
+        let err = session.to_bytes().unwrap_err();
+        assert!(err.contains("chiffré"), "{err}");
+        let out = temp_output("encrypted-edit.pdf");
+        assert!(session.save_as(&out).is_err());
+        assert!(!out.exists(), "aucun fichier ne doit être écrit");
     }
 }

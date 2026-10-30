@@ -911,7 +911,36 @@ impl Session {
     /// `pdf_edit::extract_pages`) — ne modifie pas la session en cours, sert
     /// au "découper"/"extraire une sélection de pages".
     pub fn extract_pages_to_file(&self, indices: &[usize], dest: &Path) -> Result<(), String> {
+        self.check_export_destination(dest)?;
         let bytes = pdf_edit::extract_pages(&self.doc, indices)?;
+        pdf_core::write_atomic(dest, &bytes).map_err(|e| e.to_string())
+    }
+
+    /// Refuse une destination d'export qui désigne le fichier ouvert lui-même
+    /// (voir `is_same_file`). Audit 2026-10-26 #15 : « Exporter une copie »
+    /// faisait `std::fs::copy(source, dest)`, qui tronque la destination
+    /// avant de lire la source. Le panneau d'enregistrement propose le même
+    /// nom dans le dossier du document : confirmer « Remplacer » réduisait le
+    /// PDF ouvert à 0 octet. Extraire ou optimiser vers ce même fichier
+    /// l'aurait remplacé par un sous-ensemble de ses pages ou une copie
+    /// renumérotée, sous la session encore ouverte.
+    pub fn check_export_destination(&self, dest: &Path) -> Result<(), String> {
+        if is_same_file(&self.path, dest) {
+            return Err(
+                "la destination est le fichier actuellement ouvert : choisissez un autre nom"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// « Exporter une copie… » : copie brute du fichier tel qu'il est **sur
+    /// disque** (pas des modifications en attente, voir
+    /// `save_edits_in_place`) vers `dest`. Écrite de façon atomique, et
+    /// jamais vers le fichier ouvert lui-même (`check_export_destination`).
+    pub fn export_copy_to(&self, dest: &Path) -> Result<(), String> {
+        self.check_export_destination(dest)?;
+        let bytes = std::fs::read(&self.path).map_err(|e| e.to_string())?;
         pdf_core::write_atomic(dest, &bytes).map_err(|e| e.to_string())
     }
 
@@ -941,7 +970,20 @@ impl Session {
     /// `Document::save_incremental`), seulement complété, mais du point de
     /// vue de l'utilisateur c'est bien la même session de fichier qui est
     /// mise à jour.
+    ///
+    /// Refuse d'écrire si le fichier n'existe plus à son chemin d'ouverture.
+    /// Audit 2026-10-26 #32 : un fichier renommé, déplacé ou supprimé dans le
+    /// Finder après son ouverture était silencieusement recréé à l'ancien
+    /// chemin, et l'utilisateur ne retrouvait pas ses modifications dans le
+    /// fichier qu'il connaît.
     pub fn save_edits_in_place(&mut self) -> Result<(), String> {
+        if !self.path.exists() {
+            return Err(
+                "le fichier a été déplacé, renommé ou supprimé depuis son ouverture : enregistrez vos \
+                 modifications ailleurs avec « Optimiser et enregistrer sous… »"
+                    .to_string(),
+            );
+        }
         if self.has_redaction {
             self.edit.save_redacted(&self.path)
         } else {
@@ -973,8 +1015,17 @@ impl Session {
     /// limitation documentée sur `undo_edit`). Opère sur `self.doc`, donc
     /// inclut déjà toute édition en attente (`refresh_after_edit` le tient à
     /// jour).
+    ///
+    /// Après un caviardage, passe par `pdf_edit::export_redacted` : un export
+    /// complet reprend le catalogue du document (formulaire, métadonnées,
+    /// arbre de structure), par lequel le texte retiré du flux de contenu
+    /// pourrait sinon ressortir.
     pub fn export_optimized(&self) -> Result<Vec<u8>, String> {
-        pdf_edit::export_optimized(&self.doc)
+        if self.has_redaction {
+            pdf_edit::export_redacted(&self.doc)
+        } else {
+            pdf_edit::export_optimized(&self.doc)
+        }
     }
 
     /// Après toute opération d'édition : régénère les octets du document
@@ -1023,6 +1074,29 @@ impl Session {
             pdf_core::interp::Interpreter::run_page_with_annotations(&self.doc, &page, &content)
                 .map_err(|e| e.to_string())?;
         Ok((page, display))
+    }
+}
+
+/// Vrai si `a` et `b` désignent le même fichier existant. Compare l'identité
+/// du fichier (périphérique et inode) plutôt que les chemins : un lien
+/// symbolique, un lien physique ou une variante de casse sur un volume APFS
+/// insensible à la casse désignent le même fichier sous un autre nom. Faux
+/// si l'un des deux n'existe pas.
+pub fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
     }
 }
 
@@ -1916,6 +1990,146 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(annots, 1, "the pending highlight must survive optimization");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- Audit 2026-10-26, priorité 3 ----
+
+    /// Fichier temporaire unique (compteur : l'horloge de macOS n'a qu'une
+    /// résolution d'une microseconde, voir `pdf_core::atomic_write`).
+    fn unique_temp_path(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("pdf-app-audit-{}-{n}-{name}", std::process::id()))
+    }
+
+    fn open_temp_copy(name: &str) -> (Session, PathBuf, Vec<u8>) {
+        let bytes =
+            include_bytes!("../../pdf-core/tests/fixtures/multipage_classic_xref.pdf").to_vec();
+        let path = unique_temp_path(name);
+        std::fs::write(&path, &bytes).unwrap();
+        (Session::open(&path).unwrap(), path, bytes)
+    }
+
+    /// Audit 2026-10-26 #15 : « Exporter une copie » vers le fichier ouvert
+    /// le réduisait à 0 octet (`fs::copy` tronque la destination avant de
+    /// lire la source).
+    #[test]
+    fn export_copy_onto_the_open_file_is_refused_and_leaves_it_intact() {
+        let (session, path, bytes) = open_temp_copy("self-copy.pdf");
+        assert!(session.export_copy_to(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "le fichier ouvert doit être intact"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Même refus quand la destination désigne le fichier ouvert sous un
+    /// autre nom : l'identité du fichier est comparée, pas le chemin.
+    #[test]
+    fn export_copy_through_a_symlink_to_the_open_file_is_refused() {
+        let (session, path, bytes) = open_temp_copy("symlinked.pdf");
+        let link = unique_temp_path("link-to-open.pdf");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(session.export_copy_to(&link).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Extraire une sélection vers le fichier ouvert l'aurait remplacé par
+    /// un sous-ensemble de ses pages.
+    #[test]
+    fn extracting_pages_onto_the_open_file_is_refused() {
+        let (session, path, bytes) = open_temp_copy("self-extract.pdf");
+        assert!(session.extract_pages_to_file(&[0], &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn export_copy_to_another_file_copies_the_file_on_disk() {
+        let (session, path, bytes) = open_temp_copy("source.pdf");
+        let dest = unique_temp_path("copy.pdf");
+        session.export_copy_to(&dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        std::fs::remove_file(&dest).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Audit 2026-10-26 #32 : un fichier supprimé ou déplacé après son
+    /// ouverture était silencieusement recréé à l'ancien chemin.
+    #[test]
+    fn saving_a_file_removed_since_opening_is_refused_and_does_not_recreate_it() {
+        let (mut session, path, _) = open_temp_copy("removed.pdf");
+        std::fs::remove_file(&path).unwrap();
+        let err = session.save_edits_in_place().unwrap_err();
+        assert!(err.contains("déplacé"), "{err}");
+        assert!(!path.exists(), "le fichier ne doit pas être recréé");
+    }
+
+    /// Après un caviardage, « Optimiser et enregistrer sous » doit passer par
+    /// l'export caviardé : l'export complet reprend désormais le catalogue,
+    /// dont les métadonnées XMP, qui peuvent contenir le texte caviardé.
+    #[test]
+    fn optimized_export_after_a_redaction_drops_the_metadata() {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_string(),
+            {
+                let data = "BT /F1 24 Tf 72 700 Td (SECRET) Tj ET";
+                format!("<< /Length {} >>\nstream\n{data}\nendstream", data.len())
+            },
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            {
+                let data = "<x>SECRETXMP</x>";
+                format!(
+                    "<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{data}\nendstream",
+                    data.len()
+                )
+            },
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+            offsets.len() + 1
+        ));
+        bytes.extend_from_slice(xref.as_bytes());
+        let path = unique_temp_path("metadata.pdf");
+        std::fs::write(&path, &bytes).unwrap();
+        let contains =
+            |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+
+        let mut session = Session::open(&path).unwrap();
+        let before = session.export_optimized().unwrap();
+        assert!(
+            contains(&before, b"SECRETXMP"),
+            "sans caviardage, les métadonnées sont gardées"
+        );
+
+        session
+            .redact_on_current_page([60.0, 690.0, 400.0, 730.0])
+            .unwrap();
+        let after = session.export_optimized().unwrap();
+        assert!(
+            !contains(&after, b"SECRETXMP"),
+            "métadonnées reprises après un caviardage"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

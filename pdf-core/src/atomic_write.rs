@@ -19,8 +19,17 @@ use std::path::Path;
 /// le fichier temporaire avant le renommage final. En cas d'échec à
 /// n'importe quelle étape, le fichier à `path` n'est jamais touché — soit
 /// l'écriture réussit intégralement, soit elle échoue sans effet visible.
+///
+/// Si `path` est un lien symbolique (ou traverse un dossier qui en est un),
+/// c'est la **cible** qui est remplacée. Audit 2026-10-26 #32 : renommer le
+/// fichier temporaire sur le chemin tel quel remplaçait le lien par un
+/// fichier ordinaire, et la cible n'était jamais mise à jour. Un
+/// `contrat.pdf` pointant vers un dossier synchronisé n'était ainsi plus
+/// synchronisé après un ⌘S. Un chemin qui n'existe pas encore (nouvel
+/// export) est utilisé tel quel.
 pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
-    let path = path.as_ref();
+    let resolved = std::fs::canonicalize(path.as_ref()).ok();
+    let path = resolved.as_deref().unwrap_or(path.as_ref());
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let file_name = path
         .file_name()
@@ -155,6 +164,30 @@ mod tests {
             b"original",
             "the original file must be untouched after a failed write"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit 2026-10-26 #32 : écrire à travers un lien symbolique remplaçait
+    /// le lien par un fichier ordinaire, sans jamais mettre la cible à jour.
+    #[test]
+    fn writes_through_a_symlink_to_its_target() {
+        let dir = temp_dir();
+        let target = dir.join("target.pdf");
+        let link = dir.join("link.pdf");
+        std::fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_atomic(&link, b"new content").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "le lien doit rester un lien"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
 
         std::fs::remove_dir_all(&dir).ok();
     }

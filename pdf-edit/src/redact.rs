@@ -33,7 +33,7 @@ use pdf_core::document::Document;
 use pdf_core::font::Font;
 use pdf_core::object::{Dictionary, Object};
 use pdf_core::writer::write_object;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Rectangle en espace page, coins déjà normalisés (`x0 <= x1`, `y0 <= y1`).
 #[derive(Debug, Clone, Copy)]
@@ -511,7 +511,20 @@ pub(crate) fn redact_content_stream(
                 subpath_start = gs.ctm.apply(x, y);
                 path_instr_indices.push(idx);
             }
-            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" | "n" => {
+            // Le `W`/`W*` fait partie du chemin : si un chemin *peint* est
+            // retiré, son `W` part avec lui plutôt que de rester orphelin.
+            "W" | "W*" => path_instr_indices.push(idx),
+            // Audit 2026-10-26 #24 : `n` termine un chemin **sans le peindre**
+            // (en pratique `re W n`, un pur rognage). Il était traité comme une
+            // peinture : un clip croisant la zone perdait son tracé et son `n`
+            // (en laissant un `W` orphelin), et le contenu qu'il rognait (photo
+            // recadrée, texte débordant) apparaissait sur toute la page, alors
+            // que rien de visible n'avait été retiré. Il est conservé intact.
+            "n" => {
+                path_points.clear();
+                path_instr_indices.clear();
+            }
+            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" => {
                 if let Some(bbox) = Rect::from_points(&path_points) {
                     if target.intersects(&bbox) {
                         keep[idx] = false;
@@ -603,6 +616,21 @@ pub(crate) fn redact_content_stream(
         write_instruction(instr, &mut out);
     }
     Ok((out, redacted_anything))
+}
+
+/// Noms des XObjects encore dessinés par un `Do` dans le flux `content` —
+/// sert à retirer des ressources de la page ceux dont tous les `Do` ont été
+/// caviardés (audit 2026-10-26 #5).
+pub(crate) fn xobject_names_used(content: &[u8]) -> Result<HashSet<String>, String> {
+    let instructions = parse_content_stream(content).map_err(|e| e.to_string())?;
+    Ok(instructions
+        .iter()
+        .filter(|instr| instr.operator == "Do")
+        .filter_map(|instr| match instr.operands.first() {
+            Some(Object::Name(name)) => Some(name.clone()),
+            _ => None,
+        })
+        .collect())
 }
 
 fn write_instruction(instr: &ContentInstruction, out: &mut Vec<u8>) {
@@ -748,5 +776,45 @@ mod tests {
             redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap();
         assert!(!redacted);
         assert!(out.windows(2).any(|w| w == b"Tj"));
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Audit 2026-10-26 #24 : un pur rognage (`re W n`) croisant la zone était
+    /// retiré comme une peinture. Le clip disparaissait (avec un `W` orphelin)
+    /// et le contenu qu'il rognait apparaissait sur toute la page, alors que
+    /// rien de visible n'avait été retiré.
+    #[test]
+    fn keeps_a_clip_only_path_crossing_the_target() {
+        let doc = empty_doc();
+        let content = b"q\n10 10 100 100 re W n\n500 500 10 10 re f\nQ\n";
+        let target = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let (out, redacted) =
+            redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap();
+        assert!(!redacted, "rien de visible dans la zone : rien à retirer");
+        assert!(
+            contains(&out, b"10 10 100 100 re\nW\nn\n"),
+            "le clip doit rester intact : {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Un chemin à la fois peint et utilisé comme clip (`re W f`) est bien
+    /// retiré, et son `W` avec lui plutôt que de rester orphelin.
+    #[test]
+    fn removes_a_painted_clip_path_together_with_its_w() {
+        let doc = empty_doc();
+        let content = b"10 10 100 100 re W f\n";
+        let target = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let (out, redacted) =
+            redact_content_stream(&doc, content, &Dictionary::new(), target).unwrap();
+        assert!(redacted);
+        assert!(
+            out.iter().all(|b| b.is_ascii_whitespace()),
+            "tracé, `W` et peinture doivent tous partir : {}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }

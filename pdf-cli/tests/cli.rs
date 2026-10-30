@@ -155,3 +155,22 @@ fn verify_signatures_on_an_unsigned_document_still_succeeds_with_no_fields() {
         .unwrap();
     assert!(output.status.success());
 }
+
+/// Audit 2026-10-26 #9 : `pdf-cli highlight` sur un PDF chiffré écrivait sans
+/// erreur des objets en clair dans un fichier chiffré, donc un document
+/// corrompu. La commande doit échouer et ne rien écrire.
+#[test]
+fn highlight_on_an_encrypted_pdf_fails_without_writing_anything() {
+    let out = temp_output("encrypted-highlight.pdf");
+    let output = pdf_cli()
+        .args(["highlight"])
+        .arg(fixture("encrypted_rc4.pdf"))
+        .arg(&out)
+        .args(["0", "50", "50", "300", "100"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "la commande doit échouer");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("chiffré"), "got stderr: {stderr}");
+    assert!(!out.exists(), "aucun fichier ne doit être écrit");
+}

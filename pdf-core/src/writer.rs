@@ -135,9 +135,12 @@ pub fn write_indirect_object(num: u32, gen: u16, obj: &Object, out: &mut Vec<u8>
 /// chaque allocation, comme le fait `pdf-edit`) : tout numéro absent de
 /// `1..=max` est écrit comme une entrée libre (`f`) dans la xref plutôt que
 /// de faire échouer l'écriture, par robustesse.
+/// `extra_trailer` : entrées ajoutées au trailer en plus de `/Size` et
+/// `/Root` (`/Info`, `/ID`), qui ne peuvent pas les remplacer.
 pub fn write_standalone(
     objects: &[(crate::object::ObjRef, Object)],
     root: crate::object::ObjRef,
+    extra_trailer: &Dictionary,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
@@ -162,7 +165,7 @@ pub fn write_standalone(
         }
     }
 
-    let mut trailer = Dictionary::new();
+    let mut trailer = extra_trailer.clone();
     trailer.insert("Size", Object::Integer(max_num as i64 + 1));
     trailer.insert("Root", Object::Reference(root));
     out.extend_from_slice(b"trailer\n");
@@ -262,7 +265,7 @@ mod tests {
             (ObjRef::new(1, 0), Object::Dictionary(catalog)),
             (ObjRef::new(3, 0), Object::Dictionary(pages)),
         ];
-        let bytes = write_standalone(&objects, ObjRef::new(1, 0));
+        let bytes = write_standalone(&objects, ObjRef::new(1, 0), &Dictionary::new());
 
         let doc = crate::document::Document::open(bytes).unwrap();
         assert_eq!(doc.page_count().unwrap(), 0);
